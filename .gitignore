@@ -14,6 +14,6 @@ env_tool/data/
 # Backups produced by the environment initialization scripts
 *.bak.*
 
-# Gitee Go release assembly output
+# Release assembly output
 /.release-work/
 /release/

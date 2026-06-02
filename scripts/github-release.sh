@@ -12,8 +12,8 @@ COS_REGION="${COS_REGION:-ap-guangzhou}"
 COS_ENDPOINT="${COS_ENDPOINT:-cos.${COS_REGION}.myqcloud.com}"
 COS_DATA_PREFIX="${COS_DATA_PREFIX:-env_init/data}"
 
-: "${COS_SECRET_ID:?Please configure COS_SECRET_ID in Gitee Go environment variables}"
-: "${COS_SECRET_KEY:?Please configure COS_SECRET_KEY in Gitee Go environment variables}"
+: "${COS_SECRET_ID:?Please configure COS_SECRET_ID in GitHub Actions repository secrets}"
+: "${COS_SECRET_KEY:?Please configure COS_SECRET_KEY in GitHub Actions repository secrets}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -24,7 +24,7 @@ if [[ "$RELEASE_TAG" != v* ]]; then
   exit 1
 fi
 
-WORK_PARENT="${GITEE_WORKSPACE_TMP:-${REPO_ROOT}/.release-work}"
+WORK_PARENT="${RUNNER_TEMP:-${REPO_ROOT}/.release-work}"
 mkdir -p "$WORK_PARENT"
 WORK_ROOT="$(mktemp -d "${WORK_PARENT%/}/envinit-release.XXXXXX")"
 trap 'rm -rf "$WORK_ROOT"' EXIT
@@ -91,13 +91,24 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
 
 echo "==> Creating complete env_tool package"
 PACKAGE_NAME="env_tool-${RELEASE_TAG}.tar"
-tar -C "$STAGE_DIR" -cf "${RELEASE_DIR}/${PACKAGE_NAME}" env_tool
+tar -C "$STAGE_DIR" -cf - env_tool |
+  split -b 1900m -d -a 3 - "${RELEASE_DIR}/${PACKAGE_NAME}.part-"
 cp "${STAGE_DIR}/env_tool/env_init" "${RELEASE_DIR}/env_init"
 cp "${STAGE_DIR}/env_tool/env_init_arch" "${RELEASE_DIR}/env_init_arch"
 (
   cd "$RELEASE_DIR"
-  sha256sum "$PACKAGE_NAME" env_init env_init_arch > SHA256SUMS
+  sha256sum "${PACKAGE_NAME}.part-"* env_init env_init_arch > SHA256SUMS
 )
+
+cat > "${RELEASE_DIR}/ASSEMBLY.txt" <<EOF
+Download all ${PACKAGE_NAME}.part-* files into the same directory, then run:
+
+  cat ${PACKAGE_NAME}.part-* > ${PACKAGE_NAME}
+  sha256sum -c SHA256SUMS
+  tar -xf ${PACKAGE_NAME}
+
+The split files keep every GitHub Release asset below the 2 GiB limit.
+EOF
 
 echo "==> Release files"
 ls -lh "$RELEASE_DIR"
