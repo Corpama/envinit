@@ -10,6 +10,7 @@ COSCLI_DOWNLOAD_URL="${COSCLI_DOWNLOAD_URL:-https://cosbrowser.cloud.tencent.com
 COS_BUCKET="${COS_BUCKET:-wxq-1318169049}"
 COS_REGION="${COS_REGION:-ap-guangzhou}"
 COS_ENDPOINT="${COS_ENDPOINT:-cos.${COS_REGION}.myqcloud.com}"
+COS_RELEASE_UPLOAD_ENDPOINT="${COS_RELEASE_UPLOAD_ENDPOINT:-${COS_BUCKET}.cos.accelerate.myqcloud.com}"
 COS_DATA_PREFIX="${COS_DATA_PREFIX:-env_init/data}"
 COS_RELEASE_PREFIX="${COS_RELEASE_PREFIX:-env_init/releases}"
 
@@ -57,7 +58,6 @@ download "$COSCLI_DOWNLOAD_URL" "${TOOLS_DIR}/coscli"
 chmod +x "${TOOLS_DIR}/coscli"
 
 COSCLI_AUTH_ARGS=(
-  -e "$COS_ENDPOINT"
   -i "$COS_SECRET_ID"
   -k "$COS_SECRET_KEY"
   --init-skip=true
@@ -80,6 +80,7 @@ echo "==> Downloading COS directory cos://${COS_BUCKET}/${COS_DATA_PREFIX}/"
   "cos://${COS_BUCKET}/${COS_DATA_PREFIX}/" \
   "${STAGE_DIR}/env_tool/data/" \
   -r \
+  -e "$COS_ENDPOINT" \
   "${COSCLI_AUTH_ARGS[@]}"
 
 echo "==> Running tests"
@@ -109,6 +110,7 @@ echo "==> Uploading complete package to cos://${COS_BUCKET}/${COS_RELEASE_OBJECT
 "${TOOLS_DIR}/coscli" cp \
   "$PACKAGE_PATH" \
   "cos://${COS_BUCKET}/${COS_RELEASE_OBJECT}" \
+  -e "$COS_RELEASE_UPLOAD_ENDPOINT" \
   "${COSCLI_AUTH_ARGS[@]}"
 
 cat > "${RELEASE_DIR}/download.sh" <<EOF
