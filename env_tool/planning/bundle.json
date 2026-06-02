@@ -125,14 +125,14 @@
     {
       "name": "install xpu_exporter",
       "type": "copy",
-      "source": "/mnt/usb/env_tool/xpu_exporter",
+      "source": "/mnt/usb/env_tool/data/xpu_exporter",
       "target": "/usr/local/bin/xpu_exporter",
       "mode": "0755"
     },
     {
       "name": "install xpu_exporter service",
       "type": "copy",
-      "source": "/mnt/usb/env_tool/xpu_exporter.service",
+      "source": "/mnt/usb/env_tool/data/xpu_exporter.service",
       "target": "/etc/systemd/system/xpu_exporter.service",
       "mode": "0644"
     },

@@ -737,14 +737,14 @@ RDMA 网：
   {
     "name": "install xpu_exporter",
     "type": "copy",
-    "source": "/mnt/usb/env_tool/xpu_exporter",
+    "source": "/mnt/usb/env_tool/data/xpu_exporter",
     "target": "/usr/local/bin/xpu_exporter",
     "mode": "0755"
   },
   {
     "name": "install xpu_exporter service",
     "type": "copy",
-    "source": "/mnt/usb/env_tool/xpu_exporter.service",
+    "source": "/mnt/usb/env_tool/data/xpu_exporter.service",
     "target": "/etc/systemd/system/xpu_exporter.service",
     "mode": "0644"
   },
@@ -997,3 +997,72 @@ env_init_arch: ELF 64-bit LSB executable, ARM aarch64, statically linked
 ```bash
 chmod +x env_init env_init_arch
 ```
+
+## 10. 使用 Gitee Go 自动组装完整发布包
+
+仓库中的 `env_tool/data/` 约为 `5 GiB`，不直接提交到 Git 仓库。完整物料存放在腾讯云 COS 私有桶中：
+
+```text
+cos://wxq-1318169049/env_init/data/
+```
+
+仓库提供 `.workflow/EnvinitRelease.yml`。只有推送名称以 `v` 开头的标签时，流水线才会执行，例如 `v1.0.0`。普通代码推送不会下载物料，也不会发布完整包。
+
+流水线会依次完成：
+
+| 步骤 | 操作 |
+| --- | --- |
+| 1 | 从阿里云镜像下载并临时安装 Go `1.26.2`。下载失败时回退到 `golang.google.cn` |
+| 2 | 从腾讯云中国站下载 `coscli` |
+| 3 | 使用私有 COS 凭证递归拉取 `env_init/data/` 到临时目录 |
+| 4 | 执行 `go test ./...` |
+| 5 | 交叉编译 Linux x86_64 的 `env_init` 和 Linux ARM64 的 `env_init_arch` |
+| 6 | 将脚本、规划文件、二进制和 COS 物料组装为 `env_tool-<标签>.tar` |
+| 7 | 生成 `SHA256SUMS`，并发布到 Gitee Go 的版本制品库 |
+
+### 10.1 配置私有 COS 凭证
+
+在 Gitee 仓库中进入“管理 -> 环境变量管理”，添加：
+
+| 变量名 | 是否必填 | 说明 |
+| --- | --- | --- |
+| `COS_SECRET_ID` | 是 | 腾讯云 COS SecretId |
+| `COS_SECRET_KEY` | 是 | 腾讯云 COS SecretKey |
+| `COS_SESSION_TOKEN` | 否 | 使用临时密钥时填写 session token |
+
+建议使用只允许读取 `wxq-1318169049/env_init/data/` 的最小权限密钥。不要将密钥写入仓库文件。
+
+流水线已内置以下默认值，必要时也可以在 Gitee 环境变量中覆盖：
+
+| 变量名 | 默认值 |
+| --- | --- |
+| `COS_BUCKET` | `wxq-1318169049` |
+| `COS_REGION` | `ap-guangzhou` |
+| `COS_DATA_PREFIX` | `env_init/data` |
+| `GO_VERSION` | `1.26.2` |
+
+### 10.2 创建发布标签
+
+确认代码已推送后，在本地创建并推送标签：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+构建完成后，在 Gitee Go 的“发布记录”中下载完整包。发布制品包含：
+
+```text
+env_tool-v1.0.0.tar
+env_init
+env_init_arch
+SHA256SUMS
+```
+
+解包示例：
+
+```bash
+tar -xf env_tool-v1.0.0.tar
+```
+
+注意：完整包约为 `5 GiB`。首次发布时需要确认当前 Gitee Go 版本制品库的单文件大小和仓库容量配额足够；如果平台配额不足，流水线会在上传制品阶段明确失败。
