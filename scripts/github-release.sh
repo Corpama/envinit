@@ -13,9 +13,13 @@ COS_ENDPOINT="${COS_ENDPOINT:-cos.${COS_REGION}.myqcloud.com}"
 COS_RELEASE_UPLOAD_ENDPOINT="${COS_RELEASE_UPLOAD_ENDPOINT:-${COS_BUCKET}.cos.accelerate.myqcloud.com}"
 COS_DATA_PREFIX="${COS_DATA_PREFIX:-env_init/data}"
 COS_RELEASE_PREFIX="${COS_RELEASE_PREFIX:-env_init/releases}"
+ALIST_BASE_URL="${ALIST_BASE_URL:-https://alt.corpa.me}"
+ALIST_STORAGE_MOUNT="${ALIST_STORAGE_MOUNT:-YZ_COS}"
 
 : "${COS_SECRET_ID:?Please configure COS_SECRET_ID in GitHub Actions repository secrets}"
 : "${COS_SECRET_KEY:?Please configure COS_SECRET_KEY in GitHub Actions repository secrets}"
+: "${ALIST_USERNAME:?Please configure ALIST_USERNAME in GitHub Actions repository secrets}"
+: "${ALIST_PASSWORD:?Please configure ALIST_PASSWORD in GitHub Actions repository secrets}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -113,59 +117,67 @@ echo "==> Uploading complete package to cos://${COS_BUCKET}/${COS_RELEASE_OBJECT
   -e "$COS_RELEASE_UPLOAD_ENDPOINT" \
   "${COSCLI_AUTH_ARGS[@]}"
 
-cat > "${RELEASE_DIR}/download.sh" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-
-: "\${COS_SECRET_ID:?Please set COS_SECRET_ID to a read-only COS credential}"
-: "\${COS_SECRET_KEY:?Please set COS_SECRET_KEY to a read-only COS credential}"
-
-PACKAGE_NAME="${PACKAGE_NAME}"
-PACKAGE_SHA256="${PACKAGE_SHA256}"
-COS_BUCKET="${COS_BUCKET}"
-COS_ENDPOINT="${COS_ENDPOINT}"
-COS_OBJECT="${COS_RELEASE_OBJECT}"
-COSCLI_DOWNLOAD_BASE="${COSCLI_DOWNLOAD_URL%-amd64}"
-
-case "\$(uname -m)" in
-  x86_64|amd64) COSCLI_ARCH="amd64" ;;
-  aarch64|arm64) COSCLI_ARCH="arm64" ;;
-  *)
-    echo "error: unsupported Linux architecture: \$(uname -m)" >&2
-    exit 1
-    ;;
-esac
-
-WORK_DIR="\$(mktemp -d)"
-trap 'rm -rf "\$WORK_DIR"' EXIT
-COSCLI="\${WORK_DIR}/coscli"
-
-curl --fail --location --retry 3 --retry-delay 2 \
-  "\${COSCLI_DOWNLOAD_BASE}-\${COSCLI_ARCH}" \
-  --output "\$COSCLI"
-chmod +x "\$COSCLI"
-
-COSCLI_ARGS=(
-  -e "\$COS_ENDPOINT"
-  -i "\$COS_SECRET_ID"
-  -k "\$COS_SECRET_KEY"
-  --init-skip=true
-  --disable-log
-)
-if [[ -n "\${COS_SESSION_TOKEN:-}" ]]; then
-  COSCLI_ARGS+=(--token "\$COS_SESSION_TOKEN")
+echo "==> Getting permanent AList download link"
+ALIST_BASE_URL="${ALIST_BASE_URL%/}"
+ALIST_FILE_PATH="/${ALIST_STORAGE_MOUNT#/}/${COS_RELEASE_OBJECT}"
+ALIST_LOGIN_RESPONSE="$(
+  curl --fail --silent --show-error --retry 3 --retry-delay 2 \
+    --request POST \
+    --header 'Content-Type: application/json' \
+    --data "$(jq -nc --arg username "$ALIST_USERNAME" --arg password "$ALIST_PASSWORD" \
+      '{username: $username, password: $password}')" \
+    "${ALIST_BASE_URL}/api/auth/login"
+)"
+ALIST_TOKEN="$(jq -er 'select(.code == 200) | .data.token' <<<"$ALIST_LOGIN_RESPONSE")"
+ALIST_SIGN=""
+for attempt in {1..10}; do
+  ALIST_FILE_RESPONSE="$(
+    curl --fail --silent --show-error --retry 3 --retry-delay 2 \
+      --request POST \
+      --header 'Content-Type: application/json' \
+      --header "Authorization: ${ALIST_TOKEN}" \
+      --data "$(jq -nc --arg path "$ALIST_FILE_PATH" '{path: $path, password: ""}')" \
+      "${ALIST_BASE_URL}/api/fs/get"
+  )"
+  if ALIST_SIGN="$(jq -er 'select(.code == 200) | .data.sign | select(length > 0)' <<<"$ALIST_FILE_RESPONSE")"; then
+    break
+  fi
+  echo "AList has not exposed the uploaded object yet, retrying (${attempt}/10)"
+  sleep 3
+done
+: "${ALIST_SIGN:?AList did not return a signed download link}"
+if [[ "$ALIST_SIGN" != *:0 ]]; then
+  echo "error: AList returned an expiring sign; configure a permanent sign ending in :0" >&2
+  exit 1
 fi
+ALIST_SIGN_ENCODED="$(jq -rn --arg sign "$ALIST_SIGN" '$sign | @uri')"
+ALIST_DOWNLOAD_URL="${ALIST_BASE_URL}/d${ALIST_FILE_PATH}?sign=${ALIST_SIGN_ENCODED}"
 
-"\$COSCLI" cp \
-  "cos://\${COS_BUCKET}/\${COS_OBJECT}" \
-  "\$PACKAGE_NAME" \
-  "\${COSCLI_ARGS[@]}"
+echo "==> Building cross-platform downloaders"
+build_downloader() {
+  local goos="$1"
+  local goarch="$2"
+  local output="$3"
 
-printf '%s  %s\n' "\$PACKAGE_SHA256" "\$PACKAGE_NAME" | sha256sum -c -
-echo "Downloaded and verified: \$PACKAGE_NAME"
-echo "Extract with: tar -xf \$PACKAGE_NAME"
-EOF
-chmod +x "${RELEASE_DIR}/download.sh"
+  CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+    go build \
+      -trimpath \
+      -ldflags "-s -w -X main.releaseVersion=${RELEASE_TAG} -X main.packageName=${PACKAGE_NAME} -X main.packageSHA256=${PACKAGE_SHA256} -X main.downloadURL=${ALIST_DOWNLOAD_URL}" \
+      -o "${RELEASE_DIR}/${output}" \
+      ./cmd/downloader
+}
+
+build_downloader linux amd64 env_tool_downloader-linux-amd64
+build_downloader linux arm64 env_tool_downloader-linux-arm64
+build_downloader darwin amd64 env_tool_downloader-darwin-amd64
+build_downloader darwin arm64 env_tool_downloader-darwin-arm64
+build_downloader windows amd64 env_tool_downloader-windows-amd64.exe
+build_downloader windows arm64 env_tool_downloader-windows-arm64.exe
+
+(
+  cd "$RELEASE_DIR"
+  sha256sum env_tool_downloader-* >> SHA256SUMS
+)
 
 echo "==> Release files"
 ls -lh "$RELEASE_DIR"
