@@ -1,0 +1,17 @@
+# macOS metadata
+.DS_Store
+
+# Offline installation materials are distributed separately from source code.
+env_tool/data/
+
+# Built Linux binaries
+/env_init
+/env_init_arch
+/env_tool/env_init
+/env_tool/env_init_arch
+
+# Local logs and generated runtime output
+*.log
+
+# Backups produced by the environment initialization scripts
+*.bak.*

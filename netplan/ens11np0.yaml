@@ -1,0 +1,9 @@
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ens11np0:
+      addresses:
+      - 11.1.1.11/24
+      ignore-carrier: true
+      mtu: 9000

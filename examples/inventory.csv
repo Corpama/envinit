@@ -1,0 +1,11 @@
+host_id,hostname,mgmt_ip,mgmt_prefix,mgmt_gateway,mgmt_iface1,mgmt_mac1,mgmt_iface2,mgmt_mac2,rdma1_name,rdma1_ip,rdma1_mac,rdma2_name,rdma2_ip,rdma2_mac,rdma3_name,rdma3_ip,rdma3_mac,rdma4_name,rdma4_ip,rdma4_mac
+node1,node1,172.19.37.126,24,172.19.37.1,enp6s0f0np0,,,,ens11np0,10.247.1.11,,ens13np0,10.247.2.11,,ens15np0,10.247.3.11,,ens17np0,10.247.4.11,
+node2,node2,172.19.37.127,24,172.19.37.1,enp6s0f0np0,,,,ens11np0,10.247.1.12,,ens13np0,10.247.2.12,,ens15np0,10.247.3.12,,ens17np0,10.247.4.12,
+node3,node3,172.19.37.128,24,172.19.37.1,enp6s0f0np0,,,,ens11np0,10.247.1.13,,ens13np0,10.247.2.13,,ens15np0,10.247.3.13,,ens17np0,10.247.4.13,
+node4,node4,172.19.37.129,24,172.19.37.1,enp6s0f0np0,,,,ens11np0,10.247.1.14,,ens13np0,10.247.2.14,,ens15np0,10.247.3.14,,ens17np0,10.247.4.14,
+node5,node5,172.19.37.130,24,172.19.37.1,enp6s0f0np0,,,,ens11np0,10.247.1.15,,ens13np0,10.247.2.15,,ens15np0,10.247.3.15,,ens17np0,10.247.4.15,
+node6,node6,172.19.37.131,24,172.19.37.1,enp6s0f0np0,,,,ens11np0,10.247.1.16,,ens13np0,10.247.2.16,,ens15np0,10.247.3.16,,ens17np0,10.247.4.16,
+node7,node7,172.19.37.132,24,172.19.37.1,enp6s0f0np0,,,,ens11np0,10.247.1.17,,ens13np0,10.247.2.17,,ens15np0,10.247.3.17,,ens17np0,10.247.4.17,
+node8,node8,172.19.37.133,24,172.19.37.1,enp6s0f0np0,,,,ens11np0,10.247.1.18,,ens13np0,10.247.2.18,,ens15np0,10.247.3.18,,ens17np0,10.247.4.18,
+node9,node9,172.19.37.134,24,172.19.37.1,enp6s0f0np0,,,,ens11np0,10.247.1.19,,ens13np0,10.247.2.19,,ens15np0,10.247.3.19,,ens17np0,10.247.4.19,
+node10,node10,172.19.37.135,24,172.19.37.1,enp6s0f0np0,,,,ens11np0,10.247.1.20,,ens13np0,10.247.2.20,,ens15np0,10.247.3.20,,ens17np0,10.247.4.20,
