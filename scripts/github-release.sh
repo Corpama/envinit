@@ -146,8 +146,31 @@ ALIST_LOGIN_RESPONSE="$(
     "${ALIST_BASE_URL}/api/auth/login"
 )"
 ALIST_TOKEN="$(jq -er 'select(.code == 200) | .data.token' <<<"$ALIST_LOGIN_RESPONSE")"
+refresh_alist_parent_dirs() {
+  local current_path=""
+  local part
+  local response
+
+  IFS='/' read -r -a parts <<<"${ALIST_FILE_PATH%/*}"
+  for part in "${parts[@]}"; do
+    [[ -z "$part" ]] && continue
+    current_path="${current_path}/${part}"
+    response="$(
+      curl --fail --silent --show-error --retry 3 --retry-delay 2 \
+        --request POST \
+        --header 'Content-Type: application/json' \
+        --header "Authorization: ${ALIST_TOKEN}" \
+        --data "$(jq -nc --arg path "$current_path" \
+          '{path: $path, password: "", page: 1, per_page: 500, refresh: true}')" \
+        "${ALIST_BASE_URL}/api/fs/list"
+    )"
+    echo "AList refresh ${current_path}: $(jq -r '"code=\(.code // "unknown") message=\(.message // "unknown")"' <<<"$response")"
+  done
+}
+
 ALIST_SIGN=""
 for attempt in {1..24}; do
+  refresh_alist_parent_dirs
   ALIST_FILE_RESPONSE="$(
     curl --fail --silent --show-error --retry 3 --retry-delay 2 \
       --request POST \
