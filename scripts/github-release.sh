@@ -10,7 +10,7 @@ COSCLI_DOWNLOAD_URL="${COSCLI_DOWNLOAD_URL:-https://cosbrowser.cloud.tencent.com
 COS_BUCKET="${COS_BUCKET:-wxq-1318169049}"
 COS_REGION="${COS_REGION:-ap-guangzhou}"
 COS_ENDPOINT="${COS_ENDPOINT:-cos.${COS_REGION}.myqcloud.com}"
-COS_RELEASE_UPLOAD_ENDPOINT="${COS_RELEASE_UPLOAD_ENDPOINT:-${COS_BUCKET}.cos.accelerate.myqcloud.com}"
+COS_RELEASE_UPLOAD_ENDPOINT="${COS_RELEASE_UPLOAD_ENDPOINT:-cos.accelerate.myqcloud.com}"
 COS_DATA_PREFIX="${COS_DATA_PREFIX:-env_init/data}"
 COS_RELEASE_PREFIX="${COS_RELEASE_PREFIX:-env_init/releases}"
 ALIST_BASE_URL="${ALIST_BASE_URL:-https://alt.corpa.me}"
@@ -111,11 +111,28 @@ PACKAGE_SHA256="$(sha256sum "$PACKAGE_PATH" | awk '{print $1}')"
 printf '%s  %s\n' "$PACKAGE_SHA256" "$PACKAGE_NAME" >> "${RELEASE_DIR}/SHA256SUMS"
 
 echo "==> Uploading complete package to cos://${COS_BUCKET}/${COS_RELEASE_OBJECT}"
-"${TOOLS_DIR}/coscli" cp \
-  "$PACKAGE_PATH" \
-  "cos://${COS_BUCKET}/${COS_RELEASE_OBJECT}" \
-  -e "$COS_RELEASE_UPLOAD_ENDPOINT" \
-  "${COSCLI_AUTH_ARGS[@]}"
+upload_release_package() {
+  local attempt
+
+  for attempt in 1 2 3; do
+    if "${TOOLS_DIR}/coscli" cp \
+      "$PACKAGE_PATH" \
+      "cos://${COS_BUCKET}/${COS_RELEASE_OBJECT}" \
+      -e "$COS_RELEASE_UPLOAD_ENDPOINT" \
+      "${COSCLI_AUTH_ARGS[@]}"; then
+      return 0
+    fi
+
+    echo "COS release upload failed (${attempt}/3)." >&2
+    if [[ -d "${REPO_ROOT}/coscli_output" ]]; then
+      find "${REPO_ROOT}/coscli_output" -type f -maxdepth 2 -print -exec sed -n '1,240p' {} \; >&2
+    fi
+    sleep 5
+  done
+
+  return 1
+}
+upload_release_package
 
 echo "==> Getting permanent AList download link"
 ALIST_BASE_URL="${ALIST_BASE_URL%/}"
