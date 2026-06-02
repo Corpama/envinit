@@ -147,20 +147,21 @@ ALIST_LOGIN_RESPONSE="$(
 )"
 ALIST_TOKEN="$(jq -er 'select(.code == 200) | .data.token' <<<"$ALIST_LOGIN_RESPONSE")"
 ALIST_SIGN=""
-for attempt in {1..10}; do
+for attempt in {1..24}; do
   ALIST_FILE_RESPONSE="$(
     curl --fail --silent --show-error --retry 3 --retry-delay 2 \
       --request POST \
       --header 'Content-Type: application/json' \
       --header "Authorization: ${ALIST_TOKEN}" \
-      --data "$(jq -nc --arg path "$ALIST_FILE_PATH" '{path: $path, password: ""}')" \
+      --data "$(jq -nc --arg path "$ALIST_FILE_PATH" '{path: $path, password: "", refresh: true}')" \
       "${ALIST_BASE_URL}/api/fs/get"
   )"
   if ALIST_SIGN="$(jq -er 'select(.code == 200) | .data.sign | select(length > 0)' <<<"$ALIST_FILE_RESPONSE")"; then
     break
   fi
-  echo "AList has not exposed the uploaded object yet, retrying (${attempt}/10)"
-  sleep 3
+  ALIST_ERROR="$(jq -r '"code=\(.code // "unknown") message=\(.message // "unknown")"' <<<"$ALIST_FILE_RESPONSE" 2>/dev/null || printf '%s' "$ALIST_FILE_RESPONSE")"
+  echo "AList has not exposed the uploaded object yet (${attempt}/24): ${ALIST_ERROR}"
+  sleep 5
 done
 : "${ALIST_SIGN:?AList did not return a signed download link}"
 if [[ "$ALIST_SIGN" != *:0 ]]; then
