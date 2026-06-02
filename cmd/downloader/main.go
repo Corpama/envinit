@@ -2,8 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,7 +22,10 @@ var (
 	releaseVersion = "development"
 	packageName    = ""
 	packageSHA256  = ""
-	downloadURL    = ""
+	alistBaseURL   = ""
+	alistFilePath  = ""
+	alistUserB64   = ""
+	alistPassB64   = ""
 )
 
 func main() {
@@ -33,7 +39,9 @@ func main() {
 }
 
 func run(output string) error {
-	if strings.TrimSpace(downloadURL) == "" || strings.TrimSpace(packageName) == "" || strings.TrimSpace(packageSHA256) == "" {
+	if strings.TrimSpace(alistBaseURL) == "" || strings.TrimSpace(alistFilePath) == "" ||
+		strings.TrimSpace(alistUserB64) == "" || strings.TrimSpace(alistPassB64) == "" ||
+		strings.TrimSpace(packageName) == "" || strings.TrimSpace(packageSHA256) == "" {
 		return errors.New("downloader build is missing release metadata")
 	}
 	if output == "" {
@@ -47,6 +55,10 @@ func run(output string) error {
 		fmt.Printf("Extract with: tar -xf %s\n", output)
 		return nil
 	}
+	downloadURL, err := resolveDownloadURL()
+	if err != nil {
+		return err
+	}
 	partialOutput := output + ".part"
 	if err := download(partialOutput, downloadURL); err != nil {
 		return err
@@ -54,11 +66,98 @@ func run(output string) error {
 	if err := verifySHA256(partialOutput, packageSHA256); err != nil {
 		return err
 	}
+	if err := os.Remove(output); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove unverified output: %w", err)
+	}
 	if err := os.Rename(partialOutput, output); err != nil {
 		return fmt.Errorf("replace output with verified package: %w", err)
 	}
 	fmt.Printf("Verified SHA256: %s\n", packageSHA256)
 	fmt.Printf("Extract with: tar -xf %s\n", output)
+	return nil
+}
+
+func resolveDownloadURL() (string, error) {
+	username, err := decodeCredential(alistUserB64)
+	if err != nil {
+		return "", fmt.Errorf("decode AList username: %w", err)
+	}
+	password, err := decodeCredential(alistPassB64)
+	if err != nil {
+		return "", fmt.Errorf("decode AList password: %w", err)
+	}
+
+	var loginResponse struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			Token string `json:"token"`
+		} `json:"data"`
+	}
+	if err := postJSON("/api/auth/login", "", map[string]string{
+		"username": username,
+		"password": password,
+	}, &loginResponse); err != nil {
+		return "", err
+	}
+	if loginResponse.Code != 200 || loginResponse.Data.Token == "" {
+		return "", fmt.Errorf("AList login failed: code=%d message=%s", loginResponse.Code, loginResponse.Message)
+	}
+
+	var fileResponse struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			RawURL string `json:"raw_url"`
+		} `json:"data"`
+	}
+	if err := postJSON("/api/fs/get", loginResponse.Data.Token, map[string]any{
+		"path":     alistFilePath,
+		"password": "",
+		"refresh":  true,
+	}, &fileResponse); err != nil {
+		return "", err
+	}
+	if fileResponse.Code != 200 || fileResponse.Data.RawURL == "" {
+		return "", fmt.Errorf("AList file lookup failed: code=%d message=%s", fileResponse.Code, fileResponse.Message)
+	}
+	return fileResponse.Data.RawURL, nil
+}
+
+func decodeCredential(value string) (string, error) {
+	decoded, err := base64.StdEncoding.DecodeString(value)
+	if err != nil {
+		return "", err
+	}
+	return string(decoded), nil
+}
+
+func postJSON(path, token string, body any, output any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("encode AList request: %w", err)
+	}
+	request, err := http.NewRequest(http.MethodPost, strings.TrimRight(alistBaseURL, "/")+path, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("create AList request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		request.Header.Set("Authorization", token)
+	}
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("call AList API: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		message, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		return fmt.Errorf("call AList API: HTTP %s: %s", response.Status, strings.TrimSpace(string(message)))
+	}
+	if err := json.NewDecoder(response.Body).Decode(output); err != nil {
+		return fmt.Errorf("decode AList response: %w", err)
+	}
 	return nil
 }
 

@@ -168,7 +168,7 @@ refresh_alist_parent_dirs() {
   done
 }
 
-ALIST_SIGN=""
+ALIST_RAW_URL=""
 for attempt in {1..24}; do
   refresh_alist_parent_dirs
   ALIST_FILE_RESPONSE="$(
@@ -179,19 +179,17 @@ for attempt in {1..24}; do
       --data "$(jq -nc --arg path "$ALIST_FILE_PATH" '{path: $path, password: "", refresh: true}')" \
       "${ALIST_BASE_URL}/api/fs/get"
   )"
-  if ALIST_SIGN="$(jq -er 'select(.code == 200) | .data.sign | select(length > 0)' <<<"$ALIST_FILE_RESPONSE")"; then
+  if ALIST_RAW_URL="$(jq -er 'select(.code == 200) | .data.raw_url | select(length > 0)' <<<"$ALIST_FILE_RESPONSE")"; then
     break
   fi
   ALIST_ERROR="$(jq -r '"code=\(.code // "unknown") message=\(.message // "unknown")"' <<<"$ALIST_FILE_RESPONSE" 2>/dev/null || printf '%s' "$ALIST_FILE_RESPONSE")"
   echo "AList has not exposed the uploaded object yet (${attempt}/24): ${ALIST_ERROR}"
   sleep 5
 done
-: "${ALIST_SIGN:?AList did not return a signed download link}"
-if [[ "$ALIST_SIGN" != *:0 ]]; then
-  echo "error: AList returned an expiring sign; configure a permanent sign ending in :0" >&2
-  exit 1
-fi
-ALIST_DOWNLOAD_URL="${ALIST_BASE_URL}/d${ALIST_FILE_PATH}?sign=${ALIST_SIGN}"
+: "${ALIST_RAW_URL:?AList did not return a raw download URL}"
+
+ALIST_USERNAME_B64="$(printf '%s' "$ALIST_USERNAME" | base64 | tr -d '\n')"
+ALIST_PASSWORD_B64="$(printf '%s' "$ALIST_PASSWORD" | base64 | tr -d '\n')"
 
 echo "==> Building cross-platform downloaders"
 build_downloader() {
@@ -202,7 +200,7 @@ build_downloader() {
   CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
     go build \
       -trimpath \
-      -ldflags "-s -w -X main.releaseVersion=${RELEASE_TAG} -X main.packageName=${PACKAGE_NAME} -X main.packageSHA256=${PACKAGE_SHA256} -X main.downloadURL=${ALIST_DOWNLOAD_URL}" \
+      -ldflags "-s -w -X main.releaseVersion=${RELEASE_TAG} -X main.packageName=${PACKAGE_NAME} -X main.packageSHA256=${PACKAGE_SHA256} -X main.alistBaseURL=${ALIST_BASE_URL} -X main.alistFilePath=${ALIST_FILE_PATH} -X main.alistUserB64=${ALIST_USERNAME_B64} -X main.alistPassB64=${ALIST_PASSWORD_B64}" \
       -o "${RELEASE_DIR}/${output}" \
       ./cmd/downloader
 }

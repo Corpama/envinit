@@ -2,7 +2,9 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +12,50 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestResolveDownloadURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/auth/login":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["username"] != "release-reader" || body["password"] != "secret" {
+				t.Fatalf("login body = %#v", body)
+			}
+			w.Write([]byte(`{"code":200,"message":"success","data":{"token":"jwt-token"}}`))
+		case "/api/fs/get":
+			if got := r.Header.Get("Authorization"); got != "jwt-token" {
+				t.Fatalf("Authorization = %q, want jwt-token", got)
+			}
+			w.Write([]byte(`{"code":200,"message":"success","data":{"raw_url":"https://download.example/env_tool.tar"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	oldBaseURL, oldFilePath := alistBaseURL, alistFilePath
+	oldUser, oldPass := alistUserB64, alistPassB64
+	t.Cleanup(func() {
+		alistBaseURL, alistFilePath = oldBaseURL, oldFilePath
+		alistUserB64, alistPassB64 = oldUser, oldPass
+	})
+	alistBaseURL = server.URL
+	alistFilePath = "/releases/v-test/env_tool-v-test.tar"
+	alistUserB64 = base64.StdEncoding.EncodeToString([]byte("release-reader"))
+	alistPassB64 = base64.StdEncoding.EncodeToString([]byte("secret"))
+
+	got, err := resolveDownloadURL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://download.example/env_tool.tar" {
+		t.Fatalf("download URL = %q", got)
+	}
+}
 
 func TestDownloadAndVerify(t *testing.T) {
 	content := []byte("complete env_tool package")
