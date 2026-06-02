@@ -4,9 +4,7 @@
 # Offline installation materials are distributed separately from source code.
 env_tool/data/
 
-# Built Linux binaries
-/env_init
-/env_init_arch
+# Bundled copies of the release binaries
 /env_tool/env_init
 /env_tool/env_init_arch
 

@@ -956,3 +956,44 @@ sudo ./env_init apply ... --host node1 --stages xre xdr firmware container mlxco
 ```
 
 每一步完成后检查输出，再进入下一步。
+
+## 9. 编译可执行文件
+
+项目使用 Go 编写，仅依赖标准库。可以在安装了 Go 的开发机上交叉编译 Linux 可执行文件。
+
+### 9.1 编译 x86_64 版本
+
+适用于常见的 x86_64 / AMD64 Linux 服务器。生成文件名为 `env_init`：
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  go build -o env_init ./cmd/envinit
+```
+
+### 9.2 编译 ARM64 版本
+
+适用于 ARM64 / aarch64 Linux 服务器。生成文件名为 `env_init_arch`：
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+  go build -o env_init_arch ./cmd/envinit
+```
+
+### 9.3 检查生成结果
+
+```bash
+file env_init env_init_arch
+```
+
+预期结果：
+
+```text
+env_init:      ELF 64-bit LSB executable, x86-64, statically linked
+env_init_arch: ELF 64-bit LSB executable, ARM aarch64, statically linked
+```
+
+交付到 U 盘时，可以将对应架构的文件复制到 `/mnt/usb/env_tool/`，并确保文件可执行：
+
+```bash
+chmod +x env_init env_init_arch
+```
