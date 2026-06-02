@@ -191,8 +191,7 @@ if [[ "$ALIST_SIGN" != *:0 ]]; then
   echo "error: AList returned an expiring sign; configure a permanent sign ending in :0" >&2
   exit 1
 fi
-ALIST_SIGN_ENCODED="$(jq -rn --arg sign "$ALIST_SIGN" '$sign | @uri')"
-ALIST_DOWNLOAD_URL="${ALIST_BASE_URL}/d${ALIST_FILE_PATH}?sign=${ALIST_SIGN_ENCODED}"
+ALIST_DOWNLOAD_URL="${ALIST_BASE_URL}/d${ALIST_FILE_PATH}?sign=${ALIST_SIGN}"
 
 echo "==> Building cross-platform downloaders"
 build_downloader() {

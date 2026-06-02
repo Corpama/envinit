@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -24,6 +25,23 @@ func TestDownloadAndVerify(t *testing.T) {
 	sum := sha256.Sum256(content)
 	if err := verifySHA256(output, hex.EncodeToString(sum[:])); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDownloadReportsJSONErrorWithoutWritingOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Write([]byte(`{"code":401,"message":"sign invalid","data":null}`))
+	}))
+	defer server.Close()
+
+	output := filepath.Join(t.TempDir(), "env_tool.tar.part")
+	err := download(output, server.URL)
+	if err == nil || !strings.Contains(err.Error(), "sign invalid") {
+		t.Fatalf("download error = %v, want sign invalid", err)
+	}
+	if _, err := os.Stat(output); !os.IsNotExist(err) {
+		t.Fatalf("output should not be created, stat error = %v", err)
 	}
 }
 

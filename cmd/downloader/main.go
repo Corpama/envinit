@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -46,11 +47,15 @@ func run(output string) error {
 		fmt.Printf("Extract with: tar -xf %s\n", output)
 		return nil
 	}
-	if err := download(output, downloadURL); err != nil {
+	partialOutput := output + ".part"
+	if err := download(partialOutput, downloadURL); err != nil {
 		return err
 	}
-	if err := verifySHA256(output, packageSHA256); err != nil {
+	if err := verifySHA256(partialOutput, packageSHA256); err != nil {
 		return err
+	}
+	if err := os.Rename(partialOutput, output); err != nil {
+		return fmt.Errorf("replace output with verified package: %w", err)
 	}
 	fmt.Printf("Verified SHA256: %s\n", packageSHA256)
 	fmt.Printf("Extract with: tar -xf %s\n", output)
@@ -81,6 +86,15 @@ func download(output, url string) error {
 	}
 	defer resp.Body.Close()
 
+	body := bufio.NewReader(resp.Body)
+	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json") {
+		message, err := io.ReadAll(io.LimitReader(body, 64<<10))
+		if err != nil {
+			return fmt.Errorf("read JSON error response: %w", err)
+		}
+		return fmt.Errorf("download package: %s", strings.TrimSpace(string(message)))
+	}
+
 	flags := os.O_CREATE | os.O_WRONLY
 	switch {
 	case offset > 0 && resp.StatusCode == http.StatusPartialContent:
@@ -101,7 +115,7 @@ func download(output, url string) error {
 	defer file.Close()
 
 	start := time.Now()
-	written, err := io.Copy(file, resp.Body)
+	written, err := io.Copy(file, body)
 	if err != nil {
 		return fmt.Errorf("write output: %w", err)
 	}
