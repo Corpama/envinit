@@ -8,18 +8,18 @@ triggers:
       prefix:
         - v
 stages:
-  - name: assemble-release
+  - stage:
+    name: assemble-release
     displayName: assemble release
     strategy: naturally
     trigger: auto
-    executor: []
     steps:
       - step: build@golang
         name: build_release
         displayName: Download data from COS
         golangVersion: '1.16'
-        commands:
-          - bash scripts/gitee-go-release.sh
+        commands: |
+          bash scripts/gitee-go-release.sh
         artifacts:
           - name: ENVINIT_RELEASE
             path:
@@ -28,12 +28,15 @@ stages:
       - step: publish@general_artifacts
         name: upload_release_artifact
         displayName: Upload release
+        dependsOn: build_release
         dependArtifact: ENVINIT_RELEASE
+        artifactRepository: default
         artifactName: envinit-release
         strategy: {}
       - step: publish@release_artifacts
         name: publish_release_artifact
         displayName: release envinit
+        dependsOn: upload_release_artifact
         dependArtifact: envinit-release
         artifactRepository: release
         version: '0.1.0.0'
