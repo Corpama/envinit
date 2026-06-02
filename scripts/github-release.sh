@@ -14,7 +14,7 @@ COS_RELEASE_UPLOAD_ENDPOINT="${COS_RELEASE_UPLOAD_ENDPOINT:-cos.accelerate.myqcl
 COS_DATA_PREFIX="${COS_DATA_PREFIX:-env_init/data}"
 COS_RELEASE_PREFIX="${COS_RELEASE_PREFIX:-env_init/releases}"
 ALIST_BASE_URL="${ALIST_BASE_URL:-https://alt.corpa.me}"
-ALIST_STORAGE_MOUNT="${ALIST_STORAGE_MOUNT:-YZ_COS}"
+ALIST_RELEASE_PREFIX="${ALIST_RELEASE_PREFIX:-/releases}"
 
 : "${COS_SECRET_ID:?Please configure COS_SECRET_ID in GitHub Actions repository secrets}"
 : "${COS_SECRET_KEY:?Please configure COS_SECRET_KEY in GitHub Actions repository secrets}"
@@ -136,7 +136,7 @@ upload_release_package
 
 echo "==> Getting permanent AList download link"
 ALIST_BASE_URL="${ALIST_BASE_URL%/}"
-ALIST_FILE_PATH="/${ALIST_STORAGE_MOUNT#/}/${COS_RELEASE_OBJECT}"
+ALIST_FILE_PATH="${ALIST_RELEASE_PREFIX%/}/${RELEASE_TAG}/${PACKAGE_NAME}"
 ALIST_LOGIN_RESPONSE="$(
   curl --fail --silent --show-error --retry 3 --retry-delay 2 \
     --request POST \
