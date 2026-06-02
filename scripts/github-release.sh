@@ -11,6 +11,7 @@ COS_BUCKET="${COS_BUCKET:-wxq-1318169049}"
 COS_REGION="${COS_REGION:-ap-guangzhou}"
 COS_ENDPOINT="${COS_ENDPOINT:-cos.${COS_REGION}.myqcloud.com}"
 COS_DATA_PREFIX="${COS_DATA_PREFIX:-env_init/data}"
+COS_RELEASE_PREFIX="${COS_RELEASE_PREFIX:-env_init/releases}"
 
 : "${COS_SECRET_ID:?Please configure COS_SECRET_ID in GitHub Actions repository secrets}"
 : "${COS_SECRET_KEY:?Please configure COS_SECRET_KEY in GitHub Actions repository secrets}"
@@ -55,15 +56,15 @@ echo "==> Downloading COSCLI"
 download "$COSCLI_DOWNLOAD_URL" "${TOOLS_DIR}/coscli"
 chmod +x "${TOOLS_DIR}/coscli"
 
-COSCLI_ARGS=(
-  -r
+COSCLI_AUTH_ARGS=(
   -e "$COS_ENDPOINT"
   -i "$COS_SECRET_ID"
   -k "$COS_SECRET_KEY"
   --init-skip=true
+  --disable-log
 )
 if [[ -n "${COS_SESSION_TOKEN:-}" ]]; then
-  COSCLI_ARGS+=(--token "$COS_SESSION_TOKEN")
+  COSCLI_AUTH_ARGS+=(--token "$COS_SESSION_TOKEN")
 fi
 
 echo "==> Copying repository env_tool files"
@@ -78,7 +79,8 @@ echo "==> Downloading COS directory cos://${COS_BUCKET}/${COS_DATA_PREFIX}/"
 "${TOOLS_DIR}/coscli" cp \
   "cos://${COS_BUCKET}/${COS_DATA_PREFIX}/" \
   "${STAGE_DIR}/env_tool/data/" \
-  "${COSCLI_ARGS[@]}"
+  -r \
+  "${COSCLI_AUTH_ARGS[@]}"
 
 echo "==> Running tests"
 go test ./...
@@ -91,24 +93,77 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
 
 echo "==> Creating complete env_tool package"
 PACKAGE_NAME="env_tool-${RELEASE_TAG}.tar"
-tar -C "$STAGE_DIR" -cf - env_tool |
-  split -b 1900m -d -a 3 - "${RELEASE_DIR}/${PACKAGE_NAME}.part-"
+PACKAGE_PATH="${WORK_ROOT}/${PACKAGE_NAME}"
+COS_RELEASE_OBJECT="${COS_RELEASE_PREFIX}/${RELEASE_TAG}/${PACKAGE_NAME}"
+tar -C "$STAGE_DIR" -cf "$PACKAGE_PATH" env_tool
 cp "${STAGE_DIR}/env_tool/env_init" "${RELEASE_DIR}/env_init"
 cp "${STAGE_DIR}/env_tool/env_init_arch" "${RELEASE_DIR}/env_init_arch"
+PACKAGE_SHA256="$(sha256sum "$PACKAGE_PATH" | awk '{print $1}')"
 (
   cd "$RELEASE_DIR"
-  sha256sum "${PACKAGE_NAME}.part-"* env_init env_init_arch > SHA256SUMS
+  sha256sum env_init env_init_arch > SHA256SUMS
 )
+printf '%s  %s\n' "$PACKAGE_SHA256" "$PACKAGE_NAME" >> "${RELEASE_DIR}/SHA256SUMS"
 
-cat > "${RELEASE_DIR}/ASSEMBLY.txt" <<EOF
-Download all ${PACKAGE_NAME}.part-* files into the same directory, then run:
+echo "==> Uploading complete package to cos://${COS_BUCKET}/${COS_RELEASE_OBJECT}"
+"${TOOLS_DIR}/coscli" cp \
+  "$PACKAGE_PATH" \
+  "cos://${COS_BUCKET}/${COS_RELEASE_OBJECT}" \
+  "${COSCLI_AUTH_ARGS[@]}"
 
-  cat ${PACKAGE_NAME}.part-* > ${PACKAGE_NAME}
-  sha256sum -c SHA256SUMS
-  tar -xf ${PACKAGE_NAME}
+cat > "${RELEASE_DIR}/download.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
 
-The split files keep every GitHub Release asset below the 2 GiB limit.
+: "\${COS_SECRET_ID:?Please set COS_SECRET_ID to a read-only COS credential}"
+: "\${COS_SECRET_KEY:?Please set COS_SECRET_KEY to a read-only COS credential}"
+
+PACKAGE_NAME="${PACKAGE_NAME}"
+PACKAGE_SHA256="${PACKAGE_SHA256}"
+COS_BUCKET="${COS_BUCKET}"
+COS_ENDPOINT="${COS_ENDPOINT}"
+COS_OBJECT="${COS_RELEASE_OBJECT}"
+COSCLI_DOWNLOAD_BASE="${COSCLI_DOWNLOAD_URL%-amd64}"
+
+case "\$(uname -m)" in
+  x86_64|amd64) COSCLI_ARCH="amd64" ;;
+  aarch64|arm64) COSCLI_ARCH="arm64" ;;
+  *)
+    echo "error: unsupported Linux architecture: \$(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+WORK_DIR="\$(mktemp -d)"
+trap 'rm -rf "\$WORK_DIR"' EXIT
+COSCLI="\${WORK_DIR}/coscli"
+
+curl --fail --location --retry 3 --retry-delay 2 \
+  "\${COSCLI_DOWNLOAD_BASE}-\${COSCLI_ARCH}" \
+  --output "\$COSCLI"
+chmod +x "\$COSCLI"
+
+COSCLI_ARGS=(
+  -e "\$COS_ENDPOINT"
+  -i "\$COS_SECRET_ID"
+  -k "\$COS_SECRET_KEY"
+  --init-skip=true
+  --disable-log
+)
+if [[ -n "\${COS_SESSION_TOKEN:-}" ]]; then
+  COSCLI_ARGS+=(--token "\$COS_SESSION_TOKEN")
+fi
+
+"\$COSCLI" cp \
+  "cos://\${COS_BUCKET}/\${COS_OBJECT}" \
+  "\$PACKAGE_NAME" \
+  "\${COSCLI_ARGS[@]}"
+
+printf '%s  %s\n' "\$PACKAGE_SHA256" "\$PACKAGE_NAME" | sha256sum -c -
+echo "Downloaded and verified: \$PACKAGE_NAME"
+echo "Extract with: tar -xf \$PACKAGE_NAME"
 EOF
+chmod +x "${RELEASE_DIR}/download.sh"
 
 echo "==> Release files"
 ls -lh "$RELEASE_DIR"
