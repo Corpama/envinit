@@ -101,14 +101,8 @@ PACKAGE_NAME="env_tool-${RELEASE_TAG}.tar"
 PACKAGE_PATH="${WORK_ROOT}/${PACKAGE_NAME}"
 COS_RELEASE_OBJECT="${COS_RELEASE_PREFIX}/${RELEASE_TAG}/${PACKAGE_NAME}"
 tar -C "$STAGE_DIR" -cf "$PACKAGE_PATH" env_tool
-cp "${STAGE_DIR}/env_tool/env_init" "${RELEASE_DIR}/env_init"
-cp "${STAGE_DIR}/env_tool/env_init_arch" "${RELEASE_DIR}/env_init_arch"
 PACKAGE_SHA256="$(sha256sum "$PACKAGE_PATH" | awk '{print $1}')"
-(
-  cd "$RELEASE_DIR"
-  sha256sum env_init env_init_arch > SHA256SUMS
-)
-printf '%s  %s\n' "$PACKAGE_SHA256" "$PACKAGE_NAME" >> "${RELEASE_DIR}/SHA256SUMS"
+printf '%s  %s\n' "$PACKAGE_SHA256" "$PACKAGE_NAME" > "${RELEASE_DIR}/SHA256SUMS"
 
 echo "==> Uploading complete package to cos://${COS_BUCKET}/${COS_RELEASE_OBJECT}"
 upload_release_package() {
