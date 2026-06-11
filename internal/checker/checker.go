@@ -98,6 +98,8 @@ type rdmaDeviceCounterSnapshot struct {
 	Devices map[string]map[string]map[string]int64
 }
 
+type resolvedRDMAGroups map[string][]spec.CheckRDMAGroup
+
 type nicCounterRow struct {
 	Status  string
 	Node    string
@@ -151,6 +153,14 @@ func Run(opts Options) error {
 			}
 		}
 	}
+	resolvedGroups := resolvedRDMAGroups{}
+	if runBandwidth {
+		var err error
+		resolvedGroups, err = resolveBandwidthGroups(opts, targets)
+		if err != nil {
+			return err
+		}
+	}
 
 	var failures []string
 	var bandwidthResults []Result
@@ -162,7 +172,7 @@ func Run(opts Options) error {
 	var rdmaDeviceBefore map[string]rdmaDeviceCounterSnapshot
 	if runBandwidth {
 		var rdmaFailures []string
-		rdmaDeviceBefore, rdmaFailures = collectRDMADeviceCounterSnapshots(opts, targets, "before")
+		rdmaDeviceBefore, rdmaFailures = collectRDMADeviceCounterSnapshots(opts, targets, resolvedGroups, "before")
 		failures = append(failures, rdmaFailures...)
 	}
 	if runBandwidth {
@@ -170,7 +180,7 @@ func Run(opts Options) error {
 			for j := i + 1; j < len(targets); j++ {
 				for _, pair := range [][2]Target{{targets[i], targets[j]}, {targets[j], targets[i]}} {
 					if opts.Bundle.Check.Parallel {
-						results, errs := runParallel(opts, pair[0], pair[1])
+						results, errs := runParallel(opts, resolvedGroups, pair[0], pair[1])
 						for _, err := range errs {
 							failures = append(failures, err.Error())
 							fmt.Fprintf(opts.Output, "FAIL %s -> %s: %v\n", pair[1].Name, pair[0].Name, err)
@@ -183,6 +193,7 @@ func Run(opts Options) error {
 					}
 
 					for _, stream := range bandwidthStreams(opts.Bundle.Check) {
+						stream = resolveStreamGroups(resolvedGroups, pair[0], pair[1], stream)
 						result, err := runStream(opts, pair[0], pair[1], stream)
 						if err != nil {
 							failures = append(failures, err.Error())
@@ -198,9 +209,9 @@ func Run(opts Options) error {
 	}
 	if runBandwidth {
 		printBandwidthResultTable(opts.Output, bandwidthResults)
-		rdmaDeviceAfter, rdmaFailures := collectRDMADeviceCounterSnapshots(opts, targets, "after")
+		rdmaDeviceAfter, rdmaFailures := collectRDMADeviceCounterSnapshots(opts, targets, resolvedGroups, "after")
 		failures = append(failures, rdmaFailures...)
-		failures = append(failures, compareRDMADeviceCounterSnapshots(opts, targets, rdmaDeviceBefore, rdmaDeviceAfter)...)
+		failures = append(failures, compareRDMADeviceCounterSnapshots(opts, targets, resolvedGroups, rdmaDeviceBefore, rdmaDeviceAfter)...)
 	}
 	nicAfter, nicFailures := collectNICCounterSnapshots(opts, targets, "after")
 	failures = append(failures, nicFailures...)
@@ -490,6 +501,85 @@ func targetCounterInterfaces(bundle spec.Bundle, target Target) []string {
 	return interfaces
 }
 
+func targetRDMAInterfaceName(bundle spec.Bundle, target Target, index int) string {
+	if index >= 0 && index < len(target.RDMA) {
+		if name := strings.TrimSpace(target.RDMA[index].Name); name != "" {
+			return name
+		}
+	}
+	if index >= 0 && index < len(bundle.Defaults.RDMAInterfaces) {
+		return strings.TrimSpace(bundle.Defaults.RDMAInterfaces[index].Name)
+	}
+	return ""
+}
+
+func resolveBandwidthGroups(opts Options, targets []Target) (resolvedRDMAGroups, error) {
+	out := resolvedRDMAGroups{}
+	for _, target := range targets {
+		groups := make([]spec.CheckRDMAGroup, len(opts.Bundle.Check.RDMAGroups))
+		copy(groups, opts.Bundle.Check.RDMAGroups)
+		for idx := range groups {
+			iface := targetRDMAInterfaceName(opts.Bundle, target, idx)
+			iface = strings.TrimSpace(iface)
+			if iface == "" {
+				continue
+			}
+			if opts.DryRun {
+				continue
+			}
+			device, err := resolveIBDeviceForInterface(opts, target, iface)
+			if err != nil {
+				return nil, err
+			}
+			configured := strings.TrimSpace(groups[idx].IBDevice)
+			groups[idx].IBDevice = device
+			if configured != "" && configured != device {
+				fmt.Fprintf(opts.Output, "WARN rdma group resolve: %s rdma%d iface=%s configured_ib_device=%s actual_ib_device=%s; using actual device\n", target.Name, idx+1, iface, configured, device)
+			} else {
+				fmt.Fprintf(opts.Output, "INFO rdma group resolve: %s rdma%d iface=%s ib_device=%s\n", target.Name, idx+1, iface, device)
+			}
+		}
+		out[target.Name] = groups
+	}
+	return out, nil
+}
+
+func resolveIBDeviceForInterface(opts Options, target Target, iface string) (string, error) {
+	command := resolveIBDeviceCommand(iface)
+	output, err := runCommand(opts.Bundle.Check, target, command)
+	if err != nil {
+		return "", fmt.Errorf("resolve ib device for %s %s: %w", target.Name, iface, err)
+	}
+	devices := parseResolvedIBDevices(output)
+	if len(devices) == 0 {
+		return "", fmt.Errorf("resolve ib device for %s %s: no infiniband device found under /sys/class/net/%s/device/infiniband", target.Name, iface, iface)
+	}
+	if len(devices) > 1 {
+		return "", fmt.Errorf("resolve ib device for %s %s: multiple infiniband devices found: %s", target.Name, iface, strings.Join(devices, ", "))
+	}
+	return devices[0], nil
+}
+
+func resolveIBDeviceCommand(iface string) string {
+	quoted := shellQuote(iface)
+	return fmt.Sprintf("for d in /sys/class/net/%s/device/infiniband/*; do [ -e \"$d\" ] || continue; basename \"$d\"; done", quoted)
+}
+
+func parseResolvedIBDevices(output string) []string {
+	seen := map[string]bool{}
+	var devices []string
+	for _, rawLine := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || seen[line] {
+			continue
+		}
+		seen[line] = true
+		devices = append(devices, line)
+	}
+	sort.Strings(devices)
+	return devices
+}
+
 func nicCounterCommand(interfaces []string) string {
 	quoted := make([]string, 0, len(interfaces))
 	for _, name := range interfaces {
@@ -681,15 +771,15 @@ func printNICCounterTable(output io.Writer, rows []nicCounterRow) {
 	}
 }
 
-func collectRDMADeviceCounterSnapshots(opts Options, targets []Target, phase string) (map[string]rdmaDeviceCounterSnapshot, []string) {
+func collectRDMADeviceCounterSnapshots(opts Options, targets []Target, groupsByTarget resolvedRDMAGroups, phase string) (map[string]rdmaDeviceCounterSnapshot, []string) {
 	snapshots := map[string]rdmaDeviceCounterSnapshot{}
-	devices := rdmaCounterDevices(opts.Bundle.Check)
-	if len(devices) == 0 {
-		return snapshots, nil
-	}
-	command := rdmaDeviceCounterCommand(devices)
 	var failures []string
 	for _, target := range targets {
+		devices := rdmaCounterDevices(groupsByTarget[target.Name])
+		if len(devices) == 0 {
+			continue
+		}
+		command := rdmaDeviceCounterCommand(devices)
 		if opts.DryRun {
 			fmt.Fprintf(opts.Output, "dry-run rdma-device-counters %s %s: %s\n", phase, target.Name, command)
 			continue
@@ -706,10 +796,10 @@ func collectRDMADeviceCounterSnapshots(opts Options, targets []Target, phase str
 	return snapshots, failures
 }
 
-func rdmaCounterDevices(cfg spec.CheckConfig) []string {
+func rdmaCounterDevices(groups []spec.CheckRDMAGroup) []string {
 	seen := map[string]bool{}
-	devices := make([]string, 0, len(cfg.RDMAGroups))
-	for _, group := range cfg.RDMAGroups {
+	devices := make([]string, 0, len(groups))
+	for _, group := range groups {
 		device := strings.TrimSpace(group.IBDevice)
 		if device == "" || seen[device] {
 			continue
@@ -767,19 +857,19 @@ func parseRDMADeviceCounterOutput(output string) map[string]map[string]map[strin
 	return counters
 }
 
-func compareRDMADeviceCounterSnapshots(opts Options, targets []Target, before map[string]rdmaDeviceCounterSnapshot, after map[string]rdmaDeviceCounterSnapshot) []string {
+func compareRDMADeviceCounterSnapshots(opts Options, targets []Target, groupsByTarget resolvedRDMAGroups, before map[string]rdmaDeviceCounterSnapshot, after map[string]rdmaDeviceCounterSnapshot) []string {
 	if opts.DryRun {
 		return nil
 	}
 	var rows []rdmaDeviceCounterRow
 	abnormalCount := 0
-	devices := rdmaCounterDevices(opts.Bundle.Check)
 	for _, target := range targets {
 		targetBefore, beforeOK := before[target.Name]
 		targetAfter, afterOK := after[target.Name]
 		if !beforeOK || !afterOK {
 			continue
 		}
+		devices := rdmaCounterDevices(groupsByTarget[target.Name])
 		for _, device := range devices {
 			ports := unionRDMADevicePorts(targetBefore.Devices[device], targetAfter.Devices[device])
 			if len(ports) == 0 {
@@ -1223,13 +1313,14 @@ func validateGroup(cfg spec.CheckConfig, group spec.CheckRDMAGroup) error {
 	return nil
 }
 
-func runParallel(opts Options, server Target, client Target) ([]Result, []error) {
+func runParallel(opts Options, groupsByTarget resolvedRDMAGroups, server Target, client Target) ([]Result, []error) {
 	batches := bandwidthStreamBatches(opts.Bundle.Check)
 	if opts.DryRun {
 		results := make([]Result, 0)
 		for batchIndex, batch := range batches {
 			fmt.Fprintf(opts.Output, "dry-run bandwidth batch %d %s -> %s: %d stream(s)\n", batchIndex+1, client.Name, server.Name, len(batch))
 			for _, stream := range batch {
+				stream = resolveStreamGroups(groupsByTarget, server, client, stream)
 				serverArgs := ibWriteBWArgs(opts.Bundle.Check, stream.ServerGroup, stream.ServerOffset, "", stream.Port)
 				clientArgs := ibWriteBWArgs(opts.Bundle.Check, stream.ClientGroup, stream.ClientOffset, bandwidthPeerAddress(server, stream), stream.Port)
 				fmt.Fprintf(opts.Output, "dry-run server %s: %s\n", server.Name, shellJoin(serverArgs))
@@ -1243,11 +1334,24 @@ func runParallel(opts Options, server Target, client Target) ([]Result, []error)
 	var results []Result
 	var errs []error
 	for _, batch := range batches {
+		for idx := range batch {
+			batch[idx] = resolveStreamGroups(groupsByTarget, server, client, batch[idx])
+		}
 		batchResults, batchErrs := runParallelBatch(opts, server, client, batch)
 		results = append(results, batchResults...)
 		errs = append(errs, batchErrs...)
 	}
 	return results, errs
+}
+
+func resolveStreamGroups(groupsByTarget resolvedRDMAGroups, server Target, client Target, stream checkStream) checkStream {
+	if groups := groupsByTarget[server.Name]; stream.ServerRDMAIndex >= 0 && stream.ServerRDMAIndex < len(groups) {
+		stream.ServerGroup = groups[stream.ServerRDMAIndex]
+	}
+	if groups := groupsByTarget[client.Name]; stream.ClientRDMAIndex >= 0 && stream.ClientRDMAIndex < len(groups) {
+		stream.ClientGroup = groups[stream.ClientRDMAIndex]
+	}
+	return stream
 }
 
 func runParallelBatch(opts Options, server Target, client Target, streams []checkStream) ([]Result, []error) {

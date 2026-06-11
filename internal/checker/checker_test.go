@@ -333,6 +333,47 @@ func TestRunDryRunUsesMatchingRDMAAddressWhenPresent(t *testing.T) {
 	}
 }
 
+func TestParseResolvedIBDevices(t *testing.T) {
+	got := parseResolvedIBDevices(`
+mlx5_3
+
+mlx5_1
+mlx5_3
+`)
+	want := []string{"mlx5_1", "mlx5_3"}
+	if len(got) != len(want) {
+		t.Fatalf("unexpected device count: got %#v want %#v", got, want)
+	}
+	for idx := range want {
+		if got[idx] != want[idx] {
+			t.Fatalf("unexpected devices: got %#v want %#v", got, want)
+		}
+	}
+}
+
+func TestResolveStreamGroupsUsesPerTargetIBDevices(t *testing.T) {
+	stream := checkStream{
+		ServerGroup:     spec.CheckRDMAGroup{IBDevice: "mlx5_1"},
+		ServerRDMAIndex: 0,
+		ClientGroup:     spec.CheckRDMAGroup{IBDevice: "mlx5_1"},
+		ClientRDMAIndex: 0,
+		Port:            18515,
+	}
+	server := Target{Name: "node-a", Address: "10.0.0.1"}
+	client := Target{Name: "node-b", Address: "10.0.0.2"}
+	groups := resolvedRDMAGroups{
+		"node-a": {{IBDevice: "mlx5_2"}},
+		"node-b": {{IBDevice: "mlx5_1"}},
+	}
+	got := resolveStreamGroups(groups, server, client, stream)
+	if got.ServerGroup.IBDevice != "mlx5_2" {
+		t.Fatalf("unexpected server device: %#v", got)
+	}
+	if got.ClientGroup.IBDevice != "mlx5_1" {
+		t.Fatalf("unexpected client device: %#v", got)
+	}
+}
+
 func TestRunRDMAPingDryRunUsesJumboPayload(t *testing.T) {
 	var output bytes.Buffer
 	bundle := spec.Bundle{}
@@ -598,7 +639,9 @@ func TestCompareRDMADeviceCounterSnapshotsSummarizesAbnormalDeltas(t *testing.T)
 			},
 		},
 	}
-	failures := compareRDMADeviceCounterSnapshots(opts, []Target{target}, before, after)
+	failures := compareRDMADeviceCounterSnapshots(opts, []Target{target}, resolvedRDMAGroups{
+		"node1": {{IBDevice: "mlx5_1"}},
+	}, before, after)
 	if len(failures) != 1 {
 		t.Fatalf("expected summarized failure, got %#v", failures)
 	}

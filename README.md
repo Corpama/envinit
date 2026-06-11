@@ -717,7 +717,7 @@ RDMA 网：
 - `min_gbits`：最低带宽门槛；`0` 表示只记录，不按吞吐失败。
 - `parallel`：是否按批次并发跑流。
 - `rdma_ping_payload_size`：默认 `8972`，用于验证 IPv4 MTU 9000。
-- `rdma_groups`：带宽检查使用的 IB 设备列表。
+- `rdma_groups`：带宽检查的逻辑 RDMA 分组列表。运行时会优先按规划表或 defaults 中的 `rdmaN_name`，在每台目标机器上通过 `/sys/class/net/<iface>/device/infiniband/*` 自动解析实际 `mlx5_N`；这里的 `ib_device` 保留为 fallback 和 dry-run 预览值。
 - `xpu_offsets`：仅在 `check --bandwidth-mmap xdr` 时使用。
 
 ### 6.7 post_packages、post_tasks 和 post_power_action
@@ -786,12 +786,14 @@ RDMA 网：
 
 RDMA 网卡与 IB 设备的对应关系：
 
-| 规划表字段 | RDMA 网卡 | `check.rdma_groups[].ib_device` | 预期单流带宽 |
+| 规划表字段 | RDMA 网卡 | `check.rdma_groups[].ib_device` fallback | 预期单流带宽 |
 | --- | --- | --- | --- |
 | `rdma1_ip` | `ens11np0` | `mlx5_1` | 约 `390 Gbps` |
 | `rdma2_ip` | `ens13np0` | `mlx5_2` | 约 `390 Gbps` |
 | `rdma3_ip` | `ens15np0` | `mlx5_3` | 约 `390 Gbps` |
 | `rdma4_ip` | `ens17np0` | `mlx5_4` | 约 `390 Gbps` |
+
+实际执行带宽测试时，工具不会假设所有机器的 `mlx5_N` 编号完全一致。它会按第 N 个 RDMA 网卡名解析本机 IB device，例如某台机器可能是 `rdma1_name=ens11np0 -> mlx5_1`，另一台机器也可能是 `rdma1_name=ens11np0 -> mlx5_2`；带宽命令会分别使用各自解析出的实际设备。这样可以避免 PCI 探测顺序不同导致 `mlx5_N` 整体偏移时测错卡。
 
 对应的规划表示例：
 
@@ -846,7 +848,7 @@ sudo ./env_init check \
   --check-stage bandwidth
 ```
 
-四组 RDMA group 会形成交叉矩阵。每个方向共有 `4 x 4 = 16` 条流。设置 `"parallel": true` 后，每批并发执行 4 条流，并确保一张 400G 卡在同一批中只参与一条流，避免同一端口被多条流同时抢带宽。
+四组 RDMA group 会形成交叉矩阵。每个方向共有 `4 x 4 = 16` 条流。设置 `"parallel": true` 后，每批并发执行 4 条流，并确保一张 400G 卡在同一批中只参与一条流，避免同一端口被多条流同时抢带宽。正式执行时，输出中的 `CLIENT_DEV` 和 `SERVER_DEV` 是每台机器按网卡名解析后的实际 `mlx5_N`。
 
 正常输出示意：
 
