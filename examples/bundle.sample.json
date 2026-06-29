@@ -1,7 +1,8 @@
 {
   "defaults": {
+    "configure_management_network": true,
+    "apply_network_immediately": true,
     "mgmt_bond_name": "bond0",
-    "mgmt_interfaces": ["ens20f0np0", "ens20f1np1"],
     "mgmt_prefix": 26,
     "mgmt_gateway": "10.101.9.1",
     "mgmt_nameservers": [],
@@ -15,24 +16,26 @@
     "rdma_route_cidr": "11.1.0.0/21",
     "rdma_exsist": true,
     "rdma_configure_ip_route": true,
-    "route_priority": 32761,
-    "backup_existing_netplan": true,
-    "disable_existing_apt_sources": false,
-    "rdma_interfaces": [
-      { "name": "ens11np0", "table": 101 },
-      { "name": "ens13np0", "table": 102 },
-      { "name": "ens15np0", "table": 103 },
-      { "name": "ens17np0", "table": 104 }
-    ]
+    "route_priority": 32761
+  },
+  "platform_options": {
+    "ubuntu": {
+      "backup_existing_netplan": true,
+      "disable_existing_apt_sources": false
+    },
+    "redhat": {
+      "backup_existing_network": false,
+      "disable_existing_repos": false
+    }
   },
   "offline_apt": {
     "enabled": true,
     "material_path": "/mnt/usb/repo",
-    "copy_to": "/opt/repo",
-    "target_file": "/etc/apt/sources.list.d/kunlun-offline.list",
-    "entries": [
-      "deb [trusted=yes] file:{{offline_apt_target}} jammy main"
-    ]
+    "copy_to": "/opt/repo"
+  },
+  "offline_repo": {
+    "enabled": false,
+    "material_path": "/mnt/usb/rpm-repo"
   },
   "packages": [
     "linux-headers-{{uname_r}}",
@@ -56,13 +59,13 @@
     "card_model": "P800"
   },
   "mlxconfig": {
-    "device_glob": "/dev/mst/mt4129_pciconf*",
     "settings": {
       "CNP_DSCP_P1": "48"
     }
   },
   "check": {
     "iterations": 100,
+    "bandwidth_qps": 0,
     "report_gbits": true,
     "min_gbits": 0,
     "ssh_user": "root",

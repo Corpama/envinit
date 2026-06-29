@@ -11,7 +11,10 @@ import (
 
 type Bundle struct {
 	Defaults                     Defaults         `json:"defaults"`
+	Platform                     PlatformConfig   `json:"platform"`
+	PlatformOptions              PlatformOptions  `json:"platform_options"`
 	OfflineAPT                   OfflineAPTConfig `json:"offline_apt"`
+	OfflineRepo                  OfflineAPTConfig `json:"offline_repo"`
 	Packages                     []string         `json:"packages"`
 	Artifacts                    Artifacts        `json:"artifacts"`
 	XRE                          XREConfig        `json:"xre"`
@@ -26,27 +29,54 @@ type Bundle struct {
 }
 
 type Defaults struct {
-	MgmtBondName              string                 `json:"mgmt_bond_name"`
-	MgmtInterfaces            []string               `json:"mgmt_interfaces"`
-	MgmtPrefix                int                    `json:"mgmt_prefix"`
-	MgmtGateway               string                 `json:"mgmt_gateway"`
-	MgmtNameservers           []string               `json:"mgmt_nameservers"`
-	MgmtMTU                   int                    `json:"mgmt_mtu"`
-	BondMode                  string                 `json:"bond_mode"`
-	BondLACPRate              string                 `json:"bond_lacp_rate"`
-	BondTransmitHashPolicy    string                 `json:"bond_transmit_hash_policy"`
-	BondMIIMonitorInterval    int                    `json:"bond_mii_monitor_interval"`
-	BondPrimary               string                 `json:"bond_primary"`
-	RDMAPrefix                int                    `json:"rdma_prefix"`
-	RDMAMTU                   int                    `json:"rdma_mtu"`
-	RDMARouteCIDR             string                 `json:"rdma_route_cidr"`
-	RoutePriority             int                    `json:"route_priority"`
-	RDMAExsist                *bool                  `json:"rdma_exsist,omitempty"`
-	RDMAExist                 *bool                  `json:"rdma_exist,omitempty"`
-	RDMAConfigureIPRoute      *bool                  `json:"rdma_configure_ip_route,omitempty"`
-	BackupExistingNetplan     bool                   `json:"backup_existing_netplan"`
-	DisableExistingAptSources bool                   `json:"disable_existing_apt_sources"`
-	RDMAInterfaces            []RDMAInterfaceDefault `json:"rdma_interfaces"`
+	MgmtBondName               string                 `json:"mgmt_bond_name"`
+	MgmtInterfaces             []string               `json:"mgmt_interfaces"`
+	MgmtPrefix                 int                    `json:"mgmt_prefix"`
+	MgmtGateway                string                 `json:"mgmt_gateway"`
+	MgmtNameservers            []string               `json:"mgmt_nameservers"`
+	MgmtMTU                    int                    `json:"mgmt_mtu"`
+	BondMode                   string                 `json:"bond_mode"`
+	BondLACPRate               string                 `json:"bond_lacp_rate"`
+	BondTransmitHashPolicy     string                 `json:"bond_transmit_hash_policy"`
+	BondMIIMonitorInterval     int                    `json:"bond_mii_monitor_interval"`
+	BondPrimary                string                 `json:"bond_primary"`
+	RDMAPrefix                 int                    `json:"rdma_prefix"`
+	RDMAMTU                    int                    `json:"rdma_mtu"`
+	RDMARouteCIDR              string                 `json:"rdma_route_cidr"`
+	RoutePriority              int                    `json:"route_priority"`
+	RDMAExsist                 *bool                  `json:"rdma_exsist,omitempty"`
+	RDMAExist                  *bool                  `json:"rdma_exist,omitempty"`
+	RDMAConfigureIPRoute       *bool                  `json:"rdma_configure_ip_route,omitempty"`
+	ConfigureManagementNetwork *bool                  `json:"configure_management_network,omitempty"`
+	ApplyNetworkImmediately    *bool                  `json:"apply_network_immediately,omitempty"`
+	BackupExistingNetplan      bool                   `json:"backup_existing_netplan"`
+	BackupExistingNetwork      bool                   `json:"backup_existing_network"`
+	DisableExistingAptSources  bool                   `json:"disable_existing_apt_sources"`
+	DisableExistingRepos       bool                   `json:"disable_existing_repos"`
+	RDMAInterfaces             []RDMAInterfaceDefault `json:"rdma_interfaces"`
+}
+
+type PlatformOptions struct {
+	Ubuntu UbuntuPlatformOptions `json:"ubuntu"`
+	RedHat RedHatPlatformOptions `json:"redhat"`
+}
+
+type UbuntuPlatformOptions struct {
+	BackupExistingNetplan     *bool `json:"backup_existing_netplan,omitempty"`
+	DisableExistingAptSources *bool `json:"disable_existing_apt_sources,omitempty"`
+}
+
+type RedHatPlatformOptions struct {
+	BackupExistingNetwork *bool `json:"backup_existing_network,omitempty"`
+	DisableExistingRepos  *bool `json:"disable_existing_repos,omitempty"`
+}
+
+type PlatformConfig struct {
+	OSFamily             string `json:"os_family"`
+	PackageManager       string `json:"package_manager"`
+	NetworkBackend       string `json:"network_backend"`
+	KernelHeadersPackage string `json:"kernel_headers_package"`
+	KernelHeadersDir     string `json:"kernel_headers_dir"`
 }
 
 type RDMAInterfaceDefault struct {
@@ -86,6 +116,7 @@ type CheckConfig struct {
 	Duration            int              `json:"duration"`
 	GIDIndex            int              `json:"gid_index"`
 	Iterations          int              `json:"iterations"`
+	BandwidthQPs        int              `json:"bandwidth_qps"`
 	MessageSize         int              `json:"message_size"`
 	ReportGBits         bool             `json:"report_gbits"`
 	MmapDevice          string           `json:"mmap_device"`
@@ -176,11 +207,9 @@ type RDMAConfig struct {
 }
 
 func (b *Bundle) ApplyDefaults() {
+	b.Platform.ApplyDefaults()
 	if b.Defaults.MgmtBondName == "" {
 		b.Defaults.MgmtBondName = "bond0"
-	}
-	if len(b.Defaults.MgmtInterfaces) == 0 {
-		b.Defaults.MgmtInterfaces = []string{"ens20f0np0", "ens20f1np1"}
 	}
 	if b.Defaults.MgmtPrefix == 0 {
 		b.Defaults.MgmtPrefix = 26
@@ -226,11 +255,25 @@ func (b *Bundle) ApplyDefaults() {
 	if b.OfflineAPT.CopyTo == "" && strings.TrimSpace(b.OfflineAPT.MaterialPath) != "" {
 		b.OfflineAPT.CopyTo = "/opt/" + strings.Trim(filepath.Base(strings.TrimSpace(b.OfflineAPT.MaterialPath)), "/")
 	}
+	if b.OfflineAPT.Enabled && len(b.OfflineAPT.Entries) == 0 && strings.TrimSpace(b.OfflineAPT.MaterialPath) != "" {
+		b.OfflineAPT.Entries = defaultOfflineRepoEntries("apt")
+	}
+	if b.OfflineRepo.TargetFile == "" && (b.OfflineRepo.Enabled || strings.TrimSpace(b.OfflineRepo.MaterialPath) != "" || len(b.OfflineRepo.Entries) > 0) {
+		switch b.Platform.PackageManager {
+		case "yum":
+			b.OfflineRepo.TargetFile = "/etc/yum.repos.d/kunlun-offline.repo"
+		default:
+			b.OfflineRepo.TargetFile = "/etc/apt/sources.list.d/kunlun-offline.list"
+		}
+	}
+	if b.OfflineRepo.CopyTo == "" && strings.TrimSpace(b.OfflineRepo.MaterialPath) != "" {
+		b.OfflineRepo.CopyTo = "/opt/" + strings.Trim(filepath.Base(strings.TrimSpace(b.OfflineRepo.MaterialPath)), "/")
+	}
+	if b.OfflineRepo.Enabled && len(b.OfflineRepo.Entries) == 0 && strings.TrimSpace(b.OfflineRepo.MaterialPath) != "" {
+		b.OfflineRepo.Entries = defaultOfflineRepoEntries(b.Platform.PackageManager)
+	}
 	if b.Artifacts.WorkDir == "" {
 		b.Artifacts.WorkDir = "/opt/kunlun"
-	}
-	if b.MlxConfig.DeviceGlob == "" {
-		b.MlxConfig.DeviceGlob = "/dev/mst/mt4129_pciconf*"
 	}
 	if b.Check.Duration == 0 {
 		b.Check.Duration = 1
@@ -266,6 +309,114 @@ func (b *Bundle) ApplyDefaults() {
 	}
 }
 
+func (b Bundle) Validate() error {
+	return b.Platform.Validate()
+}
+
+func (p *PlatformConfig) ApplyDefaults() {
+	p.OSFamily = normalizeAutoPlatformValue(p.OSFamily)
+	p.PackageManager = normalizeAutoPlatformValue(p.PackageManager)
+	p.NetworkBackend = strings.TrimSpace(strings.ToLower(p.NetworkBackend))
+	if p.OSFamily == "" {
+		p.OSFamily = inferOSFamily(p.PackageManager, p.NetworkBackend)
+	}
+	if p.PackageManager == "" && (p.OSFamily == "ubuntu" || p.OSFamily == "debian") {
+		p.PackageManager = "apt"
+	}
+	if p.PackageManager == "" && isRedHatFamily(p.OSFamily) {
+		p.PackageManager = "yum"
+	}
+	if p.NetworkBackend == "" && (p.PackageManager == "apt" || p.OSFamily == "ubuntu" || p.OSFamily == "debian") {
+		p.NetworkBackend = "netplan"
+	}
+	if p.NetworkBackend == "" && isRedHatFamily(p.OSFamily) {
+		p.NetworkBackend = "auto"
+	}
+	if p.KernelHeadersPackage == "" && p.PackageManager == "yum" {
+		p.KernelHeadersPackage = "kernel-devel-{{uname_r}}"
+	}
+	if p.KernelHeadersDir == "" && p.PackageManager == "yum" {
+		p.KernelHeadersDir = "/usr/src/kernels/{{uname_r}}"
+	}
+}
+
+func normalizeAutoPlatformValue(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "auto" {
+		return ""
+	}
+	return value
+}
+
+func defaultOfflineRepoEntries(packageManager string) []string {
+	switch strings.TrimSpace(strings.ToLower(packageManager)) {
+	case "yum":
+		return []string{
+			"[kunlun-offline]",
+			"name=Kunlun Offline",
+			"baseurl=file://{{offline_repo_target}}",
+			"enabled=1",
+			"gpgcheck=0",
+		}
+	default:
+		return []string{
+			"deb [trusted=yes] file:{{offline_apt_target}} ./",
+		}
+	}
+}
+
+func (p PlatformConfig) Validate() error {
+	osFamily := strings.TrimSpace(strings.ToLower(p.OSFamily))
+	packageManager := strings.TrimSpace(strings.ToLower(p.PackageManager))
+	networkBackend := strings.TrimSpace(strings.ToLower(p.NetworkBackend))
+
+	if packageManager == "apt" || osFamily == "ubuntu" || osFamily == "debian" {
+		switch networkBackend {
+		case "", "netplan":
+			return nil
+		default:
+			return fmt.Errorf("platform.network_backend %q is not supported with os_family=%q package_manager=%q; use netplan or leave it empty for Ubuntu/Debian systems", networkBackend, osFamily, packageManager)
+		}
+	}
+
+	if packageManager == "yum" || isRedHatFamily(osFamily) {
+		switch networkBackend {
+		case "", "auto", "ifcfg", "network", "network-scripts", "networkmanager", "network-manager", "nm":
+			return nil
+		default:
+			return fmt.Errorf("platform.network_backend %q is not supported with os_family=%q package_manager=%q; use auto, network, or networkmanager for RedHat-family systems", networkBackend, osFamily, packageManager)
+		}
+	}
+
+	if networkBackend != "" && networkBackend != "netplan" {
+		return fmt.Errorf("platform.network_backend %q requires a matching platform; use netplan for apt/Ubuntu or auto/network/networkmanager for yum/RedHat-family systems", networkBackend)
+	}
+	return nil
+}
+
+func inferOSFamily(packageManager string, networkBackend string) string {
+	switch strings.TrimSpace(strings.ToLower(packageManager)) {
+	case "apt":
+		return "ubuntu"
+	case "yum":
+		return "redhat"
+	}
+	switch strings.TrimSpace(strings.ToLower(networkBackend)) {
+	case "auto", "network", "network-scripts", "networkmanager", "network-manager", "nm", "ifcfg":
+		return "redhat"
+	}
+	return ""
+}
+
+func isRedHatFamily(osFamily string) bool {
+	switch strings.TrimSpace(strings.ToLower(osFamily)) {
+	case "redhat", "rhel", "centos", "kylin", "rocky", "almalinux", "anolis":
+		return true
+	default:
+		return false
+	}
+}
+
 func (b Bundle) RDMAExists() bool {
 	return firstConfiguredBool(true, b.TopLevelRDMAExist, b.TopLevelRDMAExsist, b.Defaults.RDMAExist, b.Defaults.RDMAExsist)
 }
@@ -275,6 +426,30 @@ func (b Bundle) RDMAConfigureIPRoute() bool {
 		return false
 	}
 	return firstConfiguredBool(true, b.TopLevelRDMAConfigureIPRoute, b.Defaults.RDMAConfigureIPRoute)
+}
+
+func (b Bundle) ConfigureManagementNetwork() bool {
+	return firstConfiguredBool(true, b.Defaults.ConfigureManagementNetwork)
+}
+
+func (b Bundle) ApplyNetworkImmediately() bool {
+	return firstConfiguredBool(true, b.Defaults.ApplyNetworkImmediately)
+}
+
+func (b Bundle) BackupExistingNetplan() bool {
+	return firstConfiguredBool(b.Defaults.BackupExistingNetplan, b.PlatformOptions.Ubuntu.BackupExistingNetplan)
+}
+
+func (b Bundle) DisableExistingAptSources() bool {
+	return firstConfiguredBool(b.Defaults.DisableExistingAptSources, b.PlatformOptions.Ubuntu.DisableExistingAptSources)
+}
+
+func (b Bundle) BackupExistingNetwork() bool {
+	return firstConfiguredBool(b.Defaults.BackupExistingNetwork, b.PlatformOptions.RedHat.BackupExistingNetwork)
+}
+
+func (b Bundle) DisableExistingRepos() bool {
+	return firstConfiguredBool(b.Defaults.DisableExistingRepos || b.Defaults.DisableExistingAptSources, b.PlatformOptions.RedHat.DisableExistingRepos)
 }
 
 func firstConfiguredBool(defaultValue bool, values ...*bool) bool {
@@ -287,12 +462,10 @@ func firstConfiguredBool(defaultValue bool, values ...*bool) bool {
 }
 
 func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]string) (MachineConfig, error) {
-	if strings.TrimSpace(record.MgmtIP) == "" {
-		return MachineConfig{}, errors.New("inventory row missing mgmt_ip")
-	}
+	configureMgmt := bundle.ConfigureManagementNetwork() && strings.TrimSpace(record.MgmtIP) != ""
 
 	mgmtPrefix := bundle.Defaults.MgmtPrefix
-	if record.MgmtPrefix != "" {
+	if configureMgmt && record.MgmtPrefix != "" {
 		p, err := strconv.Atoi(strings.TrimSpace(record.MgmtPrefix))
 		if err != nil {
 			return MachineConfig{}, fmt.Errorf("invalid mgmt_prefix %q: %w", record.MgmtPrefix, err)
@@ -302,53 +475,58 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 
 	mgmtIfaces := make([]string, 0, 2)
 	mgmtMACs := make([]string, 0, 2)
-	resolveMgmtCount := len(bundle.Defaults.MgmtInterfaces)
-	if resolveMgmtCount == 0 {
-		resolveMgmtCount = 2
-	}
-	explicitMgmt1 := hasExplicitMgmtSlot(record, 1)
-	explicitMgmt2 := hasExplicitMgmtSlot(record, 2)
-	if explicitMgmt2 && resolveMgmtCount < 2 {
-		resolveMgmtCount = 2
-	}
-	if explicitMgmt1 && !explicitMgmt2 {
-		resolveMgmtCount = 1
-	}
-	for idx := range resolveMgmtCount {
-		var configuredName, configuredMAC, defaultName string
-		switch idx {
-		case 0:
-			configuredName = record.MgmtIface1
-			configuredMAC = record.MgmtMAC1
-		case 1:
-			configuredName = record.MgmtIface2
-			configuredMAC = record.MgmtMAC2
+	if configureMgmt {
+		resolveMgmtCount := len(bundle.Defaults.MgmtInterfaces)
+		explicitMgmt1 := hasExplicitMgmtSlot(record, 1)
+		explicitMgmt2 := hasExplicitMgmtSlot(record, 2)
+		if explicitMgmt2 && resolveMgmtCount < 2 {
+			resolveMgmtCount = 2
 		}
-		if idx < len(bundle.Defaults.MgmtInterfaces) {
-			defaultName = bundle.Defaults.MgmtInterfaces[idx]
+		if explicitMgmt1 && !explicitMgmt2 {
+			resolveMgmtCount = 1
 		}
-		name, mac, err := resolveInterfaceName(configuredName, configuredMAC, defaultName, ifaceByMAC, fmt.Sprintf("mgmt%d", idx+1))
-		if err != nil {
-			return MachineConfig{}, err
+		for idx := range resolveMgmtCount {
+			var configuredName, configuredMAC, defaultName string
+			switch idx {
+			case 0:
+				configuredName = record.MgmtIface1
+				configuredMAC = record.MgmtMAC1
+			case 1:
+				configuredName = record.MgmtIface2
+				configuredMAC = record.MgmtMAC2
+			}
+			if idx < len(bundle.Defaults.MgmtInterfaces) {
+				defaultName = bundle.Defaults.MgmtInterfaces[idx]
+			}
+			name, mac, err := resolveInterfaceName(configuredName, configuredMAC, defaultName, ifaceByMAC, fmt.Sprintf("mgmt%d", idx+1))
+			if err != nil {
+				return MachineConfig{}, err
+			}
+			mgmtIfaces = append(mgmtIfaces, name)
+			mgmtMACs = append(mgmtMACs, mac)
 		}
-		mgmtIfaces = append(mgmtIfaces, name)
-		mgmtMACs = append(mgmtMACs, mac)
-	}
-	if len(mgmtIfaces) == 0 {
-		return MachineConfig{}, errors.New("need at least 1 management interface")
+		if len(mgmtIfaces) == 0 && (explicitMgmt1 || explicitMgmt2 || len(bundle.Defaults.MgmtInterfaces) > 0) {
+			return MachineConfig{}, errors.New("need at least 1 management interface")
+		}
 	}
 
-	mgmtGW := strings.TrimSpace(record.MgmtGateway)
-	if mgmtGW == "" {
-		mgmtGW = strings.TrimSpace(bundle.Defaults.MgmtGateway)
-	}
-	if mgmtGW == "" {
-		mgmtGW = deriveGateway(record.MgmtIP)
+	mgmtGW := ""
+	if configureMgmt {
+		mgmtGW = strings.TrimSpace(record.MgmtGateway)
+		if mgmtGW == "" {
+			mgmtGW = strings.TrimSpace(bundle.Defaults.MgmtGateway)
+		}
+		if mgmtGW == "" {
+			mgmtGW = deriveGateway(record.MgmtIP)
+		}
 	}
 
-	dns := parseList(record.MgmtNameserver)
-	if len(dns) == 0 {
-		dns = append(dns, bundle.Defaults.MgmtNameservers...)
+	var dns []string
+	if configureMgmt {
+		dns = parseList(record.MgmtNameserver)
+		if len(dns) == 0 {
+			dns = append(dns, bundle.Defaults.MgmtNameservers...)
+		}
 	}
 
 	rdma := make([]RDMAConfig, 0, len(bundle.Defaults.RDMAInterfaces))
@@ -403,7 +581,7 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 		bondName = bundle.Defaults.MgmtBondName
 	}
 	bondPrimary := strings.TrimSpace(bundle.Defaults.BondPrimary)
-	if strings.EqualFold(bundle.Defaults.BondMode, "active-backup") && bondPrimary != "" && !stringInSlice(bondPrimary, mgmtIfaces) {
+	if strings.EqualFold(bundle.Defaults.BondMode, "active-backup") && bondPrimary != "" && len(mgmtIfaces) > 0 && !stringInSlice(bondPrimary, mgmtIfaces) {
 		return MachineConfig{}, fmt.Errorf("bond_primary %q is not one of management interfaces: %s", bondPrimary, strings.Join(mgmtIfaces, ","))
 	}
 
@@ -429,15 +607,17 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 		RDMA:          rdma,
 	}
 
-	if err := validateIPv4(cfg.MgmtIP); err != nil {
-		return MachineConfig{}, fmt.Errorf("invalid mgmt_ip: %w", err)
-	}
-	if err := validateIPv4(cfg.MgmtGateway); err != nil {
-		return MachineConfig{}, fmt.Errorf("invalid mgmt_gateway: %w", err)
-	}
-	for _, ip := range cfg.MgmtDNS {
-		if err := validateIPv4(ip); err != nil {
-			return MachineConfig{}, fmt.Errorf("invalid nameserver %q: %w", ip, err)
+	if configureMgmt {
+		if err := validateIPv4(cfg.MgmtIP); err != nil {
+			return MachineConfig{}, fmt.Errorf("invalid mgmt_ip: %w", err)
+		}
+		if err := validateIPv4(cfg.MgmtGateway); err != nil {
+			return MachineConfig{}, fmt.Errorf("invalid mgmt_gateway: %w", err)
+		}
+		for _, ip := range cfg.MgmtDNS {
+			if err := validateIPv4(ip); err != nil {
+				return MachineConfig{}, fmt.Errorf("invalid nameserver %q: %w", ip, err)
+			}
 		}
 	}
 	for _, item := range cfg.RDMA {

@@ -2,6 +2,7 @@ package checker
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -89,6 +90,38 @@ func TestRunDryRunPrintsExpectedCommands(t *testing.T) {
 	}
 	if !strings.HasSuffix(clientLine, "'10.157.5.207'") {
 		t.Fatalf("expected client address to be positional final argument:\n%s", clientLine)
+	}
+}
+
+func TestIBWriteBWArgsIncludesConfiguredQPs(t *testing.T) {
+	args := ibWriteBWArgs(spec.CheckConfig{
+		Iterations:   100,
+		BandwidthQPs: 4,
+		ReportGBits:  true,
+	}, spec.CheckRDMAGroup{IBDevice: "mlx5_1"}, "", "10.247.1.12", 18515)
+	got := shellJoin(args)
+	if !strings.Contains(got, "'-d' 'mlx5_1' '-q' '4'") {
+		t.Fatalf("expected configured QP count in ib_write_bw args:\n%s", got)
+	}
+}
+
+func TestRunRejectsNegativeBundleBandwidthQPs(t *testing.T) {
+	bundle := spec.Bundle{Check: spec.CheckConfig{
+		BandwidthQPs: -1,
+		RDMAGroups:   []spec.CheckRDMAGroup{{IBDevice: "mlx5_1"}},
+	}}
+	err := Run(Options{
+		Bundle: bundle,
+		Records: []spec.MachineRecord{
+			{HostID: "node1", MgmtIP: "10.157.5.207"},
+			{HostID: "node2", MgmtIP: "10.157.5.206"},
+		},
+		Hosts:  []string{"node1,node2"},
+		DryRun: true,
+		Output: io.Discard,
+	})
+	if err == nil || !strings.Contains(err.Error(), "bandwidth_qps") {
+		t.Fatalf("expected invalid bandwidth_qps error, got %v", err)
 	}
 }
 
@@ -414,11 +447,19 @@ func TestRunRDMAPingDryRunUsesJumboPayload(t *testing.T) {
 	for _, want := range []string{
 		"dry-run rdma-ping node1:",
 		"'ping' '-c' '3' '-W' '2' '-M' 'do' '-s' '8972' '-I' 'ens15np0' '10.247.1.12'",
+		"'ping' '-c' '3' '-W' '2' '-M' 'do' '-s' '8972' '-I' 'ens15np0' '10.247.2.12'",
+		"'ping' '-c' '3' '-W' '2' '-M' 'do' '-s' '8972' '-I' 'ens16np0' '10.247.1.12'",
+		"'ping' '-c' '3' '-W' '2' '-M' 'do' '-s' '8972' '-I' 'ens16np0' '10.247.2.12'",
 		"dry-run rdma-ping node2:",
+		"'ping' '-c' '3' '-W' '2' '-M' 'do' '-s' '8972' '-I' 'ens15np0' '10.247.1.11'",
+		"'ping' '-c' '3' '-W' '2' '-M' 'do' '-s' '8972' '-I' 'ens15np0' '10.247.2.11'",
+		"'ping' '-c' '3' '-W' '2' '-M' 'do' '-s' '8972' '-I' 'ens16np0' '10.247.1.11'",
 		"'ping' '-c' '3' '-W' '2' '-M' 'do' '-s' '8972' '-I' 'ens16np0' '10.247.2.11'",
 		"RDMA ping result summary:",
 		"STATUS",
 		"SOURCE",
+		"SOURCE_RDMA",
+		"DEST_RDMA",
 		"DEST_IP",
 		"PASS    node1   node2  rdma1",
 		"PASS    node2   node1  rdma2",
@@ -431,8 +472,75 @@ func TestRunRDMAPingDryRunUsesJumboPayload(t *testing.T) {
 			t.Fatalf("expected %q in output:\n%s", want, got)
 		}
 	}
+	if gotCount := strings.Count(got, "dry-run rdma-ping "); gotCount != 8 {
+		t.Fatalf("expected 2x2 cross ping in both directions (8 commands), got %d:\n%s", gotCount, got)
+	}
 	if strings.Contains(got, "ib_write_bw") {
 		t.Fatalf("did not expect bandwidth check commands:\n%s", got)
+	}
+}
+
+func TestRDMAPingItemsBuildCrossMatrix(t *testing.T) {
+	bundle := spec.Bundle{
+		Defaults: spec.Defaults{
+			RDMAInterfaces: []spec.RDMAInterfaceDefault{{Name: "ens11np0"}, {Name: "ens13np0"}},
+		},
+	}
+	source := Target{
+		Name: "node1",
+		RDMA: []spec.RDMARecord{{Name: "ens11np0"}, {Name: "ens13np0"}},
+	}
+	destination := Target{
+		Name: "node2",
+		RDMA: []spec.RDMARecord{{IP: "10.247.1.12"}, {IP: "10.247.2.12"}},
+	}
+	items, err := rdmaPingItems(bundle, source, destination)
+	if err != nil {
+		t.Fatalf("build rdma ping items: %v", err)
+	}
+	if len(items) != 4 {
+		t.Fatalf("expected 2x2 cross matrix, got %#v", items)
+	}
+	want := []rdmaPingItem{
+		{SourceIndex: 0, DestinationIndex: 0, SourceName: "ens11np0", DestinationIP: "10.247.1.12"},
+		{SourceIndex: 0, DestinationIndex: 1, SourceName: "ens11np0", DestinationIP: "10.247.2.12"},
+		{SourceIndex: 1, DestinationIndex: 0, SourceName: "ens13np0", DestinationIP: "10.247.1.12"},
+		{SourceIndex: 1, DestinationIndex: 1, SourceName: "ens13np0", DestinationIP: "10.247.2.12"},
+	}
+	for index := range want {
+		if items[index] != want[index] {
+			t.Fatalf("unexpected item %d: got %#v want %#v", index, items[index], want[index])
+		}
+	}
+}
+
+func TestPingFailureSummaryPrefersPacketLoss(t *testing.T) {
+	output := `PING 10.247.2.12 (10.247.2.12) from 10.247.1.11 ens11np0: 8972(9000) bytes of data.
+
+--- 10.247.2.12 ping statistics ---
+3 packets transmitted, 0 received, 100% packet loss, time 2032ms
+`
+	got := pingFailureSummary(output, fmt.Errorf("local command on node1: exit status 1"))
+	if got != "3 packets transmitted, 0 received, 100% packet loss, time 2032ms" {
+		t.Fatalf("unexpected summary: %q", got)
+	}
+}
+
+func TestPingFailureSummaryUsesCommandStderr(t *testing.T) {
+	err := fmt.Errorf("local command on node1: exit status 2\nping: SO_BINDTODEVICE ens404: No such device")
+	got := pingFailureSummary("", err)
+	if got != "ping: SO_BINDTODEVICE ens404: No such device" {
+		t.Fatalf("unexpected summary: %q", got)
+	}
+}
+
+func TestIsTransientSSHErrorDetectsKexReset(t *testing.T) {
+	err := fmt.Errorf("ssh 10.0.0.2: exit status 255\nkex_exchange_identification: read: Connection reset by peer")
+	if !isTransientSSHError(err) {
+		t.Fatalf("expected transient ssh error: %v", err)
+	}
+	if isTransientSSHError(fmt.Errorf("ssh 10.0.0.2: exit status 255\nPermission denied")) {
+		t.Fatal("did not expect auth failure to be transient")
 	}
 }
 

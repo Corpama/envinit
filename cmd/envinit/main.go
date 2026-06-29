@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -54,6 +56,7 @@ func runCheck(args []string) error {
 	checksRaw := fs.String("checks", "", "Deprecated alias for --check-stage")
 	emuKVTransfer := fs.Bool("emu-kv-transfer", false, "Enable 8MiB ib_write_bw message size to emulate KV cache transfer")
 	bandwidthMmap := fs.String("bandwidth-mmap", "", "Enable bandwidth mmap mode; supported value: xdr")
+	bandwidthQPs := fs.Int("bandwidth-qps", 0, "Override ib_write_bw queue pair count (-q)")
 	rdmaPingCount := fs.Int("rdma-ping-count", 0, "Override RDMA ping packet count")
 	rdmaPingMTU := fs.Int("rdma-ping-mtu", 0, "Override RDMA ping MTU; payload is calculated as MTU-28 for IPv4")
 	rdmaPingTimeout := fs.Int("rdma-ping-timeout", 0, "Override RDMA ping timeout in seconds")
@@ -86,6 +89,7 @@ func runCheck(args []string) error {
 	if err := applyCheckOverrides(&b, checkOverrideOptions{
 		emuKVTransfer:   *emuKVTransfer,
 		bandwidthMmap:   *bandwidthMmap,
+		bandwidthQPs:    *bandwidthQPs,
 		rdmaPingCount:   *rdmaPingCount,
 		rdmaPingMTU:     *rdmaPingMTU,
 		rdmaPingTimeout: *rdmaPingTimeout,
@@ -110,12 +114,16 @@ func runCheck(args []string) error {
 type checkOverrideOptions struct {
 	emuKVTransfer   bool
 	bandwidthMmap   string
+	bandwidthQPs    int
 	rdmaPingCount   int
 	rdmaPingMTU     int
 	rdmaPingTimeout int
 }
 
 func applyCheckOverrides(b *spec.Bundle, opts checkOverrideOptions) error {
+	if opts.bandwidthQPs < 0 {
+		return fmt.Errorf("--bandwidth-qps must not be negative")
+	}
 	if opts.rdmaPingCount < 0 {
 		return fmt.Errorf("--rdma-ping-count must be greater than 0")
 	}
@@ -138,6 +146,9 @@ func applyCheckOverrides(b *spec.Bundle, opts checkOverrideOptions) error {
 		b.Check.MmapDevice = "/dev/xdrdrv"
 	default:
 		return fmt.Errorf("--bandwidth-mmap supports only xdr")
+	}
+	if opts.bandwidthQPs > 0 {
+		b.Check.BandwidthQPs = opts.bandwidthQPs
 	}
 
 	if opts.rdmaPingCount > 0 {
@@ -190,7 +201,7 @@ func run(dryRun bool, args []string) error {
 	host := fs.String("host", "", "host_id/hostname/mgmt_ip from the inventory; auto-detect the current machine when omitted")
 	root := fs.String("root", "/", "Alternate filesystem root for testing, defaults to /")
 	sheet := fs.String("sheet", "", "Worksheet name for .xlsx inventories, defaults to the first sheet")
-	stagesRaw := fs.String("stages", "all", "Stages separated by commas or spaces: all,apt,ofed,udev,network,xre,xdr,firmware,container,mlxconfig,sysctl,iommu,post")
+	stagesRaw := fs.String("stages", "all", "Stages separated by commas or spaces: all,software,ofed,network,udev,xre,xdr,firmware,container,mlxconfig,sysctl,kernel,post")
 	fs.SetOutput(os.Stderr)
 	if err := fs.Parse(normalizedArgs); err != nil {
 		return err
@@ -215,9 +226,22 @@ func run(dryRun bool, args []string) error {
 	if err != nil {
 		return err
 	}
-	app, err := runner.New(b, records, *host, *root, dryRun, stages, os.Stdout)
+	out := io.Writer(os.Stdout)
+	var dryRunLog bytes.Buffer
+	if dryRun {
+		out = &dryRunLog
+	}
+	app, err := runner.New(b, records, *host, *root, dryRun, stages, out)
 	if err != nil {
 		return err
+	}
+
+	if dryRun {
+		if err := app.Apply(); err != nil {
+			return err
+		}
+		fmt.Print(renderPlanPreview(app, dryRunLog.String()))
+		return nil
 	}
 
 	description, err := app.Describe()
@@ -225,14 +249,118 @@ func run(dryRun bool, args []string) error {
 		return err
 	}
 	fmt.Print(description)
-	if dryRun {
-		return nil
-	}
 	if err := app.Apply(); err != nil {
 		return err
 	}
 	fmt.Println("Initialization completed.")
 	return nil
+}
+
+func renderPlanPreview(app *runner.App, log string) string {
+	groups := groupDryRunLogByStage(log)
+	var b strings.Builder
+	fmt.Fprintln(&b, "Plan preview (dry-run; no changes have been made)")
+	fmt.Fprintf(&b, "Target machine: %s\n", app.Machine.HostID)
+	if strings.TrimSpace(app.Machine.Hostname) != "" {
+		fmt.Fprintf(&b, "Hostname: %s\n", app.Machine.Hostname)
+	}
+	fmt.Fprintf(&b, "Platform: os_family=%s package_manager=%s network_backend=%s\n",
+		valueOrAuto(app.Bundle.Platform.OSFamily),
+		valueOrAuto(app.Bundle.Platform.PackageManager),
+		valueOrAuto(app.Bundle.Platform.NetworkBackend),
+	)
+	if app.Bundle.ConfigureManagementNetwork() && strings.TrimSpace(app.Machine.MgmtIP) != "" {
+		fmt.Fprintf(&b, "Management network: %s/%d via %s, uplink=%s, members=%s\n",
+			app.Machine.MgmtIP,
+			app.Machine.MgmtPrefix,
+			app.Machine.MgmtGateway,
+			managementPlanName(app.Machine.MgmtBondName, app.Machine.MgmtIfaces),
+			strings.Join(app.Machine.MgmtIfaces, ","),
+		)
+	} else {
+		fmt.Fprintf(&b, "Management network: skipped (mgmt_ip is empty or configure_management_network=false)\n")
+	}
+	for _, item := range app.Machine.RDMA {
+		fmt.Fprintf(&b, "RDMA: %s -> %s/%d via %s table %d\n", item.Name, item.IP, item.Prefix, item.Gateway, item.Table)
+	}
+	if len(groups.Prelude) > 0 {
+		fmt.Fprintln(&b)
+		fmt.Fprintln(&b, "Preflight")
+		for _, line := range groups.Prelude {
+			fmt.Fprintf(&b, "  - %s\n", line)
+		}
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "Stages")
+	for _, stage := range groups.Order {
+		fmt.Fprintf(&b, "  - %s (%d actions)\n", stage, len(groups.ByStage[stage]))
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "Stage details")
+	for _, stage := range groups.Order {
+		fmt.Fprintf(&b, "[%s]\n", stage)
+		actions := groups.ByStage[stage]
+		if len(actions) == 0 {
+			fmt.Fprintln(&b, "  - no actions")
+			continue
+		}
+		for _, line := range actions {
+			fmt.Fprintf(&b, "  - %s\n", line)
+		}
+	}
+	return b.String()
+}
+
+type dryRunLogGroups struct {
+	Prelude []string
+	Order   []string
+	ByStage map[string][]string
+}
+
+func groupDryRunLogByStage(log string) dryRunLogGroups {
+	groups := dryRunLogGroups{ByStage: map[string][]string{}}
+	current := ""
+	for _, raw := range strings.Split(log, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if stage, ok := strings.CutPrefix(line, "==> stage: "); ok {
+			current = strings.TrimSpace(stage)
+			if _, exists := groups.ByStage[current]; !exists {
+				groups.Order = append(groups.Order, current)
+				groups.ByStage[current] = nil
+			}
+			continue
+		}
+		if current == "" {
+			groups.Prelude = append(groups.Prelude, line)
+			continue
+		}
+		groups.ByStage[current] = append(groups.ByStage[current], line)
+	}
+	return groups
+}
+
+func valueOrAuto(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "auto"
+	}
+	return value
+}
+
+func managementPlanName(bondName string, ifaces []string) string {
+	if len(ifaces) <= 1 {
+		if len(ifaces) == 1 {
+			return ifaces[0]
+		}
+		return "-"
+	}
+	if strings.TrimSpace(bondName) == "" {
+		return "bond0"
+	}
+	return bondName
 }
 
 func parseStages(raw string) (map[string]bool, error) {
@@ -243,10 +371,11 @@ func parseStages(raw string) (map[string]bool, error) {
 		if item == "" {
 			continue
 		}
-		if !runner.IsKnownStage(item) {
+		stage, ok := runner.CanonicalStage(item)
+		if !ok {
 			return nil, fmt.Errorf("unknown stage %q", item)
 		}
-		out[item] = true
+		out[stage] = true
 	}
 	if len(out) == 0 {
 		out["all"] = true

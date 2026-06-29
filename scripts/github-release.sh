@@ -71,13 +71,33 @@ if [[ -n "${COS_SESSION_TOKEN:-}" ]]; then
   COSCLI_AUTH_ARGS+=(--token "$COS_SESSION_TOKEN")
 fi
 
-echo "==> Copying repository env_tool files"
-tar \
-  --exclude='env_tool/data' \
-  --exclude='env_tool/env_init' \
-  --exclude='env_tool/env_init_arch' \
-  --exclude='.DS_Store' \
-  -cf - env_tool | tar -C "$STAGE_DIR" -xf -
+echo "==> Assembling env_tool files"
+cp README.md "${STAGE_DIR}/env_tool/README.md"
+mkdir -p "${STAGE_DIR}/env_tool/planning"
+cp examples/inventory.sample.csv "${STAGE_DIR}/env_tool/planning/inventory.csv"
+cp examples/bundle.sample.json "${STAGE_DIR}/env_tool/planning/bundle.json"
+if [[ -f examples/bundle.redhat.sample.json ]]; then
+  cp examples/bundle.redhat.sample.json "${STAGE_DIR}/env_tool/planning/bundle.redhat.sample.json"
+fi
+cat > "${STAGE_DIR}/env_tool/run1.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+sudo ./env_init apply \
+  --inventory /mnt/usb/env_tool/planning/inventory.csv \
+  --bundle /mnt/usb/env_tool/planning/bundle.json \
+  --stages software ofed
+EOF
+cat > "${STAGE_DIR}/env_tool/run2.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+sudo ./env_init apply \
+  --inventory /mnt/usb/env_tool/planning/inventory.csv \
+  --bundle /mnt/usb/env_tool/planning/bundle.json \
+  --stages network udev xre xdr firmware container mlxconfig sysctl kernel post
+EOF
+chmod +x "${STAGE_DIR}/env_tool/run1.sh" "${STAGE_DIR}/env_tool/run2.sh"
 
 echo "==> Downloading COS directory cos://${COS_BUCKET}/${COS_DATA_PREFIX}/"
 "${TOOLS_DIR}/coscli" cp \

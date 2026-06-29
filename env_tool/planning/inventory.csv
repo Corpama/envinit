@@ -1,9 +1,0 @@
-host_id,hostname,mgmt_ip,mgmt_prefix,mgmt_gateway,mgmt_iface1,mgmt_mac1,mgmt_iface2,mgmt_mac2,rdma1_name,rdma1_ip,rdma1_mac,rdma2_name,rdma2_ip,rdma2_mac,rdma3_name,rdma3_ip,rdma3_mac,rdma4_name,rdma4_ip,rdma4_mac
-node1,node1,10.157.5.207,23,10.157.4.1,ens12f0np0,,ens12f1np1,,ens15np0,,,ens16np0,,,ens13np0,,,ens14np0,,
-node2,node2,10.157.5.206,23,10.157.4.1,ens12f0np0,,ens12f1np1,,ens15np0,,,ens16np0,,,ens13np0,,,ens14np0,,
-node3,node3,10.157.5.205,23,10.157.4.1,ens12f0np0,,ens12f1np1,,ens15np0,,,ens16np0,,,ens13np0,,,ens14np0,,
-node4,node4,10.157.5.204,23,10.157.4.1,ens12f0np0,,ens12f1np1,,ens15np0,,,ens16np0,,,ens13np0,,,ens14np0,,
-node5,node5,10.157.5.203,23,10.157.4.1,ens12f0np0,,ens12f1np1,,ens15np0,,,ens16np0,,,ens13np0,,,ens14np0,,
-node6,node6,10.157.5.202,23,10.157.4.1,ens12f0np0,,ens12f1np1,,ens15np0,,,ens16np0,,,ens13np0,,,ens14np0,,
-node7,node7,10.157.5.201,23,10.157.4.1,ens12f0np0,,ens12f1np1,,ens15np0,,,ens16np0,,,ens13np0,,,ens14np0,,
-node8,node8,10.157.5.200,23,10.157.4.1,ens12f0np0,,ens12f1np1,,ens15np0,,,ens16np0,,,ens13np0,,,ens14np0,,

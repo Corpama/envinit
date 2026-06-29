@@ -18,6 +18,10 @@ func Load(path string) (spec.Bundle, error) {
 	if err := json.Unmarshal(data, &bundle); err != nil {
 		return spec.Bundle{}, fmt.Errorf("parse bundle json: %w", err)
 	}
+	applyDetectedPlatformDefaults(&bundle, defaultPlatformDetector())
 	bundle.ApplyDefaults()
+	if err := bundle.Validate(); err != nil {
+		return spec.Bundle{}, err
+	}
 	return bundle, nil
 }

@@ -1,9 +1,0 @@
-host_id,hostname,mgmt_ip,mgmt_prefix,mgmt_gateway,mgmt_iface1,mgmt_mac1,mgmt_iface2,mgmt_mac2,rdma1_name,rdma1_ip,rdma1_mac,rdma2_name,rdma2_ip,rdma2_mac,rdma3_name,rdma3_ip,rdma3_mac,rdma4_name,rdma4_ip,rdma4_mac
-rdtest-node2329,rdtest-node2329.bcc-zwlt.baidu.com,10.129.128.113,24,10.129.128.1,eth0,,,,eth1,25.40.8.2,,eth2,25.40.8.34,,eth3,25.40.8.66,,eth4,25.40.8.98,
-instance-rffi2vja,instance-rffi2vja,10.129.128.56,24,10.129.128.1,eth0,,,,eth1,25.40.9.2,,eth2,25.40.9.34,,eth3,25.40.9.66,,eth4,25.40.9.98,
-instance-e4j98szs-2,instance-e4j98szs-2,10.129.128.243,24,10.129.128.1,eth0,,,,eth1,25.40.7.226,,eth2,25.40.14.34,,eth3,25.40.11.162,,eth4,25.40.14.98,
-instance-wfh69oyk,instance-wfh69oyk,10.129.128.54,24,10.129.128.1,eth0,,,,eth1,25.40.6.2,,eth2,25.40.6.34,,eth3,25.40.6.66,,eth4,25.40.6.98,
-rdtest-node2325,rdtest-node2325.bcc-zwlt.baidu.com,10.129.128.18,24,10.129.128.1,eth0,,,,eth1,25.40.19.2,,eth2,25.40.19.34,,eth3,25.40.19.66,,eth4,25.40.19.98,
-rdtest-node2372,rdtest-node2372.bcc-zwlt.baidu.com,10.129.128.109,24,10.129.128.1,eth0,,,,eth1,25.40.18.130,,eth2,25.40.18.162,,eth3,25.40.18.194,,eth4,25.40.18.226,
-rdtest-node2268,rdtest-node2268.bcc-zwlt.baidu.com,10.129.128.5,24,10.129.128.1,eth0,,,,eth1,25.40.18.2,,eth2,25.40.18.34,,eth3,25.40.18.66,,eth4,25.40.18.98,
-rdtest-node2309,rdtest-node2309.bcc-zwlt.baidu.com,10.129.128.39,24,10.129.128.1,eth0,,,,eth1,25.40.17.130,,eth2,25.40.17.162,,eth3,25.40.17.194,,eth4,25.40.17.226,

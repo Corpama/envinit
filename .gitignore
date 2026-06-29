@@ -10,6 +10,8 @@ env_tool/data/
 
 # Local logs and generated runtime output
 *.log
+.gocache/
+.gomodcache/
 
 # Backups produced by the environment initialization scripts
 *.bak.*
