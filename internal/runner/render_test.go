@@ -135,6 +135,7 @@ func TestRenderNetworkManagerIfcfgBondAndRoutes(t *testing.T) {
 	for _, want := range []string{
 		"DEVICE=bond0",
 		"TYPE=Bond",
+		"BOOTPROTO=static",
 		"IPADDR=10.101.9.11",
 		"PREFIX=26",
 		"GATEWAY=10.101.9.1",
@@ -148,7 +149,7 @@ func TestRenderNetworkManagerIfcfgBondAndRoutes(t *testing.T) {
 	}
 
 	slave := renderBondSlaveIfcfg(machine, "ens20f0np0", true)
-	for _, want := range []string{"DEVICE=ens20f0np0", "MASTER=bond0", "SLAVE=yes", "NM_CONTROLLED=yes"} {
+	for _, want := range []string{"DEVICE=ens20f0np0", "BOOTPROTO=none", "MASTER=bond0", "SLAVE=yes", "NM_CONTROLLED=yes"} {
 		if !strings.Contains(slave, want) {
 			t.Fatalf("expected %q in slave ifcfg:\n%s", want, slave)
 		}
@@ -156,7 +157,7 @@ func TestRenderNetworkManagerIfcfgBondAndRoutes(t *testing.T) {
 
 	rdma := spec.RDMAConfig{Name: "ens11np0", IP: "11.1.1.11", Prefix: 24, Gateway: "11.1.1.1", Table: 101}
 	ifcfg := renderRDMAIfcfg(rdma, 9000, true)
-	for _, want := range []string{"DEVICE=ens11np0", "IPADDR=11.1.1.11", "PREFIX=24", "MTU=9000"} {
+	for _, want := range []string{"DEVICE=ens11np0", "BOOTPROTO=static", "IPADDR=11.1.1.11", "PREFIX=24", "MTU=9000"} {
 		if !strings.Contains(ifcfg, want) {
 			t.Fatalf("expected %q in rdma ifcfg:\n%s", want, ifcfg)
 		}
@@ -1576,8 +1577,8 @@ func TestNetworkBeforeUdevRenamesAndAppliesBeforePersistentRules(t *testing.T) {
 	if got := len(app.confirmedInterfaceBindings); got != 2 {
 		t.Fatalf("expected network stage to confirm two NIC bindings, got %d", got)
 	}
-	if err := app.runUdevStage(); err != nil {
-		t.Fatalf("run udev stage: %v", err)
+	if !app.udevRulesPersisted {
+		t.Fatal("expected network stage to persist udev rules")
 	}
 	got := output.String()
 	renameIdx := strings.Index(got, "temporarily renamed target interface names before applying network settings")
@@ -1591,7 +1592,7 @@ func TestNetworkBeforeUdevRenamesAndAppliesBeforePersistentRules(t *testing.T) {
 	}
 }
 
-func TestNetworkStageAutoEnablesUdevWhenPlannedInterfacesAreMissing(t *testing.T) {
+func TestNetworkStagePersistsUdevWhenPlannedInterfacesAreMissing(t *testing.T) {
 	root := t.TempDir()
 	mustWriteNetDevice(t, root, "eno1", "aa:bb:cc:dd:ee:01", "0000:20:00.0", "ixgbe", 0, "p0")
 
@@ -1619,14 +1620,11 @@ func TestNetworkStageAutoEnablesUdevWhenPlannedInterfacesAreMissing(t *testing.T
 		Output: &output,
 	}
 
-	if !app.stageEnabled("udev") {
-		t.Fatal("expected udev to be auto-enabled when network target interfaces are missing")
-	}
-	if got, want := app.selectedStages(), []string{"network", "udev"}; !reflect.DeepEqual(got, want) {
+	if got, want := app.selectedStages(), []string{"network"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected selected stages: got=%v want=%v", got, want)
 	}
 	if got := strings.Join(app.plannedFiles(), "\n"); !strings.Contains(got, udevFile) {
-		t.Fatalf("expected planned files to include auto-enabled udev file, got:\n%s", got)
+		t.Fatalf("expected planned files to include network-owned udev file, got:\n%s", got)
 	}
 
 	if err := app.Apply(); err != nil {
@@ -1640,15 +1638,14 @@ func TestNetworkStageAutoEnablesUdevWhenPlannedInterfacesAreMissing(t *testing.T
 		"==> stage: network",
 		"temporarily renamed target interface names before applying network settings",
 		"run: netplan apply",
-		"==> stage: udev",
 		"run: udevadm control --reload-rules",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expected %q in output:\n%s", want, got)
 		}
 	}
-	if networkIdx, udevIdx := strings.Index(got, "==> stage: network"), strings.Index(got, "==> stage: udev"); networkIdx == -1 || udevIdx == -1 || networkIdx > udevIdx {
-		t.Fatalf("expected network to run before auto-enabled udev, got:\n%s", got)
+	if strings.Contains(got, "==> stage: udev") {
+		t.Fatalf("did not expect a separate udev stage when network is selected, got:\n%s", got)
 	}
 }
 

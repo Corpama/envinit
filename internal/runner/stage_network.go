@@ -55,6 +55,9 @@ func (a *App) runNetworkStage() error {
 	if a.Bundle.RDMAExists() && !deferApply {
 		a.enableRoCEAdaptiveRouting()
 	}
+	if err := a.persistUdevRules(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -96,6 +99,9 @@ func (a *App) runNetworkManagerStage() error {
 	if a.Bundle.RDMAExists() && !deferApply {
 		a.enableRoCEAdaptiveRouting()
 	}
+	if err := a.persistUdevRules(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -130,6 +136,9 @@ func (a *App) runLegacyNetworkStage() error {
 	}
 	if a.Bundle.RDMAExists() && !deferApply {
 		a.enableRoCEAdaptiveRouting()
+	}
+	if err := a.persistUdevRules(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -237,6 +246,18 @@ func parseEthtoolBusInfo(output string) (string, error) {
 }
 
 func (a *App) runUdevStage() error {
+	if a.udevRulesPersisted {
+		a.logf("skip udev: persistent NIC naming rules were already written by the network stage")
+		return nil
+	}
+	return a.persistUdevRules()
+}
+
+func (a *App) persistUdevRules() error {
+	if !a.hasPersistentNICNamingTargets() && !a.interfaceBindingsConfirmed {
+		a.logf("skip udev persistent naming: no management or RDMA NIC targets are configured")
+		return nil
+	}
 	bindings, err := a.confirmedNICBindings()
 	if err != nil {
 		return err
@@ -249,6 +270,7 @@ func (a *App) runUdevStage() error {
 		return err
 	}
 	a.logf("udev rules reloaded; reboot is still required for persistent udev naming.")
+	a.udevRulesPersisted = true
 	return nil
 }
 

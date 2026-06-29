@@ -28,6 +28,10 @@ func (a *App) configureManagementNetwork() bool {
 	return a.Bundle.ConfigureManagementNetwork() && strings.TrimSpace(a.Machine.MgmtIP) != ""
 }
 
+func (a *App) hasPersistentNICNamingTargets() bool {
+	return (a.configureManagementNetwork() && len(a.Machine.MgmtIfaces) > 0) || (a.Bundle.RDMAExists() && len(a.Machine.RDMA) > 0)
+}
+
 func (a *App) managementSummaryName() string {
 	if len(a.Machine.MgmtIfaces) > 1 {
 		return a.Machine.MgmtBondName

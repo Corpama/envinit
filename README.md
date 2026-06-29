@@ -108,7 +108,7 @@ sudo ./env_init apply \
 默认顺序固定为：
 
 ```text
-software -> ofed -> network -> udev -> xre -> xdr -> firmware
+software -> ofed -> network -> xre -> xdr -> firmware
 -> container -> mlxconfig -> sysctl -> kernel -> post
 ```
 
@@ -126,7 +126,7 @@ sudo ./env_init apply \
   --inventory /mnt/usb/env_tool/planning/inventory.csv \
   --bundle /mnt/usb/env_tool/planning/bundle.json \
   --host node1 \
-  --stages network udev sysctl kernel
+  --stages network sysctl kernel
 ```
 
 `post` 默认会询问是否执行 `ipmitool power soft`。非交互环境无法确认时会跳过关机。
@@ -166,7 +166,7 @@ sudo ./env_init check \
 `apply` 会先读取 `bundle.json` 和规划表，匹配当前机器，再按固定顺序执行所选 stage：
 
 ```text
-software -> ofed -> network -> udev -> xre -> xdr -> firmware
+software -> ofed -> network -> xre -> xdr -> firmware
 -> container -> mlxconfig -> sysctl -> kernel -> post
 ```
 
@@ -183,7 +183,7 @@ sudo ./env_init apply \
   --inventory /mnt/usb/env_tool/planning/inventory.csv \
   --bundle /mnt/usb/env_tool/planning/bundle.json \
   --host node1 \
-  --stages network udev sysctl
+  --stages network sysctl
 ```
 
 `apply` 必须使用 `root` 权限。正式执行前建议先将 `apply` 替换为 `plan`，检查工具打印的 `Files to be written` 和 `Detailed actions`。
@@ -194,8 +194,8 @@ sudo ./env_init apply \
 | --- | --- | --- | --- |
 | `software` | 复制离线软件源、配置 apt/yum 源、安装依赖包 | 在无外网环境中准备后续编译和安装需要的软件 | `/opt/repo`、`apt-get install`、`yum install` |
 | `ofed` | 解压并安装 Mellanox OFED | 安装 RDMA 网卡驱动和用户态工具，使 400G 网卡可用于 RoCE/RDMA | `mlnxofedinstall --add-kernel-support` |
-| `network` | 确认网卡绑定、临时重命名、写入管理网/RDMA 网络配置和 policy route 脚本 | 配置管理面连通性，并让每张 RDMA 网卡使用独立地址和路由表 | `/etc/netplan/`、`/etc/sysconfig/network-scripts/`、`netplan apply`、`nmcli`、`ifup` |
-| `udev` | 根据已确认的网卡绑定写入持久化命名规则 | 避免网卡名因 PCI 探测顺序变化而漂移，保证规划表长期有效 | `/etc/udev/rules.d/70-persistent-net.rules` |
+| `network` | 确认网卡绑定、临时重命名、写入并应用管理网/RDMA 网络配置、写入持久化命名规则 | 配置管理面连通性，让每张 RDMA 网卡使用独立地址和路由表，并固化规划网卡名 | `/etc/netplan/`、`/etc/sysconfig/network-scripts/`、`/etc/udev/rules.d/70-persistent-net.rules`、`netplan apply`、`nmcli`、`ifup` |
+| `udev` | 兼容/修复 stage，单独重新生成持久化命名规则 | 在需要修复规则文件时复用 NIC Binding Review TUI，不负责临时重命名和网络配置 | `/etc/udev/rules.d/70-persistent-net.rules`、`udevadm control --reload-rules` |
 | `xre` | 安装 XRE 驱动，并按卡型执行必要调优 | 让操作系统识别和管理昆仑芯 XPU | `bash <xre_installer>` |
 | `xdr` | 编译并安装 XDR 内核模块 | 提供 XDR 数据通路，支持相关高速传输能力 | `build.sh`、`install.sh` |
 | `firmware` | 解压并升级算力卡固件 | 将算力卡固件更新到配套版本 | `bash auto_update.sh` |
@@ -237,7 +237,7 @@ linux-headers-5.15.0-100-generic
 
 RedHat/麒麟路径下，工具会使用 `offline_repo` 生成 yum repo 文件，执行 `yum makecache` 和 `yum install -y <packages>`。因此命令行 stage 名统一使用 `software`，不再暴露成某个发行版专属的名称。
 
-### 4.4 ofed 和 udev：安装驱动并固定网卡名
+### 4.4 ofed 和 network：安装驱动并固定网卡名
 
 `ofed` 会解压 `artifacts.ofed_archive`，然后执行类似命令：
 
@@ -250,9 +250,9 @@ RedHat/麒麟路径下，工具会使用 `offline_repo` 生成 yum repo 文件�
   --force
 ```
 
-`network` 阶段会先根据规划表和本机 `/sys/class/net` 自动发现物理网卡，再打开 NIC Binding Review TUI 让用户确认管理网和 RDMA 网卡绑定。确认后，工具会先在当前启动周期把实际网卡临时重命名为规划名称，再写入并应用管理网/RDMA 网络配置。
+`network` 阶段会先根据规划表和本机 `/sys/class/net` 自动发现物理网卡，再打开 NIC Binding Review TUI 让用户确认管理网和 RDMA 网卡绑定。确认后，工具会先在当前启动周期把实际网卡临时重命名为规划名称，再写入并应用管理网/RDMA 网络配置，最后根据同一份确认结果写入持久化 udev 命名规则。
 
-`udev` 阶段复用同一份已确认绑定结果写入持久化命名规则。如果单独运行 `udev`，也会在需要时进入 NIC Binding Review TUI。持久化规则会在重启后继续生效。
+单独运行 `udev` 仍然保留为兼容/修复入口，会在需要时进入 NIC Binding Review TUI 并重新生成持久化规则，但常规流程不再需要把 `udev` 作为 `network` 后面的独立步骤。
 
 生成的规则类似：
 
@@ -260,7 +260,7 @@ RedHat/麒麟路径下，工具会使用 `offline_repo` 生成 yum repo 文件�
 SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="aa:bb:cc:dd:ee:11", NAME="ens11np0"
 ```
 
-工具会重新加载 udev 规则；当前启动周期的临时重命名由 `network` 阶段完成。
+`network` 会在写入规则后重新加载 udev 规则；当前启动周期的临时重命名也由 `network` 阶段完成。
 
 关键命令作用：
 
@@ -1018,7 +1018,7 @@ sudo ./env_init check \
 
 原因：目标接口名尚未出现，通常是当前系统网卡名还没有按规划名绑定，或 OFED 后 RDMA 网卡尚未暴露。
 
-处理：先执行 `software ofed network udev`。`network` 阶段会先自动发现物理网卡并打开 NIC Binding Review TUI；确认后先临时重命名网卡，再写入并应用网络配置。`udev` 阶段随后根据同一份确认结果写入持久化命名规则，重启后保持规划名。
+处理：先执行 `software ofed network`。`network` 阶段会先自动发现物理网卡并打开 NIC Binding Review TUI；确认后先临时重命名网卡，再写入并应用网络配置，并根据同一份确认结果写入持久化命名规则，重启后保持规划名。
 
 ### 8.3 MAC 找不到
 
@@ -1045,7 +1045,7 @@ sudo ./env_init check \
 ```bash
 ./env_init plan ... --host node1
 sudo ./env_init apply ... --host node1 --stages software ofed
-sudo ./env_init apply ... --host node1 --stages network udev
+sudo ./env_init apply ... --host node1 --stages network
 sudo ./env_init apply ... --host node1 --stages xre xdr firmware container mlxconfig sysctl kernel post
 ```
 

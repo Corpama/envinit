@@ -12,7 +12,7 @@ func (a *App) ensureInterfacesReady() error {
 	if len(missing) == 0 {
 		return nil
 	}
-	return fmt.Errorf("target interface names are not present yet: %s; run the udev stage so physical NICs can be bound to target names and temporarily renamed before applying network settings", strings.Join(missing, ", "))
+	return fmt.Errorf("target interface names are not present yet: %s; run the network stage so physical NICs can be reviewed, temporarily renamed, configured, and persisted with udev rules", strings.Join(missing, ", "))
 }
 
 func (a *App) missingPlannedInterfaces() []string {

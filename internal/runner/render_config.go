@@ -132,7 +132,7 @@ func (a *App) writeIfcfgNetworkFiles() error {
 func renderMgmtIfcfg(machine spec.MachineConfig, iface string, nmControlled bool) string {
 	var b strings.Builder
 	writeIfcfgCommon(&b, iface, "Ethernet", machine.MgmtMTU, nmControlled)
-	b.WriteString("BOOTPROTO=none\n")
+	b.WriteString("BOOTPROTO=static\n")
 	fmt.Fprintf(&b, "IPADDR=%s\n", machine.MgmtIP)
 	fmt.Fprintf(&b, "PREFIX=%d\n", machine.MgmtPrefix)
 	fmt.Fprintf(&b, "GATEWAY=%s\n", machine.MgmtGateway)
@@ -143,7 +143,7 @@ func renderMgmtIfcfg(machine spec.MachineConfig, iface string, nmControlled bool
 func renderBondIfcfg(machine spec.MachineConfig, nmControlled bool) string {
 	var b strings.Builder
 	writeIfcfgCommon(&b, machine.MgmtBondName, "Bond", machine.MgmtMTU, nmControlled)
-	b.WriteString("BOOTPROTO=none\n")
+	b.WriteString("BOOTPROTO=static\n")
 	fmt.Fprintf(&b, "IPADDR=%s\n", machine.MgmtIP)
 	fmt.Fprintf(&b, "PREFIX=%d\n", machine.MgmtPrefix)
 	fmt.Fprintf(&b, "GATEWAY=%s\n", machine.MgmtGateway)
@@ -164,7 +164,7 @@ func renderBondSlaveIfcfg(machine spec.MachineConfig, iface string, nmControlled
 func renderRDMAIfcfg(item spec.RDMAConfig, mtu int, nmControlled bool) string {
 	var b strings.Builder
 	writeIfcfgCommon(&b, item.Name, "Ethernet", mtu, nmControlled)
-	b.WriteString("BOOTPROTO=none\n")
+	b.WriteString("BOOTPROTO=static\n")
 	fmt.Fprintf(&b, "IPADDR=%s\n", item.IP)
 	fmt.Fprintf(&b, "PREFIX=%d\n", item.Prefix)
 	return b.String()

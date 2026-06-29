@@ -38,7 +38,6 @@ var stageOrder = []string{
 	"software",
 	"ofed",
 	"network",
-	"udev",
 	"xre",
 	"xdr",
 	"firmware",
@@ -54,6 +53,7 @@ var knownStages = func() map[string]bool {
 	for _, stage := range stageOrder {
 		out[stage] = true
 	}
+	out["udev"] = true
 	return out
 }()
 
@@ -69,6 +69,7 @@ type App struct {
 	networkApplyDeferred       bool
 	confirmedInterfaceBindings []interfaceBinding
 	interfaceBindingsConfirmed bool
+	udevRulesPersisted         bool
 	now                        func() time.Time
 }
 
@@ -131,6 +132,11 @@ func (a *App) Apply() error {
 			return err
 		}
 	}
+	if a.stageEnabled("udev") && !a.stageEnabled("network") {
+		if err := a.runStage("udev"); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -185,9 +191,6 @@ func CanonicalStage(stage string) (string, bool) {
 
 func (a *App) stageEnabled(stage string) bool {
 	if a.Stages["all"] || a.Stages[stage] {
-		return true
-	}
-	if stage == "udev" && a.Stages["network"] && len(a.missingPlannedInterfaces()) > 0 {
 		return true
 	}
 	return (stage == "software" && a.Stages["apt"]) || (stage == "kernel" && a.Stages["iommu"])

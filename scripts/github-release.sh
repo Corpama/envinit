@@ -95,7 +95,7 @@ set -euo pipefail
 sudo ./env_init apply \
   --inventory /mnt/usb/env_tool/planning/inventory.csv \
   --bundle /mnt/usb/env_tool/planning/bundle.json \
-  --stages network udev xre xdr firmware container mlxconfig sysctl kernel post
+  --stages network xre xdr firmware container mlxconfig sysctl kernel post
 EOF
 chmod +x "${STAGE_DIR}/env_tool/run1.sh" "${STAGE_DIR}/env_tool/run2.sh"
 

@@ -123,7 +123,7 @@ func (a *App) describeStage(stage string) ([]string, error) {
 				lines = append(lines, fmt.Sprintf("best-effort enable RoCE adaptive routing on %s using ethtool bus-info and mlxreg ROCE_ACCL adaptive_routing_forced_en=0x1", item.Name))
 			}
 		}
-		return lines, nil
+		return a.appendNetworkUdevRuleActions(lines), nil
 	case "udev":
 		lines := []string{
 			"reuse confirmed NIC bindings from the network stage, or review NIC bindings when udev is run standalone",
@@ -356,7 +356,7 @@ func (a *App) describeNetworkManagerStage() []string {
 			lines = append(lines, fmt.Sprintf("best-effort enable RoCE adaptive routing on %s using ethtool bus-info and mlxreg ROCE_ACCL adaptive_routing_forced_en=0x1", item.Name))
 		}
 	}
-	return lines
+	return a.appendNetworkUdevRuleActions(lines)
 }
 
 func (a *App) describeLegacyNetworkStage() []string {
@@ -402,7 +402,18 @@ func (a *App) describeLegacyNetworkStage() []string {
 			lines = append(lines, fmt.Sprintf("best-effort enable RoCE adaptive routing on %s using ethtool bus-info and mlxreg ROCE_ACCL adaptive_routing_forced_en=0x1", item.Name))
 		}
 	}
-	return lines
+	return a.appendNetworkUdevRuleActions(lines)
+}
+
+func (a *App) appendNetworkUdevRuleActions(lines []string) []string {
+	if !a.hasPersistentNICNamingTargets() {
+		return lines
+	}
+	return append(lines,
+		fmt.Sprintf("write %s with persistent names for confirmed management and RDMA NIC bindings", udevFile),
+		"run udevadm control --reload-rules",
+		"persistent NIC names take effect after reboot",
+	)
 }
 
 func (a *App) describeYumStage() ([]string, error) {
@@ -443,12 +454,16 @@ func (a *App) selectedStages() []string {
 			out = append(out, stage)
 		}
 	}
+	if a.stageEnabled("udev") && !a.stageEnabled("network") {
+		out = append(out, "udev")
+	}
 	return out
 }
 
 func (a *App) plannedFiles() []string {
 	files := make([]string, 0, 2+len(a.Machine.RDMA)*2)
-	if a.Stages["all"] || a.Stages["network"] {
+	networkSelected := a.Stages["all"] || a.Stages["network"]
+	if networkSelected {
 		if a.usesIfcfgNetwork() {
 			if a.configureManagementNetwork() {
 				if len(a.Machine.MgmtIfaces) == 1 {
@@ -479,8 +494,11 @@ func (a *App) plannedFiles() []string {
 				}
 			}
 		}
+		if a.hasPersistentNICNamingTargets() {
+			files = append(files, udevFile)
+		}
 	}
-	if a.stageEnabled("udev") {
+	if !networkSelected && a.stageEnabled("udev") && a.hasPersistentNICNamingTargets() {
 		files = append(files, udevFile)
 	}
 	if a.Stages["all"] || a.Stages["sysctl"] {
