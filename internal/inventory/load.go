@@ -135,8 +135,21 @@ func rowToRecord(header map[int]string, row []string) (spec.MachineRecord, error
 			}
 		}
 	}
+	for len(record.RDMA) > 0 && emptyRDMARecord(record.RDMA[len(record.RDMA)-1]) {
+		record.RDMA = record.RDMA[:len(record.RDMA)-1]
+	}
 
 	return record, nil
+}
+
+func emptyRDMARecord(record spec.RDMARecord) bool {
+	return strings.TrimSpace(record.Name) == "" &&
+		strings.TrimSpace(record.MAC) == "" &&
+		strings.TrimSpace(record.IP) == "" &&
+		strings.TrimSpace(record.Prefix) == "" &&
+		strings.TrimSpace(record.Gateway) == "" &&
+		strings.TrimSpace(record.Table) == "" &&
+		strings.TrimSpace(record.RouteCIDR) == ""
 }
 
 func assignRDMAField(record *spec.MachineRecord, key string, value string) bool {

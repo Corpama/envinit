@@ -26,6 +26,46 @@ func TestResolveTargetsUsesInventoryMgmtIP(t *testing.T) {
 	}
 }
 
+func TestInventoryRDMAInterfacesOverrideLongerBundleDefaults(t *testing.T) {
+	bundle := spec.Bundle{Defaults: spec.Defaults{RDMAInterfaces: []spec.RDMAInterfaceDefault{
+		{Name: "default1"},
+		{Name: "default2"},
+		{Name: "default3"},
+		{Name: "default4"},
+	}}, Check: spec.CheckConfig{Bandwidth: spec.CheckBandwidthConfig{RDMAGroups: []spec.CheckRDMAGroup{
+		{IBDevice: "mlx5_0"},
+		{IBDevice: "mlx5_1"},
+		{IBDevice: "mlx5_2"},
+		{IBDevice: "mlx5_3"},
+	}}}}
+	target := Target{RDMA: []spec.RDMARecord{{Name: "ens1"}, {Name: "ens2"}}}
+	interfaces := targetCounterInterfaces(bundle, target)
+	if got := strings.Join(interfaces, ","); got != "ens1,ens2" {
+		t.Fatalf("expected inventory interface count to win, got %q", got)
+	}
+
+	groups, err := resolveBandwidthGroups(Options{Bundle: bundle, DryRun: true}, []Target{{
+		Name: "node1",
+		RDMA: target.RDMA,
+	}})
+	if err != nil {
+		t.Fatalf("resolve groups: %v", err)
+	}
+	if len(groups["node1"]) != 2 {
+		t.Fatalf("expected 2 bandwidth groups, got %#v", groups["node1"])
+	}
+
+	source := Target{Name: "node1", RDMA: []spec.RDMARecord{{Name: "ens1", IP: "10.1.1.1"}, {Name: "ens2", IP: "10.1.2.1"}}}
+	destination := Target{Name: "node2", RDMA: []spec.RDMARecord{{Name: "ens1", IP: "10.1.1.2"}, {Name: "ens2", IP: "10.1.2.2"}}}
+	items, err := rdmaPingItems(bundle, source, destination)
+	if err != nil {
+		t.Fatalf("build RDMA ping items: %v", err)
+	}
+	if len(items) != 4 {
+		t.Fatalf("expected a 2x2 matrix without phantom defaults, got %#v", items)
+	}
+}
+
 func TestRunRejectsSingleHostForBandwidth(t *testing.T) {
 	err := Run(Options{
 		Bundle:       spec.Bundle{},
@@ -661,7 +701,7 @@ func TestIsTransientSSHErrorDetectsKexReset(t *testing.T) {
 }
 
 func TestRunRDMAPingRequiresRDMAIPs(t *testing.T) {
-	bundle := spec.Bundle{}
+	bundle := spec.Bundle{Defaults: spec.Defaults{RDMAInterfaces: []spec.RDMAInterfaceDefault{{Name: "ens1"}}}}
 	bundle.ApplyDefaults()
 	err := Run(Options{
 		Bundle:      bundle,

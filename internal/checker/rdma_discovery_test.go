@@ -98,6 +98,36 @@ func TestUpdateDelimitedInventoryRDMAWritesDiscoveredFields(t *testing.T) {
 	}
 }
 
+func TestUpdateDelimitedInventoryRDMAClearsTrailingStaleSlots(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inventory.csv")
+	content := "host_id,mgmt_ip,rdma1_name,rdma1_ip,rdma1_prefix,rdma2_name,rdma2_ip,rdma2_prefix,rdma3_name,rdma3_ip,rdma3_gateway,rdma4_name,rdma4_ip,rdma4_table\n" +
+		"node1,10.61.10.41,old1,10.61.11.41,24,old2,10.61.12.41,24,old3,10.61.13.41,10.61.13.1,old4,10.61.14.41,104\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write inventory: %v", err)
+	}
+	targets := []Target{{
+		Input:   "node1",
+		Name:    "node1",
+		Address: "10.61.10.41",
+		RDMA: []spec.RDMARecord{
+			{Name: "ens1", IP: "10.61.11.41"},
+			{Name: "ens2", IP: "10.61.12.41"},
+		},
+	}}
+	if err := updateDelimitedInventoryRDMA(path, targets); err != nil {
+		t.Fatalf("update inventory: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read inventory: %v", err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "node1,10.61.10.41,ens1,10.61.11.41,24,ens2,10.61.12.41,24,,,,,,\n") {
+		t.Fatalf("expected stale rdma3/rdma4 fields to be cleared while retained slots keep their settings:\n%s", got)
+	}
+}
+
 func TestUpdateDelimitedInventoryRDMAAppendsMissingTargetAndDoesNotDuplicateExisting(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "inventory.csv")

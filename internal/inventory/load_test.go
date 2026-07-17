@@ -65,6 +65,24 @@ func TestLoadCSVParsesDynamicRDMAColumns(t *testing.T) {
 	}
 }
 
+func TestLoadCSVTrimsTrailingEmptyRDMASlots(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inventory.csv")
+	content := "host_id,rdma1_name,rdma1_ip,rdma2_name,rdma2_ip,rdma3_name,rdma3_ip,rdma4_name,rdma4_ip\n" +
+		"xpu21,ens1,10.61.11.43,ens2,10.61.12.43,,,,\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write csv: %v", err)
+	}
+
+	rows, err := Load(path, "")
+	if err != nil {
+		t.Fatalf("load csv: %v", err)
+	}
+	if len(rows[0].RDMA) != 2 {
+		t.Fatalf("expected 2 populated RDMA records, got %d: %#v", len(rows[0].RDMA), rows[0].RDMA)
+	}
+}
+
 func TestLoadCSVParsesRDMARouteCIDR(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "inventory.csv")

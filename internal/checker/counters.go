@@ -37,7 +37,7 @@ func collectNICCounterSnapshots(opts Options, targets []Target, phase string) (m
 }
 
 func targetCounterInterfaces(bundle spec.Bundle, target Target) []string {
-	maxItems := maxInt(len(target.RDMA), len(bundle.Defaults.RDMAInterfaces))
+	maxItems := targetRDMAInterfaceCount(bundle, target)
 	interfaces := make([]string, 0, maxItems)
 	seen := map[string]bool{}
 	for idx := 0; idx < maxItems; idx++ {
@@ -57,6 +57,13 @@ func targetCounterInterfaces(bundle spec.Bundle, target Target) []string {
 	return interfaces
 }
 
+func targetRDMAInterfaceCount(bundle spec.Bundle, target Target) int {
+	if len(target.RDMA) > 0 {
+		return len(target.RDMA)
+	}
+	return len(bundle.Defaults.RDMAInterfaces)
+}
+
 func targetRDMAInterfaceName(bundle spec.Bundle, target Target, index int) string {
 	if index >= 0 && index < len(target.RDMA) {
 		if name := strings.TrimSpace(target.RDMA[index].Name); name != "" {
@@ -72,8 +79,8 @@ func targetRDMAInterfaceName(bundle spec.Bundle, target Target, index int) strin
 func resolveBandwidthGroups(opts Options, targets []Target) (resolvedRDMAGroups, error) {
 	out := resolvedRDMAGroups{}
 	for _, target := range targets {
-		groupCount := maxInt(len(opts.Bundle.Check.Bandwidth.RDMAGroups), maxInt(len(target.RDMA), len(opts.Bundle.Defaults.RDMAInterfaces)))
-		if opts.DryRun && !opts.RunXCCL && len(opts.Bundle.Check.Bandwidth.RDMAGroups) > 0 {
+		groupCount := targetRDMAInterfaceCount(opts.Bundle, target)
+		if groupCount == 0 && len(opts.Bundle.Check.Bandwidth.RDMAGroups) > 0 {
 			groupCount = len(opts.Bundle.Check.Bandwidth.RDMAGroups)
 		}
 		if groupCount == 0 {

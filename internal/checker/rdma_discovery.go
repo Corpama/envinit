@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"envinit/internal/spec"
@@ -72,6 +73,7 @@ func autoDiscoverNetworkTargets(opts DiscoverOptions, targets []Target) ([]Targe
 	}
 	if opts.DryRun {
 		fmt.Fprintf(opts.Output, "dry-run: would update inventory network fields: %s\n", opts.InventoryPath)
+		fmt.Fprintln(opts.Output, "dry-run: bundle remains unchanged")
 		return updated, nil
 	}
 	if strings.TrimSpace(opts.InventoryPath) != "" {
@@ -79,6 +81,7 @@ func autoDiscoverNetworkTargets(opts DiscoverOptions, targets []Target) ([]Targe
 			return nil, err
 		}
 		fmt.Fprintf(opts.Output, "INFO updated inventory network fields: %s\n", opts.InventoryPath)
+		fmt.Fprintln(opts.Output, "INFO bundle remains unchanged")
 	}
 	return updated, nil
 }
@@ -452,10 +455,32 @@ func writeTargetInventoryFields(row []string, headerIndex map[string]int, target
 	if parsed := net.ParseIP(managementIP); parsed != nil && parsed.To4() != nil {
 		row[headerIndex["mgmt_ip"]] = managementIP
 	}
+	for key, column := range headerIndex {
+		slot, ok := inventoryRDMASlot(key)
+		if ok && slot > len(target.RDMA) && column < len(row) {
+			row[column] = ""
+		}
+	}
 	for idx, item := range target.RDMA {
 		row[headerIndex[fmt.Sprintf("rdma%d_name", idx+1)]] = strings.TrimSpace(item.Name)
 		row[headerIndex[fmt.Sprintf("rdma%d_ip", idx+1)]] = strings.TrimSpace(item.IP)
 	}
+}
+
+func inventoryRDMASlot(key string) (int, bool) {
+	if !strings.HasPrefix(key, "rdma") {
+		return 0, false
+	}
+	rest := strings.TrimPrefix(key, "rdma")
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == 0 || end >= len(rest) || rest[end] != '_' {
+		return 0, false
+	}
+	slot, err := strconv.Atoi(rest[:end])
+	return slot, err == nil && slot > 0
 }
 
 func setFirstExistingInventoryField(row []string, headerIndex map[string]int, keys []string, value string) {

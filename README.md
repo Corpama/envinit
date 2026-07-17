@@ -775,7 +775,7 @@ RDMA 工作模式：
 
 `full` 表示存在 RDMA 网卡，并配置 RDMA IP、路由、policy rule、命名、`mlxconfig` 和 post 调优。`names_only` 表示存在 RDMA 网卡，但只做发现、绑定、命名、`mlxconfig` 和 post 调优，不配置 RDMA IP/路由。`off` 表示没有 RDMA 网卡，跳过所有 RDMA 相关动作。
 
-`rdma_interfaces` 仅作为兼容旧配置或强制覆盖目标名/路由表时使用。新配置建议优先从规划表读取 `rdmaN_name`、`rdmaN_ip`、`rdmaN_table`，缺失时再由默认规则补齐。
+`rdma_interfaces` 仅作为兼容旧配置或在 inventory 完全没有 RDMA 条目时提供回退。新配置建议由 inventory 的 `rdmaN_name`、`rdmaN_ip`、`rdmaN_table` 描述实际网卡；只要某台机器存在 RDMA 条目，它的条目数量就是该机器的 RDMA 数量，bundle 不会再把它扩展成固定四卡。未显式填写路由表号时仍按逻辑顺序自动使用 `101、102、103...`。
 
 RDMA 直连路由默认按每张 RDMA 口的 `rdmaN_ip` 和 `rdmaN_prefix` 自动推导，例如 `172.18.12.10/25` 会生成 `172.18.12.0/25` 的 scope link 路由。旧配置中的 `rdma_route_cidr` 和 `rdmaN_route_cidr` 仍然兼容，但新配置通常不需要填写。
 
@@ -1067,7 +1067,7 @@ Kylin yum 路径建议使用 `offline_repo`：
 
 `env_init discover` 解决的是“现场没有完整 inventory，后续 check 不知道通过哪个管理地址登录、也不知道哪些 RDMA 网卡和地址应参测”的问题。它通过本地执行或 SSH 运行只读命令，发现候选网络信息，然后按 inventory 的逻辑槽位进行确认和写回。
 
-它只写 inventory 文件，不会修改目标机的网卡名、IP、路由、SSH 配置或其他系统状态。真正修改目标机网络的是 `apply --stages network`，两者不要混淆。
+它只写 inventory 文件，不修改 bundle，也不会修改目标机的网卡名、IP、路由、SSH 配置或其他系统状态。真正修改目标机网络的是 `apply --stages network`，两者不要混淆。
 
 最基本的调用：
 
@@ -1089,9 +1089,9 @@ sudo ./env_init discover \
 3. **发现 RDMA 候选**：执行 `show_gids`，只接受包含 IPv4 的记录；过滤 `lo`、bond、容器/虚拟网络。一个接口出现多条 GID 时优先 RoCE v1 记录，然后按 IPv4 数值和接口名排序。
 4. **管理/RDMA 互斥**：把已识别为 RDMA 的接口名和 IPv4 从管理网候选中移除，避免把 400G 地址误写成 `mgmt_ip`。
 5. **review 或自动接受**：默认打开 Network Discovery Review。已有 inventory 的 `rdmaN_name` 或 `rdmaN_ip` 会尽量保持在原逻辑槽位；其余候选按发现顺序填入。
-6. **写回**：只更新 `mgmt_ip`、`rdmaN_name`、`rdmaN_ip`；其他 inventory 字段保持不变。
+6. **写回**：更新 `mgmt_ip`、`rdmaN_name`、`rdmaN_ip`，bundle 保持不变。若重新发现的 RDMA 数量变少，会清空该机器多余尾部槽位的 `rdmaN_*` 字段，避免旧的四卡或八卡记录继续制造不存在的参测网卡；仍然存在的槽位会保留 prefix、gateway、table 等人工规划值。
 
-这里的 `rdma1`、`rdma2` 是项目逻辑顺序，不是 `mlx5_1`、`mlx5_2`。discover 会展示 `show_gids` 返回的 IB device 供人判断，但不会把固定 `mlx5_N` 写入 bundle。check 会在每台机器上根据最终确认的 `rdmaN_name` 从 sysfs 重新解析实际 IB device。
+这里的 `rdma1`、`rdma2` 是项目逻辑顺序，不是 `mlx5_1`、`mlx5_2`。discover 会展示 `show_gids` 返回的 IB device 供人判断，但不会把固定 `mlx5_N` 写入 bundle。check 会在每台机器上根据最终确认的 `rdmaN_name` 从 sysfs 重新解析实际 IB device。inventory 已有 RDMA 条目时，apply 和 check 都以该机器的实际条目数量为准；只有完全没有 RDMA 条目时才回退到 bundle 的 `defaults.rdma_interfaces`。
 
 #### 8.1.3 review 操作
 

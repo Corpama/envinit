@@ -795,7 +795,7 @@ func TestNewResolvesManagementByMACAndKeepsRDMATargetNames(t *testing.T) {
 	if got := strings.Join(app.Machine.MgmtIfaces, ","); got != "eth-mgmt-a,eth-mgmt-b" {
 		t.Fatalf("unexpected mgmt ifaces: %s", got)
 	}
-	if app.Machine.RDMA[0].Name != "ens11np0" || app.Machine.RDMA[3].Name != "ens17np0" {
+	if app.Machine.RDMA[0].Name != "rdma-a" || app.Machine.RDMA[3].Name != "rdma-d" {
 		t.Fatalf("unexpected rdma names: %#v", app.Machine.RDMA)
 	}
 	if app.Machine.RDMA[0].MAC != "aa:bb:cc:dd:ee:11" || app.Machine.RDMA[3].MAC != "aa:bb:cc:dd:ee:14" {

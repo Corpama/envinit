@@ -357,14 +357,6 @@ func (b *Bundle) ApplyDefaults() {
 		b.Defaults.RoutePriority = 32761
 	}
 	b.Defaults.RDMAMode = normalizeRDMAMode(b.Defaults.RDMAMode)
-	if b.RDMAExists() && len(b.Defaults.RDMAInterfaces) == 0 {
-		b.Defaults.RDMAInterfaces = []RDMAInterfaceDefault{
-			{Name: "ens11np0", Table: 101},
-			{Name: "ens13np0", Table: 102},
-			{Name: "ens15np0", Table: 103},
-			{Name: "ens17np0", Table: 104},
-		}
-	}
 	if b.OfflineAPT.TargetFile == "" {
 		b.OfflineAPT.TargetFile = "/etc/apt/sources.list.d/kunlun-offline.list"
 	}
@@ -714,7 +706,10 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 		}
 	}
 
-	rdmaCount := maxInt(len(bundle.Defaults.RDMAInterfaces), len(record.RDMA))
+	rdmaCount := len(record.RDMA)
+	if rdmaCount == 0 {
+		rdmaCount = len(bundle.Defaults.RDMAInterfaces)
+	}
 	rdma := make([]RDMAConfig, 0, rdmaCount)
 	if bundle.RDMAExists() {
 		for idx := 0; idx < rdmaCount; idx++ {
@@ -734,12 +729,14 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 			if idx < len(record.RDMA) {
 				row := record.RDMA[idx]
 				item.MAC = strings.TrimSpace(row.MAC)
-				name, mac, err := resolveInterfaceName(row.Name, row.MAC, item.Name, ifaceByMAC, fmt.Sprintf("rdma%d", idx+1))
-				if err != nil {
-					return MachineConfig{}, err
+				if strings.TrimSpace(row.Name) != "" || strings.TrimSpace(row.MAC) != "" || strings.TrimSpace(item.Name) != "" {
+					name, mac, err := resolveInterfaceName(row.Name, row.MAC, item.Name, ifaceByMAC, fmt.Sprintf("rdma%d", idx+1))
+					if err != nil {
+						return MachineConfig{}, err
+					}
+					item.Name = firstNonEmpty(row.Name, item.Name, name)
+					item.MAC = mac
 				}
-				item.Name = firstNonEmpty(row.Name, item.Name, name)
-				item.MAC = mac
 				item.IP = strings.TrimSpace(row.IP)
 				if row.Prefix != "" {
 					p, err := strconv.Atoi(strings.TrimSpace(row.Prefix))

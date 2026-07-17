@@ -462,6 +462,14 @@ func TestRDMAModeNamesOnlyKeepsRDMAWithoutIPRoute(t *testing.T) {
 	}
 }
 
+func TestApplyDefaultsDoesNotInjectRDMAInterfaces(t *testing.T) {
+	b := Bundle{}
+	b.ApplyDefaults()
+	if len(b.Defaults.RDMAInterfaces) != 0 {
+		t.Fatalf("expected RDMA interface defaults to remain empty, got %#v", b.Defaults.RDMAInterfaces)
+	}
+}
+
 func TestValidateRejectsInvalidRDMAMode(t *testing.T) {
 	b := Bundle{
 		Defaults: Defaults{
@@ -506,7 +514,7 @@ func TestResolveMachineAllowsBlankRDMAIPWhenRouteConfigDisabled(t *testing.T) {
 	}
 }
 
-func TestResolveMachineExpandsRDMAFromInventoryBeyondDefaultFour(t *testing.T) {
+func TestResolveMachineUsesDynamicRDMAInventoryCount(t *testing.T) {
 	b := Bundle{}
 	b.ApplyDefaults()
 	record := MachineRecord{
@@ -534,5 +542,54 @@ func TestResolveMachineExpandsRDMAFromInventoryBeyondDefaultFour(t *testing.T) {
 	}
 	if cfg.RDMA[7].Name != "ens8" || cfg.RDMA[7].IP != "10.61.18.43" || cfg.RDMA[7].Table != 108 {
 		t.Fatalf("unexpected rdma8 config: %#v", cfg.RDMA[7])
+	}
+}
+
+func TestResolveMachineInventoryCountOverridesBundleDefaults(t *testing.T) {
+	b := Bundle{
+		Defaults: Defaults{
+			RDMAMode: RDMAModeNamesOnly,
+			RDMAInterfaces: []RDMAInterfaceDefault{
+				{Name: "default1", Table: 101},
+				{Name: "default2", Table: 102},
+				{Name: "default3", Table: 103},
+				{Name: "default4", Table: 104},
+			},
+		},
+	}
+	b.ApplyDefaults()
+	cfg, err := ResolveMachine(b, MachineRecord{
+		HostID: "node01",
+		RDMA: []RDMARecord{
+			{Name: "ens1"},
+			{Name: "ens2"},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("resolve machine: %v", err)
+	}
+	if len(cfg.RDMA) != 2 {
+		t.Fatalf("expected inventory to define exactly 2 RDMA interfaces, got %#v", cfg.RDMA)
+	}
+	if cfg.RDMA[0].Name != "ens1" || cfg.RDMA[1].Name != "ens2" {
+		t.Fatalf("unexpected resolved RDMA interfaces: %#v", cfg.RDMA)
+	}
+}
+
+func TestResolveMachineAssignsLogicalNamesToIPOnlyRDMAInventory(t *testing.T) {
+	b := Bundle{}
+	b.ApplyDefaults()
+	cfg, err := ResolveMachine(b, MachineRecord{
+		HostID: "node01",
+		RDMA: []RDMARecord{
+			{IP: "10.1.1.1"},
+			{IP: "10.1.2.1"},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("resolve machine: %v", err)
+	}
+	if len(cfg.RDMA) != 2 || cfg.RDMA[0].Name != "rdma1" || cfg.RDMA[1].Name != "rdma2" {
+		t.Fatalf("expected dynamic logical RDMA names, got %#v", cfg.RDMA)
 	}
 }

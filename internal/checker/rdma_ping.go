@@ -188,7 +188,10 @@ func printRDMAPingResultTable(output io.Writer, rows []rdmaPingResultRow) {
 }
 
 func rdmaPingItems(bundle spec.Bundle, source Target, destination Target) ([]rdmaPingItem, error) {
-	maxItems := maxInt(len(source.RDMA), len(destination.RDMA), len(bundle.Defaults.RDMAInterfaces))
+	maxItems := maxInt(len(source.RDMA), len(destination.RDMA))
+	if maxItems == 0 {
+		maxItems = len(bundle.Defaults.RDMAInterfaces)
+	}
 	sourceNames := make([]string, maxItems)
 	sourceIPs := make([]string, maxItems)
 	destinationNames := make([]string, maxItems)
