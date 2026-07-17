@@ -31,6 +31,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          notes_file="release-notes/${GITHUB_REF_NAME}.md"
+          if [[ ! -f "$notes_file" ]]; then
+            echo "error: missing Chinese release notes: $notes_file" >&2
+            exit 1
+          fi
           gh release create "$GITHUB_REF_NAME" release/* \
             --title "$GITHUB_REF_NAME" \
-            --generate-notes
+            --notes-file "$notes_file"
