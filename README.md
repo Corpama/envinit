@@ -16,19 +16,6 @@
 | `ubuntu22.04-x86_64` | Ubuntu 22.04 | `apt` | `netplan` | `examples/bundle.ubuntu22.sample.json` |
 | `kylin10sp3-x86_64` | Kylin V10 SP3 | `yum` | `auto`，运行时在 NetworkManager 和 legacy network 间选择 | `examples/bundle.kylin10sp3.sample.json` |
 
-CentOS 7 已从工具交付 profile 中移除。原因是现场所需的 MLNX OFED、内核和离线软件源组合维护成本较高，容易产生驱动构建和系统包版本不匹配问题。
-
-本轮调整结论：
-
-- 下载器按系统 profile 拉取物料，避免一次性交付全量 `data` 导致包过大、拉取慢和 COS 成本高。
-- COS release 默认只保留最近两个版本，历史版本会在 release 脚本中清理。
-- `examples` 只保留 Ubuntu 和 Kylin 两份 bundle 样例，`platform_options.redhat` 作为旧字段兼容，不再作为新样例出现。
-- `bundle.json` 中的物料路径推荐写成 `data/...`，但它是相对执行 `env_init` 命令时的当前目录，不是相对 bundle 文件所在目录。
-- 已经通过带内管理网连接的机器，默认不立即 apply 网络配置，避免工具运行中重载当前网络导致失联。
-- 当关闭管理网配置时，工具不会备份、重命名或改写管理网已有配置；只处理 RDMA 侧配置。反过来，关闭 RDMA 时也不会触碰 RDMA 网络配置。
-- OFED 前置依赖已内置：Kylin/yum 检查 `elfutils-devel`，Ubuntu/apt 检查 `linux-headers-$(uname -r)`、`build-essential`、`debhelper`、`fakeroot`。
-- ACSCtl、MaxReadReq、ring buffer、RoCE adaptive routing 和 `CNP_DSCP=48` 会写入 post boot 服务，并在 `post` 阶段立即重启一次服务让配置当场生效。
-
 工具提供四个子命令：
 
 | 子命令 | 用途 | 是否修改系统 |
