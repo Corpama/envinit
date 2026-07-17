@@ -247,6 +247,12 @@ for profile_id in "${PROFILE_IDS[@]}"; do
         inventory: $inventory
       }'
   )")
+
+  # Each profile contains several gigabytes of offline material. Release the
+  # extracted tree and tar as soon as their hashes and manifest entry are
+  # complete so the next profile does not double the runner disk peak.
+  rm -rf "${WORK_ROOT}/profiles/${profile_id}" "$PROFILE_PACKAGE_PATH"
+  rm -f "$BUNDLE_RELEASE_PATH"
 done
 
 MANIFEST_PATH="${RELEASE_DIR}/manifest.json"
