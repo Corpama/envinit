@@ -4,17 +4,26 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 
 	"envinit/internal/spec"
 )
 
 func ResolveTargets(records []spec.MachineRecord, hostInputs []string) ([]Target, error) {
+	return resolveTargets(records, hostInputs, true)
+}
+
+func ResolveDiscoveryTargets(records []spec.MachineRecord, hostInputs []string) ([]Target, error) {
+	return resolveTargets(records, hostInputs, false)
+}
+
+func resolveTargets(records []spec.MachineRecord, hostInputs []string, requireInventoryMgmtIP bool) ([]Target, error) {
 	var targets []Target
 	seen := map[string]bool{}
 	for _, raw := range hostInputs {
 		for _, input := range splitHosts(raw) {
-			target, err := resolveTarget(records, input)
+			target, err := resolveTarget(records, input, requireInventoryMgmtIP)
 			if err != nil {
 				return nil, err
 			}
@@ -43,13 +52,16 @@ func splitHosts(raw string) []string {
 	return out
 }
 
-func resolveTarget(records []spec.MachineRecord, input string) (Target, error) {
+func resolveTarget(records []spec.MachineRecord, input string, requireInventoryMgmtIP bool) (Target, error) {
 	input = strings.TrimSpace(input)
 	for _, record := range records {
 		if matchesRecord(record, input) {
 			address := strings.TrimSpace(record.MgmtIP)
-			if address == "" {
+			if address == "" && requireInventoryMgmtIP {
 				return Target{}, fmt.Errorf("inventory record %q has no mgmt_ip", input)
+			}
+			if address == "" {
+				address = input
 			}
 			return Target{
 				Input:            input,
@@ -81,14 +93,43 @@ func matchesRecord(record spec.MachineRecord, input string) bool {
 
 func markLocalTargets(targets []Target) []Target {
 	localIPs := localIPSet()
+	localNames := localHostnameSet()
 	for idx := range targets {
 		address := strings.TrimSpace(targets[idx].Address)
 		ip := net.ParseIP(address)
 		if ip != nil && (ip.IsLoopback() || localIPs[ip.String()]) {
 			targets[idx].Local = true
+			continue
+		}
+		for _, name := range []string{targets[idx].Input, targets[idx].Name, targets[idx].ExpectedHostname, targets[idx].Address} {
+			if localNames[strings.ToLower(strings.TrimSpace(name))] {
+				targets[idx].Local = true
+				break
+			}
 		}
 	}
 	return targets
+}
+
+func localHostnameSet() map[string]bool {
+	out := map[string]bool{}
+	hostname, err := os.Hostname()
+	if err != nil {
+		return out
+	}
+	addHostnameVariant(out, hostname)
+	return out
+}
+
+func addHostnameVariant(out map[string]bool, value string) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return
+	}
+	out[value] = true
+	if idx := strings.IndexByte(value, '.'); idx > 0 {
+		out[value[:idx]] = true
+	}
 }
 
 func localIPSet() map[string]bool {

@@ -12,14 +12,17 @@ import (
 )
 
 const (
-	netplanDir        = "/etc/netplan"
-	networkScriptsDir = "/etc/sysconfig/network-scripts"
-	nmDispatcherFile  = "/etc/NetworkManager/dispatcher.d/90-kunlun-rdma-routes"
-	routeDir          = "/etc/networkd-dispatcher/routable.d"
-	localSbinDir      = "/usr/local/sbin"
-	udevFile          = "/etc/udev/rules.d/70-persistent-net.rules"
-	sysctlFile        = "/etc/sysctl.conf"
-	grubFile          = "/etc/default/grub"
+	netplanDir             = "/etc/netplan"
+	networkScriptsDir      = "/etc/sysconfig/network-scripts"
+	nmDispatcherFile       = "/etc/NetworkManager/dispatcher.d/90-kunlun-rdma-routes"
+	routeDir               = "/etc/networkd-dispatcher/routable.d"
+	localSbinDir           = "/usr/local/sbin"
+	managementUdevFile     = "/etc/udev/rules.d/70-kunlun-management-net.rules"
+	rdmaUdevFile           = "/etc/udev/rules.d/71-kunlun-rdma-net.rules"
+	rdmaSelectedFile       = "/var/lib/envinit/selected_interfaces"
+	legacyRDMASelectedFile = "/etc/rdma/rdma_conf/selected_interfaces"
+	sysctlFile             = "/etc/sysctl.conf"
+	grubFile               = "/etc/default/grub"
 
 	kunlunModprobeFile = "/etc/modprobe.d/kunlun.conf"
 
@@ -58,19 +61,25 @@ var knownStages = func() map[string]bool {
 }()
 
 type App struct {
-	Bundle        spec.Bundle
-	Machine       spec.MachineConfig
-	Root          string
-	DryRun        bool
-	Stages        map[string]bool
-	Output        io.Writer
-	HostSpecified bool
+	Bundle                  spec.Bundle
+	Machine                 spec.MachineConfig
+	Root                    string
+	DryRun                  bool
+	InteractiveDryRunReview bool
+	Stages                  map[string]bool
+	Output                  io.Writer
+	HostSpecified           bool
+	ResumeApply             bool
+	ResetApplyProgress      bool
 
 	networkApplyDeferred       bool
 	confirmedInterfaceBindings []interfaceBinding
 	interfaceBindingsConfirmed bool
 	udevRulesPersisted         bool
 	now                        func() time.Time
+	runStageOverride           func(string) error
+	applySourceRecord          spec.MachineRecord
+	hasApplySourceRecord       bool
 }
 
 func New(bundle spec.Bundle, records []spec.MachineRecord, host string, root string, dryRun bool, stages map[string]bool, out io.Writer) (*App, error) {
@@ -95,14 +104,16 @@ func New(bundle spec.Bundle, records []spec.MachineRecord, host string, root str
 		out = io.Discard
 	}
 	app := &App{
-		Bundle:        bundle,
-		Machine:       machine,
-		Root:          root,
-		DryRun:        dryRun,
-		Stages:        stages,
-		Output:        out,
-		HostSpecified: strings.TrimSpace(host) != "",
-		now:           time.Now,
+		Bundle:               bundle,
+		Machine:              machine,
+		Root:                 root,
+		DryRun:               dryRun,
+		Stages:               stages,
+		Output:               out,
+		HostSpecified:        strings.TrimSpace(host) != "",
+		applySourceRecord:    record,
+		hasApplySourceRecord: true,
+		now:                  time.Now,
 	}
 	if app.configureManagementNetwork() {
 		if err := app.ensureAutoManagementInterfaces(); err != nil {
@@ -120,23 +131,52 @@ func (a *App) Apply() error {
 		if os.Geteuid() != 0 {
 			return errors.New("apply mode must be run as root")
 		}
+		if err := requireApplyTTY(); err != nil {
+			return err
+		}
 	}
 	if err := a.ensureHostname(); err != nil {
 		return err
 	}
-	for _, stage := range stageOrder {
-		if !a.stageEnabled(stage) {
-			continue
-		}
-		if err := a.runStage(stage); err != nil {
-			return err
-		}
+	if err := a.runSelectedStages(); err != nil {
+		return err
 	}
 	if a.stageEnabled("udev") && !a.stageEnabled("network") {
 		if err := a.runStage("udev"); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+func (a *App) runSelectedStages() error {
+	if a.ResumeApply && !a.DryRun && a.Stages["all"] {
+		return a.runStagesWithProgress()
+	}
+	for _, stage := range stageOrder {
+		if !a.stageEnabled(stage) {
+			continue
+		}
+		if err := a.executeStage(stage); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *App) executeStage(stage string) error {
+	if a.runStageOverride != nil {
+		return a.runStageOverride(stage)
+	}
+	return a.runStage(stage)
+}
+
+func requireApplyTTY() error {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("apply mode requires an interactive TTY; run from a local console or an SSH session allocated with a TTY, not a non-interactive remote command: %w", err)
+	}
+	_ = tty.Close()
 	return nil
 }
 

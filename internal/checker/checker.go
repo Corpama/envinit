@@ -13,39 +13,44 @@ func Run(opts Options) error {
 	}
 	runBandwidth := opts.RunBandwidth
 	runRDMAPing := opts.RunRDMAPing
-	if !runBandwidth && !runRDMAPing {
+	runXCCL := opts.RunXCCL
+	if !runBandwidth && !runRDMAPing && !runXCCL {
 		runBandwidth = true
 	}
+	runRDMATraffic := runBandwidth || runXCCL
 	targets, err := ResolveTargets(opts.Records, opts.Hosts)
 	if err != nil {
 		return err
 	}
-	if len(targets) < 2 {
-		return errors.New("check requires at least two hosts")
+	if len(targets) < 2 && (runBandwidth || runRDMAPing) {
+		return errors.New("bandwidth and rdma-ping checks require at least two hosts; single-host mode is supported only for --check-stage xccl")
 	}
 	targets = markLocalTargets(targets)
 	if !opts.DryRun {
 		warnHostnameMismatches(opts, targets)
 	}
-	if runBandwidth && len(opts.Bundle.Check.RDMAGroups) == 0 {
-		return errors.New("bundle check.rdma_groups is required")
+	if runBandwidth && opts.Bundle.Check.Bandwidth.BandwidthQPs < 0 {
+		return errors.New("bundle check.bandwidth.bandwidth_qps must not be negative")
 	}
-	if runBandwidth && opts.Bundle.Check.BandwidthQPs < 0 {
-		return errors.New("bundle check.bandwidth_qps must not be negative")
-	}
-	if runBandwidth {
-		for _, group := range opts.Bundle.Check.RDMAGroups {
-			if err := validateGroup(opts.Bundle.Check, group); err != nil {
+	if runRDMATraffic {
+		for _, group := range opts.Bundle.Check.Bandwidth.RDMAGroups {
+			if err := validateGroup(group); err != nil {
 				return err
 			}
 		}
 	}
 	resolvedGroups := resolvedRDMAGroups{}
-	if runBandwidth {
+	if runRDMATraffic {
 		var err error
 		resolvedGroups, err = resolveBandwidthGroups(opts, targets)
 		if err != nil {
 			return err
+		}
+		if runBandwidth {
+			resolvedGroups, err = resolveXDRTopologyGroups(opts, targets, resolvedGroups)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -57,7 +62,7 @@ func Run(opts Options) error {
 		failures = append(failures, runRDMAPingChecks(opts, targets)...)
 	}
 	var rdmaDeviceBefore map[string]rdmaDeviceCounterSnapshot
-	if runBandwidth {
+	if runRDMATraffic {
 		var rdmaFailures []string
 		rdmaDeviceBefore, rdmaFailures = collectRDMADeviceCounterSnapshots(opts, targets, resolvedGroups, "before")
 		failures = append(failures, rdmaFailures...)
@@ -66,7 +71,7 @@ func Run(opts Options) error {
 		for i := 0; i < len(targets); i++ {
 			for j := i + 1; j < len(targets); j++ {
 				for _, pair := range [][2]Target{{targets[i], targets[j]}, {targets[j], targets[i]}} {
-					if opts.Bundle.Check.Parallel {
+					if opts.Bundle.Check.Bandwidth.Parallel {
 						results, errs := runParallel(opts, resolvedGroups, pair[0], pair[1])
 						for _, err := range errs {
 							failures = append(failures, err.Error())
@@ -79,8 +84,7 @@ func Run(opts Options) error {
 						continue
 					}
 
-					for _, stream := range bandwidthStreams(opts.Bundle.Check) {
-						stream = resolveStreamGroups(resolvedGroups, pair[0], pair[1], stream)
+					for _, stream := range bandwidthStreamsForGroups(opts.Bundle.Check.Bandwidth, resolvedGroups[pair[0].Name], resolvedGroups[pair[1].Name]) {
 						result, err := runStream(opts, pair[0], pair[1], stream)
 						if err != nil {
 							failures = append(failures, err.Error())
@@ -94,8 +98,16 @@ func Run(opts Options) error {
 			}
 		}
 	}
+	if runXCCL {
+		if err := runXCCLCheck(opts, targets, resolvedGroups); err != nil {
+			failures = append(failures, err.Error())
+			fmt.Fprintf(opts.Output, "FAIL xccl: %v\n", err)
+		}
+	}
 	if runBandwidth {
 		printBandwidthResultTable(opts.Output, bandwidthResults)
+	}
+	if runRDMATraffic {
 		rdmaDeviceAfter, rdmaFailures := collectRDMADeviceCounterSnapshots(opts, targets, resolvedGroups, "after")
 		failures = append(failures, rdmaFailures...)
 		failures = append(failures, compareRDMADeviceCounterSnapshots(opts, targets, resolvedGroups, rdmaDeviceBefore, rdmaDeviceAfter)...)
@@ -112,7 +124,7 @@ func Run(opts Options) error {
 func appendBandwidthResultFailure(opts Options, failures []string, result Result) []string {
 	label := resultLabel(result)
 	if !result.Passed {
-		failures = append(failures, fmt.Sprintf("%s -> %s %s %.2f Gbps below %.2f Gbps", result.Client.Name, result.Server.Name, label, result.GBits, opts.Bundle.Check.MinGBits))
+		failures = append(failures, fmt.Sprintf("%s -> %s %s %.2f Gbps below %.2f Gbps", result.Client.Name, result.Server.Name, label, result.GBits, opts.Bundle.Check.Bandwidth.MinGBits))
 	}
 	return failures
 }

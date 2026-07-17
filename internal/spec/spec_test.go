@@ -1,9 +1,99 @@
 package spec
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
+
+func TestCheckConfigUnmarshalAcceptsNestedBandwidth(t *testing.T) {
+	var cfg CheckConfig
+	if err := json.Unmarshal([]byte(`{
+		"bandwidth": {"iterations": 77, "min_gbits": 380},
+		"rdma_ping": {"count": 4, "payload_size": 8972, "timeout": 3},
+		"ssh": {"user": "root", "options": ["-p", "22"]}
+	}`), &cfg); err != nil {
+		t.Fatalf("unmarshal nested check config: %v", err)
+	}
+	if cfg.Bandwidth.Iterations != 77 || cfg.Bandwidth.MinGBits != 380 {
+		t.Fatalf("unexpected nested bandwidth config: %#v", cfg.Bandwidth)
+	}
+	if cfg.RDMAPing.Count != 4 || cfg.RDMAPing.PayloadSize != 8972 || cfg.RDMAPing.Timeout != 3 {
+		t.Fatalf("unexpected nested RDMA ping config: %#v", cfg.RDMAPing)
+	}
+	if cfg.SSH.User != "root" || len(cfg.SSH.Options) != 2 {
+		t.Fatalf("unexpected nested SSH config: %#v", cfg.SSH)
+	}
+}
+
+func TestCheckConfigUnmarshalAcceptsLegacyFlatBandwidth(t *testing.T) {
+	var cfg CheckConfig
+	if err := json.Unmarshal([]byte(`{
+		"iterations": 77,
+		"min_gbits": 380,
+		"rdma_groups": [{"ib_device": "mlx5_1", "xpu_offsets": []}],
+		"rdma_ping_count": 4,
+		"rdma_ping_payload_size": 8972,
+		"rdma_ping_timeout": 3,
+		"ssh_user": "root",
+		"ssh_options": ["-p", "22"]
+	}`), &cfg); err != nil {
+		t.Fatalf("unmarshal legacy check config: %v", err)
+	}
+	if cfg.Bandwidth.Iterations != 77 || cfg.Bandwidth.MinGBits != 380 {
+		t.Fatalf("unexpected legacy bandwidth config: %#v", cfg.Bandwidth)
+	}
+	if len(cfg.Bandwidth.RDMAGroups) != 1 || cfg.Bandwidth.RDMAGroups[0].IBDevice != "mlx5_1" {
+		t.Fatalf("unexpected legacy RDMA groups: %#v", cfg.Bandwidth.RDMAGroups)
+	}
+	if cfg.RDMAPing.Count != 4 || cfg.RDMAPing.PayloadSize != 8972 || cfg.RDMAPing.Timeout != 3 {
+		t.Fatalf("unexpected legacy RDMA ping config: %#v", cfg.RDMAPing)
+	}
+	if cfg.SSH.User != "root" || len(cfg.SSH.Options) != 2 {
+		t.Fatalf("unexpected legacy SSH config: %#v", cfg.SSH)
+	}
+}
+
+func TestCheckConfigNestedBandwidthTakesPrecedenceOverLegacyFields(t *testing.T) {
+	var cfg CheckConfig
+	if err := json.Unmarshal([]byte(`{
+		"iterations": 99,
+		"min_gbits": 100,
+		"bandwidth": {"iterations": 77, "min_gbits": 380},
+		"rdma_ping_count": 9,
+		"rdma_ping": {"count": 4},
+		"ssh_user": "legacy",
+		"ssh": {"user": "nested"}
+	}`), &cfg); err != nil {
+		t.Fatalf("unmarshal mixed check config: %v", err)
+	}
+	if cfg.Bandwidth.Iterations != 77 || cfg.Bandwidth.MinGBits != 380 {
+		t.Fatalf("nested bandwidth should take precedence: %#v", cfg.Bandwidth)
+	}
+	if cfg.RDMAPing.Count != 4 {
+		t.Fatalf("nested RDMA ping should take precedence: %#v", cfg.RDMAPing)
+	}
+	if cfg.SSH.User != "nested" {
+		t.Fatalf("nested SSH should take precedence: %#v", cfg.SSH)
+	}
+}
+
+func TestCheckConfigRejectsUnknownTopLevelField(t *testing.T) {
+	var cfg CheckConfig
+	err := json.Unmarshal([]byte(`{"bandwidth": {}, "unexpected": true}`), &cfg)
+	if err == nil || !strings.Contains(err.Error(), `unknown field "unexpected"`) {
+		t.Fatalf("expected unknown check field error, got %v", err)
+	}
+}
+
+func TestCheckConfigRejectsUnknownNestedField(t *testing.T) {
+	var cfg CheckConfig
+	err := json.Unmarshal([]byte(`{"ssh": {"user": "root", "unexpected": true}}`), &cfg)
+	if err == nil || !strings.Contains(err.Error(), `unknown field "unexpected"`) {
+		t.Fatalf("expected unknown nested check field error, got %v", err)
+	}
+}
 
 func TestApplyDefaultsSetsOfflineAPTCopyTarget(t *testing.T) {
 	b := Bundle{
@@ -14,6 +104,20 @@ func TestApplyDefaultsSetsOfflineAPTCopyTarget(t *testing.T) {
 	b.ApplyDefaults()
 	if b.OfflineAPT.CopyTo != "/opt/repo" {
 		t.Fatalf("unexpected offline apt copy target: %s", b.OfflineAPT.CopyTo)
+	}
+}
+
+func TestApplyDefaultsSetsXCCLRuntimeDefaults(t *testing.T) {
+	var b Bundle
+	b.ApplyDefaults()
+	if b.Check.XCCL.WorkRoot != "/tmp/envinit-xccl-check" || b.Check.XCCL.XPUHome != "/usr/local/xpu" {
+		t.Fatalf("unexpected XCCL runtime defaults: %#v", b.Check.XCCL)
+	}
+	if b.Check.XCCL.Test != "all_reduce" || b.Check.XCCL.MinBytes != "128m" || b.Check.XCCL.MaxBytes != "128m" {
+		t.Fatalf("unexpected XCCL performance defaults: %#v", b.Check.XCCL)
+	}
+	if b.Check.XCCL.EnableXDR == nil || !*b.Check.XCCL.EnableXDR {
+		t.Fatalf("XCCL XDR should default to enabled: %#v", b.Check.XCCL.EnableXDR)
 	}
 }
 
@@ -199,10 +303,13 @@ func TestPlatformOptionsOverrideLegacyDefaultPolicyFields(t *testing.T) {
 				BackupExistingNetplan:     &enabled,
 				DisableExistingAptSources: &disabled,
 			},
-			RedHat: RedHatPlatformOptions{
+			Kylin: YumPlatformOptions{
 				BackupExistingNetwork: &enabled,
 				DisableExistingRepos:  &disabled,
 			},
+		},
+		Platform: PlatformConfig{
+			OSFamily: "kylin",
 		},
 	}
 	if !b.BackupExistingNetplan() {
@@ -212,10 +319,32 @@ func TestPlatformOptionsOverrideLegacyDefaultPolicyFields(t *testing.T) {
 		t.Fatal("expected ubuntu platform option to disable apt source backup")
 	}
 	if !b.BackupExistingNetwork() {
-		t.Fatal("expected redhat platform option to enable network backup")
+		t.Fatal("expected kylin platform option to enable network backup")
 	}
 	if b.DisableExistingRepos() {
-		t.Fatal("expected redhat platform option to disable repo backup")
+		t.Fatal("expected kylin platform option to disable repo backup")
+	}
+}
+
+func TestKylinPlatformOptionsFallbackToLegacyRedHatKey(t *testing.T) {
+	enabled := true
+	disabled := false
+	b := Bundle{
+		Platform: PlatformConfig{
+			OSFamily: "kylin",
+		},
+		PlatformOptions: PlatformOptions{
+			RedHat: YumPlatformOptions{
+				BackupExistingNetwork: &enabled,
+				DisableExistingRepos:  &disabled,
+			},
+		},
+	}
+	if !b.BackupExistingNetwork() {
+		t.Fatal("expected legacy redhat platform option to enable network backup for kylin")
+	}
+	if b.DisableExistingRepos() {
+		t.Fatal("expected legacy redhat platform option to disable repo backup for kylin")
 	}
 }
 
@@ -254,13 +383,12 @@ func TestApplyDefaultsSetsActiveBackupMII(t *testing.T) {
 }
 
 func TestResolveMachineRejectsInvalidActiveBackupPrimary(t *testing.T) {
-	disabled := false
 	b := Bundle{
 		Defaults: Defaults{
 			MgmtInterfaces: []string{"enp2s0", "enp3s0"},
 			BondMode:       "active-backup",
 			BondPrimary:    "enp9s0",
-			RDMAExsist:     &disabled,
+			RDMAMode:       RDMAModeOff,
 		},
 	}
 	b.ApplyDefaults()
@@ -274,10 +402,9 @@ func TestResolveMachineRejectsInvalidActiveBackupPrimary(t *testing.T) {
 }
 
 func TestResolveMachineSkipsRDMAWhenDisabled(t *testing.T) {
-	disabled := false
 	b := Bundle{
 		Defaults: Defaults{
-			RDMAExsist: &disabled,
+			RDMAMode: RDMAModeOff,
 		},
 	}
 	b.ApplyDefaults()
@@ -295,12 +422,11 @@ func TestResolveMachineSkipsRDMAWhenDisabled(t *testing.T) {
 }
 
 func TestResolveMachineSkipsManagementWhenMgmtIPIsBlank(t *testing.T) {
-	disabled := false
 	b := Bundle{
 		Defaults: Defaults{
 			MgmtInterfaces: []string{"enp2s0", "enp3s0"},
 			MgmtGateway:    "172.16.18.1",
-			RDMAExsist:     &disabled,
+			RDMAMode:       RDMAModeOff,
 		},
 	}
 	b.ApplyDefaults()
@@ -315,39 +441,43 @@ func TestResolveMachineSkipsManagementWhenMgmtIPIsBlank(t *testing.T) {
 	}
 }
 
-func TestTopLevelRDMAExistOverridesDefaults(t *testing.T) {
-	enabled := true
-	disabled := false
+func TestRDMAModeDefaultsToFull(t *testing.T) {
 	b := Bundle{
-		TopLevelRDMAExist: &disabled,
-		Defaults: Defaults{
-			RDMAExsist: &enabled,
-		},
+		Defaults: Defaults{},
 	}
-	if b.RDMAExists() {
-		t.Fatal("expected top-level rdma_exist=false to override defaults.rdma_exsist=true")
+	b.ApplyDefaults()
+	if !b.RDMAExists() || !b.RDMAConfigureIPRoute() {
+		t.Fatal("expected blank rdma_mode to default to full")
 	}
 }
 
-func TestTopLevelRDMAConfigureIPRouteOverridesDefaults(t *testing.T) {
-	enabled := true
-	disabled := false
+func TestRDMAModeNamesOnlyKeepsRDMAWithoutIPRoute(t *testing.T) {
 	b := Bundle{
-		TopLevelRDMAConfigureIPRoute: &disabled,
 		Defaults: Defaults{
-			RDMAConfigureIPRoute: &enabled,
+			RDMAMode: RDMAModeNamesOnly,
 		},
 	}
-	if b.RDMAConfigureIPRoute() {
-		t.Fatal("expected top-level rdma_configure_ip_route=false to override defaults.rdma_configure_ip_route=true")
+	if !b.RDMAExists() || b.RDMAConfigureIPRoute() {
+		t.Fatal("expected rdma_mode=names_only to keep RDMA enabled and disable IP route config")
+	}
+}
+
+func TestValidateRejectsInvalidRDMAMode(t *testing.T) {
+	b := Bundle{
+		Defaults: Defaults{
+			RDMAMode: "name_only",
+		},
+	}
+	b.ApplyDefaults()
+	if err := b.Validate(); err == nil {
+		t.Fatal("expected invalid rdma_mode to fail validation")
 	}
 }
 
 func TestResolveMachineAllowsBlankRDMAIPWhenRouteConfigDisabled(t *testing.T) {
-	disabled := false
 	b := Bundle{
 		Defaults: Defaults{
-			RDMAConfigureIPRoute: &disabled,
+			RDMAMode: RDMAModeNamesOnly,
 			RDMAInterfaces: []RDMAInterfaceDefault{
 				{Name: "ens11np0"},
 				{Name: "ens13np0"},
@@ -373,5 +503,36 @@ func TestResolveMachineAllowsBlankRDMAIPWhenRouteConfigDisabled(t *testing.T) {
 	}
 	if cfg.RDMA[0].Table != 0 {
 		t.Fatalf("expected omitted route table to stay unused as 0, got %d", cfg.RDMA[0].Table)
+	}
+}
+
+func TestResolveMachineExpandsRDMAFromInventoryBeyondDefaultFour(t *testing.T) {
+	b := Bundle{}
+	b.ApplyDefaults()
+	record := MachineRecord{
+		HostID:     "xpu21",
+		MgmtIP:     "10.61.10.43",
+		MgmtIface1: "eth0",
+		RDMA:       make([]RDMARecord, 8),
+	}
+	for idx := range record.RDMA {
+		record.RDMA[idx] = RDMARecord{
+			Name: fmt.Sprintf("ens%d", idx+1),
+			IP:   fmt.Sprintf("10.61.%d.43", 11+idx),
+		}
+	}
+
+	cfg, err := ResolveMachine(b, record, nil)
+	if err != nil {
+		t.Fatalf("resolve machine: %v", err)
+	}
+	if len(cfg.RDMA) != 8 {
+		t.Fatalf("expected 8 RDMA configs, got %d: %#v", len(cfg.RDMA), cfg.RDMA)
+	}
+	if cfg.RDMA[4].Name != "ens5" || cfg.RDMA[4].Table != 105 {
+		t.Fatalf("unexpected rdma5 config: %#v", cfg.RDMA[4])
+	}
+	if cfg.RDMA[7].Name != "ens8" || cfg.RDMA[7].IP != "10.61.18.43" || cfg.RDMA[7].Table != 108 {
+		t.Fatalf("unexpected rdma8 config: %#v", cfg.RDMA[7])
 	}
 }

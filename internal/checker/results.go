@@ -15,24 +15,35 @@ func printBandwidthResultTable(output io.Writer, results []Result) {
 		return
 	}
 	rows := make([]bandwidthResultRow, 0, len(results))
+	degradedCount := 0
 	for _, result := range results {
 		status := "PASS"
 		if !result.Passed {
 			status = "FAIL"
+		} else if result.Degraded {
+			status = "WARN"
+		}
+		if result.Degraded {
+			degradedCount++
 		}
 		row := bandwidthResultRow{
 			Status:     status,
 			Client:     result.Client.Name,
 			Server:     result.Server.Name,
-			ClientRDMA: rdmaLabel(result.ClientRDMAIndex),
-			ServerRDMA: rdmaLabel(result.ServerRDMAIndex),
+			ClientNIC:  rdmaNICLabel(result.Client, result.ClientRDMAIndex),
+			ServerNIC:  rdmaNICLabel(result.Server, result.ServerRDMAIndex),
+			ClientIP:   rdmaIPLabel(result.Client, result.ClientRDMAIndex),
+			ServerIP:   bandwidthPeerAddress(result.Server, checkStream{ServerRDMAIndex: result.ServerRDMAIndex}),
 			ClientDev:  result.ClientGroup.IBDevice,
 			ServerDev:  result.ServerGroup.IBDevice,
 			Port:       "-",
 			ClientXP:   "-",
 			ServerXP:   "-",
+			ClientTopo: topologyResultLabel(result.ClientTopology),
+			ServerTopo: topologyResultLabel(result.ServerTopology),
 			Bandwidth:  "unknown",
 			Failure:    !result.Passed,
+			Degraded:   result.Degraded,
 		}
 		if result.Port > 0 {
 			row.Port = strconv.Itoa(result.Port)
@@ -57,13 +68,17 @@ func printBandwidthResultTable(output io.Writer, results []Result) {
 		for _, pair := range [][2]string{
 			{left.Client, right.Client},
 			{left.Server, right.Server},
-			{left.ClientRDMA, right.ClientRDMA},
-			{left.ServerRDMA, right.ServerRDMA},
+			{left.ClientNIC, right.ClientNIC},
+			{left.ServerNIC, right.ServerNIC},
+			{left.ClientIP, right.ClientIP},
+			{left.ServerIP, right.ServerIP},
 			{left.ClientDev, right.ClientDev},
 			{left.ServerDev, right.ServerDev},
 			{left.Port, right.Port},
 			{left.ClientXP, right.ClientXP},
 			{left.ServerXP, right.ServerXP},
+			{left.ClientTopo, right.ClientTopo},
+			{left.ServerTopo, right.ServerTopo},
 		} {
 			if pair[0] != pair[1] {
 				return pair[0] < pair[1]
@@ -72,7 +87,7 @@ func printBandwidthResultTable(output io.Writer, results []Result) {
 		return false
 	})
 
-	headers := []string{"STATUS", "CLIENT", "SERVER", "CLIENT_RDMA", "SERVER_RDMA", "CLIENT_DEV", "SERVER_DEV", "PORT", "CLIENT_XPU", "SERVER_XPU", "BANDWIDTH"}
+	headers := []string{"STATUS", "CLIENT", "SERVER", "CLIENT_NIC", "SERVER_NIC", "CLIENT_IP", "SERVER_IP", "CLIENT_DEV", "SERVER_DEV", "PORT", "CLIENT_XPU", "SERVER_XPU", "CLIENT_TOPO", "SERVER_TOPO", "BANDWIDTH"}
 	widths := make([]int, len(headers))
 	for idx, header := range headers {
 		widths[idx] = len(header)
@@ -83,13 +98,17 @@ func printBandwidthResultTable(output io.Writer, results []Result) {
 			row.Status,
 			row.Client,
 			row.Server,
-			row.ClientRDMA,
-			row.ServerRDMA,
+			row.ClientNIC,
+			row.ServerNIC,
+			row.ClientIP,
+			row.ServerIP,
 			row.ClientDev,
 			row.ServerDev,
 			row.Port,
 			row.ClientXP,
 			row.ServerXP,
+			row.ClientTopo,
+			row.ServerTopo,
 			row.Bandwidth,
 		}
 		for idx, cell := range cells {
@@ -110,6 +129,20 @@ func printBandwidthResultTable(output io.Writer, results []Result) {
 		}
 		fmt.Fprintln(output, line)
 	}
+	if degradedCount > 0 {
+		fmt.Fprintf(output, "WARN bandwidth topology: %d completed stream(s) used non-PIX XPU/NIC mappings; bandwidth may be limited by the PCIe/NUMA path\n", degradedCount)
+	}
+}
+
+func topologyResultLabel(link string) string {
+	link = strings.ToUpper(strings.TrimSpace(link))
+	if link == "" {
+		return "-"
+	}
+	if topologyLinkDegraded(link) {
+		return link + "(DEGRADED)"
+	}
+	return link
 }
 
 func rdmaLabel(index int) string {
@@ -117,4 +150,25 @@ func rdmaLabel(index int) string {
 		return "-"
 	}
 	return fmt.Sprintf("rdma%d", index+1)
+}
+
+func rdmaNICLabel(target Target, index int) string {
+	if index >= 0 && index < len(target.RDMA) {
+		if name := strings.TrimSpace(target.RDMA[index].Name); name != "" {
+			return name
+		}
+	}
+	return rdmaLabel(index)
+}
+
+func rdmaIPLabel(target Target, index int) string {
+	if index >= 0 && index < len(target.RDMA) {
+		if address := strings.TrimSpace(target.RDMA[index].IP); address != "" {
+			return address
+		}
+	}
+	if address := strings.TrimSpace(target.Address); address != "" {
+		return address
+	}
+	return "-"
 }

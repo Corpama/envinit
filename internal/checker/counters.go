@@ -72,15 +72,31 @@ func targetRDMAInterfaceName(bundle spec.Bundle, target Target, index int) strin
 func resolveBandwidthGroups(opts Options, targets []Target) (resolvedRDMAGroups, error) {
 	out := resolvedRDMAGroups{}
 	for _, target := range targets {
-		groups := make([]spec.CheckRDMAGroup, len(opts.Bundle.Check.RDMAGroups))
-		copy(groups, opts.Bundle.Check.RDMAGroups)
+		groupCount := maxInt(len(opts.Bundle.Check.Bandwidth.RDMAGroups), maxInt(len(target.RDMA), len(opts.Bundle.Defaults.RDMAInterfaces)))
+		if opts.DryRun && !opts.RunXCCL && len(opts.Bundle.Check.Bandwidth.RDMAGroups) > 0 {
+			groupCount = len(opts.Bundle.Check.Bandwidth.RDMAGroups)
+		}
+		if groupCount == 0 {
+			return nil, fmt.Errorf("resolve rdma groups for %s: inventory and bundle defaults contain no RDMA interfaces", target.Name)
+		}
+		groups := make([]spec.CheckRDMAGroup, groupCount)
+		copy(groups, opts.Bundle.Check.Bandwidth.RDMAGroups)
 		for idx := range groups {
 			iface := targetRDMAInterfaceName(opts.Bundle, target, idx)
 			iface = strings.TrimSpace(iface)
 			if iface == "" {
+				if strings.TrimSpace(groups[idx].IBDevice) == "" {
+					return nil, fmt.Errorf("resolve rdma group for %s rdma%d: inventory is missing rdma%d_name", target.Name, idx+1, idx+1)
+				}
 				continue
 			}
-			if opts.DryRun {
+			if opts.DryRun && !opts.RunXCCL && strings.TrimSpace(opts.Bundle.Check.Bandwidth.MmapDevice) == "" {
+				if strings.TrimSpace(groups[idx].IBDevice) == "" {
+					groups[idx].IBDevice = fmt.Sprintf("<resolve-ib-device:%s>", iface)
+				}
+				continue
+			}
+			if opts.DryRun && !opts.RunXCCL && strings.TrimSpace(groups[idx].IBDevice) != "" && len(groups[idx].XPUOffsets) > 0 {
 				continue
 			}
 			device, err := resolveIBDeviceForInterface(opts, target, iface)
@@ -89,7 +105,9 @@ func resolveBandwidthGroups(opts Options, targets []Target) (resolvedRDMAGroups,
 			}
 			configured := strings.TrimSpace(groups[idx].IBDevice)
 			groups[idx].IBDevice = device
-			if configured != "" && configured != device {
+			if opts.DryRun {
+				fmt.Fprintf(opts.Output, "dry-run discovery rdma group: %s rdma%d iface=%s ib_device=%s\n", target.Name, idx+1, iface, device)
+			} else if configured != "" && configured != device {
 				fmt.Fprintf(opts.Output, "WARN rdma group resolve: %s rdma%d iface=%s configured_ib_device=%s actual_ib_device=%s; using actual device\n", target.Name, idx+1, iface, configured, device)
 			} else {
 				fmt.Fprintf(opts.Output, "INFO rdma group resolve: %s rdma%d iface=%s ib_device=%s\n", target.Name, idx+1, iface, device)
@@ -102,7 +120,7 @@ func resolveBandwidthGroups(opts Options, targets []Target) (resolvedRDMAGroups,
 
 func resolveIBDeviceForInterface(opts Options, target Target, iface string) (string, error) {
 	command := resolveIBDeviceCommand(iface)
-	output, err := runCommand(opts.Bundle.Check, target, command)
+	output, err := runDiscoveryCommand(opts, target, command)
 	if err != nil {
 		return "", fmt.Errorf("resolve ib device for %s %s: %w", target.Name, iface, err)
 	}
@@ -114,6 +132,13 @@ func resolveIBDeviceForInterface(opts Options, target Target, iface string) (str
 		return "", fmt.Errorf("resolve ib device for %s %s: multiple infiniband devices found: %s", target.Name, iface, strings.Join(devices, ", "))
 	}
 	return devices[0], nil
+}
+
+func runDiscoveryCommand(opts Options, target Target, command string) (string, error) {
+	if opts.CommandRunner != nil {
+		return opts.CommandRunner(opts.Bundle.Check, target, command)
+	}
+	return runCommand(opts.Bundle.Check, target, command)
 }
 
 func resolveIBDeviceCommand(iface string) string {

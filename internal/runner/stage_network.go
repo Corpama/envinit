@@ -25,6 +25,9 @@ func (a *App) runNetworkStage() error {
 			return err
 		}
 	}
+	if err := a.ensureNetplanRouteDispatcher(); err != nil {
+		return err
+	}
 
 	if a.configureManagementNetwork() {
 		mgmtPath := filepath.Join(netplanDir, "00-kunlun-bond.yaml")
@@ -143,6 +146,27 @@ func (a *App) runLegacyNetworkStage() error {
 	return nil
 }
 
+func (a *App) ensureNetplanRouteDispatcher() error {
+	if !a.Bundle.RDMAConfigureIPRoute() || len(a.Machine.RDMA) == 0 {
+		return nil
+	}
+	if a.DryRun {
+		a.logf("dry-run: would ensure networkd-dispatcher is installed and enabled for RDMA route replay")
+		return nil
+	}
+	if _, err := a.captureCmd("", nil, "dpkg", "-s", "networkd-dispatcher"); err != nil {
+		if err := a.runCmd("", nil, "apt-get", "update"); err != nil {
+			return err
+		}
+		if err := a.runCmd("", nil, "apt-get", "install", "-y", "networkd-dispatcher"); err != nil {
+			return err
+		}
+	} else {
+		a.logf("networkd-dispatcher is already installed")
+	}
+	return a.runCmd("", nil, "systemctl", "enable", "--now", "networkd-dispatcher")
+}
+
 func (a *App) prepareNetworkApply() (bool, error) {
 	missing := a.missingPlannedInterfaces()
 	if len(missing) == 0 {
@@ -152,10 +176,31 @@ func (a *App) prepareNetworkApply() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := a.renameInterfacesTemporarily(bindings); err != nil {
+	temporaryBindings := bindings
+	if !a.Bundle.ApplyNetworkImmediately() {
+		temporaryBindings = make([]interfaceBinding, 0, len(bindings))
+		for _, binding := range bindings {
+			if binding.Kind == "mgmt" {
+				if strings.TrimSpace(binding.CurrentName) != "" && strings.TrimSpace(binding.CurrentName) != strings.TrimSpace(binding.Name) {
+					a.logf("defer management interface rename %s -> %s until reboot because apply_network_immediately=false", binding.CurrentName, binding.Name)
+				}
+				continue
+			}
+			temporaryBindings = append(temporaryBindings, binding)
+		}
+	}
+	if err := a.renameInterfacesTemporarily(temporaryBindings); err != nil {
 		return false, err
 	}
-	a.logf("temporarily renamed target interface names before applying network settings: %s", strings.Join(missing, ", "))
+	var renamed []string
+	for _, binding := range temporaryBindings {
+		if strings.TrimSpace(binding.CurrentName) != "" && strings.TrimSpace(binding.Name) != "" && strings.TrimSpace(binding.CurrentName) != strings.TrimSpace(binding.Name) {
+			renamed = append(renamed, binding.Name)
+		}
+	}
+	if len(renamed) > 0 {
+		a.logf("temporarily renamed target interface names before applying network settings: %s", strings.Join(renamed, ", "))
+	}
 	return false, nil
 }
 
@@ -262,9 +307,17 @@ func (a *App) persistUdevRules() error {
 	if err != nil {
 		return err
 	}
-	content := renderUdevRules(bindings)
-	if err := a.writeManagedFile(udevFile, content, 0o644); err != nil {
-		return err
+	if a.configureManagementNetwork() {
+		content := renderUdevRulesForKind(bindings, "mgmt")
+		if err := a.writeManagedFile(managementUdevFile, content, 0o644); err != nil {
+			return err
+		}
+	}
+	if a.Bundle.RDMAExists() {
+		content := renderUdevRulesForKind(bindings, "rdma")
+		if err := a.writeManagedFile(rdmaUdevFile, content, 0o644); err != nil {
+			return err
+		}
 	}
 	if err := a.runCmd("", nil, "udevadm", "control", "--reload-rules"); err != nil {
 		return err
@@ -295,6 +348,9 @@ func (a *App) confirmedNICBindings() ([]interfaceBinding, error) {
 	}
 	a.confirmedInterfaceBindings = cloneInterfaceBindings(bindings)
 	a.interfaceBindingsConfirmed = true
+	if err := a.persistSelectedRDMAInterfaces(bindings); err != nil {
+		return nil, err
+	}
 	return cloneInterfaceBindings(bindings), nil
 }
 
@@ -305,10 +361,17 @@ func incompleteNICBindingError(err error) error {
 func (a *App) confirmInterfaceBindings(bindings []interfaceBinding) ([]interfaceBinding, error) {
 	if a.DryRun {
 		if bindingsNeedManualReview(bindings) {
+			if a.InteractiveDryRunReview {
+				return a.confirmInterfaceBindingsInteractively(bindings, true)
+			}
 			return nil, errors.New("manual NIC binding review is required because automatic discovery was ambiguous; run apply from an interactive terminal to choose NICs in the TUI, or provide mgmt*_mac/rdma*_mac values in inventory for exact matching")
 		}
 		return bindings, nil
 	}
+	return a.confirmInterfaceBindingsInteractively(bindings, false)
+}
+
+func (a *App) confirmInterfaceBindingsInteractively(bindings []interfaceBinding, dryRunReview bool) ([]interfaceBinding, error) {
 	devices, err := a.discoverReviewNetDevices()
 	if err != nil {
 		return nil, err
@@ -331,7 +394,11 @@ func (a *App) confirmInterfaceBindings(bindings []interfaceBinding) ([]interface
 	defer tty.Close()
 
 	if bindingsNeedManualReview(bindings) {
-		a.logf("open manual NIC binding TUI for %d target(s) and %d selectable NIC(s)", len(bindings), len(devices))
+		if dryRunReview {
+			a.logf("open dry-run NIC binding TUI for %d target(s) and %d selectable NIC(s)", len(bindings), len(devices))
+		} else {
+			a.logf("open manual NIC binding TUI for %d target(s) and %d selectable NIC(s)", len(bindings), len(devices))
+		}
 	}
 	review := newNICBindingReview(bindings, devices)
 	confirmed, err := runNICBindingReview(tty, review)
@@ -369,4 +436,74 @@ func syncConfirmedInterfaceBindings(a *App, bindings []interfaceBinding) {
 			rdmaIdx++
 		}
 	}
+}
+
+func (a *App) persistSelectedRDMAInterfaces(bindings []interfaceBinding) error {
+	if !a.Bundle.RDMAExists() {
+		return nil
+	}
+	content := renderSelectedRDMAInterfaces(bindings)
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	if a.DryRun {
+		a.logf("dry-run: would write %s with confirmed RDMA interface bindings", rdmaSelectedFile)
+		return nil
+	}
+	if err := a.writeManagedFile(rdmaSelectedFile, content, 0o644); err != nil {
+		return err
+	}
+	if err := a.ensureLegacyRDMASelectedLink(); err != nil {
+		return err
+	}
+	if a.pathExists("/lib/systemd/system/rdma.service") || a.pathExists("/etc/systemd/system/rdma.service") || a.pathExists("/etc/init.d/rdma") {
+		_ = a.runCmdAllowFailure("", nil, "systemctl", "restart", "rdma.service")
+	}
+	return nil
+}
+
+func (a *App) ensureLegacyRDMASelectedLink() error {
+	legacy := a.targetPath(legacyRDMASelectedFile)
+	primary := a.targetPath(rdmaSelectedFile)
+	relativeTarget, err := filepath.Rel(filepath.Dir(legacy), primary)
+	if err != nil {
+		return fmt.Errorf("resolve legacy RDMA selected interface link: %w", err)
+	}
+	if current, err := os.Readlink(legacy); err == nil && current == relativeTarget {
+		a.logf("unchanged compatibility link %s -> %s", legacyRDMASelectedFile, rdmaSelectedFile)
+		return nil
+	}
+
+	a.logf("link %s -> %s for RDMA service compatibility", legacyRDMASelectedFile, rdmaSelectedFile)
+	if a.DryRun {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(legacy), err)
+	}
+	if _, err := os.Lstat(legacy); err == nil {
+		backup := fmt.Sprintf("%s.bak.%s", legacy, a.applyProgressNow().Format("20060102_150405"))
+		a.logf("backup %s -> %s", legacyRDMASelectedFile, backup)
+		if err := os.Rename(legacy, backup); err != nil {
+			return fmt.Errorf("backup legacy RDMA selected interface file: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect %s: %w", legacyRDMASelectedFile, err)
+	}
+	if err := os.Symlink(relativeTarget, legacy); err != nil {
+		return fmt.Errorf("link %s to %s: %w", legacyRDMASelectedFile, rdmaSelectedFile, err)
+	}
+	return nil
+}
+
+func (a *App) pathExists(systemPath string) bool {
+	_, err := os.Stat(a.targetPath(systemPath))
+	return err == nil
+}
+
+func (a *App) canConfirmNICBindingsForStandaloneStage() bool {
+	if len(a.Machine.RDMA) == 0 {
+		return false
+	}
+	return !a.DryRun || a.pathExists("/sys/class/net")
 }

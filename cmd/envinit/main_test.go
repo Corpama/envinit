@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"envinit/internal/runner"
 	"envinit/internal/spec"
 )
@@ -79,6 +81,49 @@ func TestRenderPlanPreviewGroupsStageDetails(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expected %q in plan preview:\n%s", want, got)
+		}
+	}
+}
+
+func TestPlanPreviewModelNavigatesStagesAndScrollsActions(t *testing.T) {
+	app := fakePlanApp()
+	preview := buildPlanPreview(app, strings.Join([]string{
+		"hostname already xpu11",
+		"==> stage: network",
+		"write /etc/sysconfig/network-scripts/ifcfg-bond0",
+		"run: nmcli connection reload",
+		"run: nmcli connection up bond0",
+		"run: nmcli connection up ens11np0",
+		"run: bash /usr/local/sbin/kunlun-config_rt_ens11np0.sh",
+		"run: bash /usr/local/sbin/kunlun-config_rt_ens13np0.sh",
+		"best-effort enable RoCE adaptive routing on ens11np0",
+		"best-effort enable RoCE adaptive routing on ens13np0",
+		"==> stage: post",
+		"write /etc/systemd/system/kunlun-post-boot.service",
+	}, "\n"))
+	model := newPlanPreviewModel(preview)
+	model.height = 14
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(planPreviewModel)
+	if got := model.stages[model.stage].Name; got != "network" {
+		t.Fatalf("expected network stage after down, got %s", got)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	model = updated.(planPreviewModel)
+	if model.scroll == 0 {
+		t.Fatal("expected PgDown to scroll stage actions")
+	}
+	view := model.View()
+	for _, want := range []string{
+		"Plan Preview",
+		"Target: test1",
+		"network",
+		"Keys: Up/Down stage",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("expected %q in TUI view:\n%s", want, view)
 		}
 	}
 }
@@ -189,24 +234,24 @@ func TestApplyCheckOverridesConvertsMTUToPingPayload(t *testing.T) {
 	if err := applyCheckOverrides(&b, checkOverrideOptions{rdmaPingCount: 10, rdmaPingMTU: 9000, rdmaPingTimeout: 5}); err != nil {
 		t.Fatalf("apply check overrides: %v", err)
 	}
-	if b.Check.RDMAPingCount != 10 {
-		t.Fatalf("unexpected ping count: %d", b.Check.RDMAPingCount)
+	if b.Check.RDMAPing.Count != 10 {
+		t.Fatalf("unexpected ping count: %d", b.Check.RDMAPing.Count)
 	}
-	if b.Check.RDMAPingTimeout != 5 {
-		t.Fatalf("unexpected ping timeout: %d", b.Check.RDMAPingTimeout)
+	if b.Check.RDMAPing.Timeout != 5 {
+		t.Fatalf("unexpected ping timeout: %d", b.Check.RDMAPing.Timeout)
 	}
-	if b.Check.RDMAPingPayloadSize != 8972 {
-		t.Fatalf("unexpected ping payload size: %d", b.Check.RDMAPingPayloadSize)
+	if b.Check.RDMAPing.PayloadSize != 8972 {
+		t.Fatalf("unexpected ping payload size: %d", b.Check.RDMAPing.PayloadSize)
 	}
 }
 
 func TestApplyCheckOverridesSetsBandwidthQPs(t *testing.T) {
-	b := spec.Bundle{Check: spec.CheckConfig{BandwidthQPs: 2}}
+	b := spec.Bundle{Check: spec.CheckConfig{Bandwidth: spec.CheckBandwidthConfig{BandwidthQPs: 2}}}
 	if err := applyCheckOverrides(&b, checkOverrideOptions{bandwidthQPs: 8}); err != nil {
 		t.Fatalf("apply check overrides: %v", err)
 	}
-	if b.Check.BandwidthQPs != 8 {
-		t.Fatalf("unexpected bandwidth QP count: %d", b.Check.BandwidthQPs)
+	if b.Check.Bandwidth.BandwidthQPs != 8 {
+		t.Fatalf("unexpected bandwidth QP count: %d", b.Check.Bandwidth.BandwidthQPs)
 	}
 }
 
@@ -235,27 +280,29 @@ func TestApplyCheckOverridesEnablesEmulatedKVTransferAndXDRMmap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply check overrides: %v", err)
 	}
-	if b.Check.MessageSize != 8388608 {
-		t.Fatalf("unexpected message size: %d", b.Check.MessageSize)
+	if b.Check.Bandwidth.MessageSize != 8388608 {
+		t.Fatalf("unexpected message size: %d", b.Check.Bandwidth.MessageSize)
 	}
-	if b.Check.MmapDevice != "/dev/xdrdrv" {
-		t.Fatalf("unexpected mmap device: %q", b.Check.MmapDevice)
+	if b.Check.Bandwidth.MmapDevice != "/dev/xdrdrv" {
+		t.Fatalf("unexpected mmap device: %q", b.Check.Bandwidth.MmapDevice)
 	}
 }
 
 func TestApplyCheckOverridesDisablesLegacyBandwidthDefaults(t *testing.T) {
 	b := spec.Bundle{
 		Check: spec.CheckConfig{
-			MessageSize: 8388608,
-			MmapDevice:  "/dev/xdrdrv",
+			Bandwidth: spec.CheckBandwidthConfig{
+				MessageSize: 8388608,
+				MmapDevice:  "/dev/xdrdrv",
+			},
 		},
 	}
 	b.ApplyDefaults()
 	if err := applyCheckOverrides(&b, checkOverrideOptions{}); err != nil {
 		t.Fatalf("apply check overrides: %v", err)
 	}
-	if b.Check.MessageSize != 0 || b.Check.MmapDevice != "" {
-		t.Fatalf("expected bandwidth defaults to be disabled, got size=%d mmap=%q", b.Check.MessageSize, b.Check.MmapDevice)
+	if b.Check.Bandwidth.MessageSize != 0 || b.Check.Bandwidth.MmapDevice != "" {
+		t.Fatalf("expected bandwidth defaults to be disabled, got size=%d mmap=%q", b.Check.Bandwidth.MessageSize, b.Check.Bandwidth.MmapDevice)
 	}
 }
 
@@ -268,17 +315,27 @@ func TestApplyCheckOverridesRejectsUnknownBandwidthMmap(t *testing.T) {
 }
 
 func TestParseCheckStagesAcceptsBandwidthAndRDMAPing(t *testing.T) {
-	runBandwidth, runRDMAPing, err := parseCheckStages("bandwidth,rdma-ping")
+	runBandwidth, runRDMAPing, runXCCL, err := parseCheckStages("bandwidth,rdma-ping")
 	if err != nil {
 		t.Fatalf("parse check stages: %v", err)
 	}
-	if !runBandwidth || !runRDMAPing {
-		t.Fatalf("unexpected stages: bandwidth=%v rdma-ping=%v", runBandwidth, runRDMAPing)
+	if !runBandwidth || !runRDMAPing || runXCCL {
+		t.Fatalf("unexpected stages: bandwidth=%v rdma-ping=%v xccl=%v", runBandwidth, runRDMAPing, runXCCL)
+	}
+}
+
+func TestParseCheckStagesAcceptsXCCL(t *testing.T) {
+	runBandwidth, runRDMAPing, runXCCL, err := parseCheckStages("xccl")
+	if err != nil {
+		t.Fatalf("parse check stages: %v", err)
+	}
+	if runBandwidth || runRDMAPing || !runXCCL {
+		t.Fatalf("unexpected stages: bandwidth=%v rdma-ping=%v xccl=%v", runBandwidth, runRDMAPing, runXCCL)
 	}
 }
 
 func TestParseCheckStagesRejectsUnknownStage(t *testing.T) {
-	if _, _, err := parseCheckStages("latency"); err == nil {
+	if _, _, _, err := parseCheckStages("latency"); err == nil {
 		t.Fatal("expected unknown check-stage error")
 	}
 }

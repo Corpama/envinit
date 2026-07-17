@@ -86,7 +86,7 @@ func (a *App) describeStage(stage string) ([]string, error) {
 		}
 		lines := []string{}
 		if a.Bundle.BackupExistingNetplan() {
-			lines = append(lines, "backup existing /etc/netplan/*.yaml files except envinit-managed files")
+			lines = append(lines, "backup existing envinit-managed netplan files that will be rewritten")
 		}
 		if !a.configureManagementNetwork() {
 			lines = append(lines, "skip management network configuration because mgmt_ip is empty or configure_management_network=false")
@@ -96,14 +96,15 @@ func (a *App) describeStage(stage string) ([]string, error) {
 			lines = append(lines, fmt.Sprintf("write %s with bond %s %s over %s (%s/%d via %s)", filepath.Join(netplanDir, "00-kunlun-bond.yaml"), a.Machine.MgmtBondName, a.bondSummary(), strings.Join(a.Machine.MgmtIfaces, ","), a.Machine.MgmtIP, a.Machine.MgmtPrefix, a.Machine.MgmtGateway))
 		}
 		if !a.Bundle.RDMAExists() {
-			lines = append(lines, "skip all RDMA actions because rdma_exsist=false")
+			lines = append(lines, "skip all RDMA actions because rdma_mode=off")
 		} else if !a.Bundle.RDMAConfigureIPRoute() {
-			lines = append(lines, "skip RDMA IP, netplan, route, and policy-rule configuration because rdma_configure_ip_route=false")
+			lines = append(lines, "skip RDMA IP, netplan, route, and policy-rule configuration because rdma_mode=names_only")
 		} else {
+			lines = append(lines, "ensure networkd-dispatcher is installed and enabled for RDMA route replay")
 			for _, item := range a.Machine.RDMA {
 				lines = append(lines,
 					fmt.Sprintf("write %s with %s/%d mtu %d", filepath.Join(netplanDir, fmt.Sprintf("10-kunlun-%s.yaml", item.Name)), item.IP, item.Prefix, a.Machine.RDMAMTU),
-					fmt.Sprintf("write %s for table %d via %s route_cidr=%s priority=%d", a.routeScriptPath(item.Name), item.Table, item.Gateway, a.Machine.RouteCIDR, a.Machine.RoutePriority),
+					fmt.Sprintf("write %s for table %d via %s route_cidr=%s priority=%d", a.routeScriptPath(item.Name), item.Table, item.Gateway, effectiveRDMARouteCIDR(item, a.Machine.RouteCIDR), a.Machine.RoutePriority),
 				)
 			}
 		}
@@ -127,10 +128,12 @@ func (a *App) describeStage(stage string) ([]string, error) {
 	case "udev":
 		lines := []string{
 			"reuse confirmed NIC bindings from the network stage, or review NIC bindings when udev is run standalone",
-			fmt.Sprintf("write %s with persistent names for management and RDMA interfaces", udevFile),
+		}
+		lines = a.appendUdevManagedFileActions(lines)
+		lines = append(lines,
 			"run udevadm control --reload-rules",
 			"persistent names take effect after reboot; the network stage handles current-boot temporary renaming before applying network settings",
-		}
+		)
 		return lines, nil
 	case "software":
 		if a.usesYum() {
@@ -168,10 +171,19 @@ func (a *App) describeStage(stage string) ([]string, error) {
 		if value, err := a.unameR(); err == nil && strings.TrimSpace(value) != "" {
 			kernel = value
 		}
-		return []string{
+		lines := []string{}
+		if packages, err := a.ofedPrerequisitePackages(); err == nil && len(packages) > 0 {
+			if a.usesYum() {
+				lines = append(lines, fmt.Sprintf("ensure OFED prerequisite packages are installed: rpm -q <pkg> or yum install -y %s", strings.Join(packages, " ")))
+			} else {
+				lines = append(lines, fmt.Sprintf("ensure OFED prerequisite packages are installed: dpkg -s <pkg> or apt-get install -y %s", strings.Join(packages, " ")))
+			}
+		}
+		lines = append(lines,
 			fmt.Sprintf("extract %s into %s", a.Bundle.Artifacts.OFEDArchive, filepath.Join(a.Bundle.Artifacts.WorkDir, "ofed-<timestamp>")),
 			fmt.Sprintf("run ./mlnxofedinstall --without-fw-update --add-kernel-support -k %s --skip-distro-check --force", kernel),
-		}, nil
+		)
+		return lines, nil
 	case "xre":
 		if strings.TrimSpace(a.Bundle.Artifacts.XREInstaller) == "" {
 			return []string{"skip: xre_installer not configured"}, nil
@@ -236,7 +248,7 @@ func (a *App) describeStage(stage string) ([]string, error) {
 		}, nil
 	case "mlxconfig":
 		if !a.Bundle.RDMAExists() {
-			return []string{"skip mlxconfig: rdma_exsist=false"}, nil
+			return []string{"skip mlxconfig: rdma_mode=off"}, nil
 		}
 		if len(a.Bundle.MlxConfig.Settings) == 0 {
 			return []string{"skip: no mlxconfig settings configured"}, nil
@@ -281,11 +293,11 @@ func (a *App) describeStage(stage string) ([]string, error) {
 		}
 		if a.Bundle.RDMAExists() {
 			lines = append(lines,
-				fmt.Sprintf("write %s to set RDMA ring buffers to 8192 and enable RoCE adaptive routing at boot", postBootScript),
-				fmt.Sprintf("write and enable %s", postBootService),
+				fmt.Sprintf("write %s to disable PCIe ACSCtl, tune RDMA MaxReadReq/ring buffers, set CNP DSCP, and enable RoCE adaptive routing at boot", postBootScript),
+				fmt.Sprintf("write, enable, and restart %s", postBootService),
 			)
 		} else {
-			lines = append(lines, "skip RDMA post-boot service because rdma_exsist=false")
+			lines = append(lines, "skip RDMA post-boot service because rdma_mode=off")
 		}
 		postTasks := a.Bundle.PostTasks
 		for idx, task := range postTasks {
@@ -315,7 +327,7 @@ func (a *App) describeNetworkManagerStage() []string {
 	lines := []string{}
 	lines = append(lines, a.describeExplicitNetworkBackendServiceSwitch()...)
 	if a.Bundle.BackupExistingNetwork() {
-		lines = append(lines, "backup existing /etc/sysconfig/network-scripts/ifcfg-* route-* and rule-* files except envinit-managed files")
+		lines = append(lines, "backup existing envinit-managed ifcfg, route, and rule files that will be rewritten")
 	}
 	if !a.configureManagementNetwork() {
 		lines = append(lines, "skip management network configuration because mgmt_ip is empty or configure_management_network=false")
@@ -325,14 +337,14 @@ func (a *App) describeNetworkManagerStage() []string {
 		lines = append(lines, fmt.Sprintf("write %s and member ifcfg files with bond %s %s over %s (%s/%d via %s)", ifcfgPath(a.Machine.MgmtBondName), a.Machine.MgmtBondName, a.bondSummary(), strings.Join(a.Machine.MgmtIfaces, ","), a.Machine.MgmtIP, a.Machine.MgmtPrefix, a.Machine.MgmtGateway))
 	}
 	if !a.Bundle.RDMAExists() {
-		lines = append(lines, "skip all RDMA actions because rdma_exsist=false")
+		lines = append(lines, "skip all RDMA actions because rdma_mode=off")
 	} else if !a.Bundle.RDMAConfigureIPRoute() {
-		lines = append(lines, "skip RDMA IP, ifcfg, route, and policy-rule configuration because rdma_configure_ip_route=false")
+		lines = append(lines, "skip RDMA IP, ifcfg, route, and policy-rule configuration because rdma_mode=names_only")
 	} else {
 		for _, item := range a.Machine.RDMA {
 			lines = append(lines,
 				fmt.Sprintf("write %s with %s/%d mtu %d", ifcfgPath(item.Name), item.IP, item.Prefix, a.Machine.RDMAMTU),
-				fmt.Sprintf("write %s and %s for table %d via %s route_cidr=%s priority=%d", ifcfgRoutePath(item.Name), ifcfgRulePath(item.Name), item.Table, item.Gateway, a.Machine.RouteCIDR, a.Machine.RoutePriority),
+				fmt.Sprintf("write %s and %s for table %d via %s route_cidr=%s priority=%d", ifcfgRoutePath(item.Name), ifcfgRulePath(item.Name), item.Table, item.Gateway, effectiveRDMARouteCIDR(item, a.Machine.RouteCIDR), a.Machine.RoutePriority),
 				fmt.Sprintf("write %s for immediate policy route apply", a.routeScriptPath(item.Name)),
 			)
 		}
@@ -363,7 +375,7 @@ func (a *App) describeLegacyNetworkStage() []string {
 	lines := []string{}
 	lines = append(lines, a.describeExplicitNetworkBackendServiceSwitch()...)
 	if a.Bundle.BackupExistingNetwork() {
-		lines = append(lines, "backup existing /etc/sysconfig/network-scripts/ifcfg-* route-* and rule-* files except envinit-managed files")
+		lines = append(lines, "backup existing envinit-managed ifcfg, route, and rule files that will be rewritten")
 	}
 	if !a.configureManagementNetwork() {
 		lines = append(lines, "skip management network configuration because mgmt_ip is empty or configure_management_network=false")
@@ -373,14 +385,14 @@ func (a *App) describeLegacyNetworkStage() []string {
 		lines = append(lines, fmt.Sprintf("write %s and member ifcfg files with bond %s %s over %s (%s/%d via %s, NM_CONTROLLED=no)", ifcfgPath(a.Machine.MgmtBondName), a.Machine.MgmtBondName, a.bondSummary(), strings.Join(a.Machine.MgmtIfaces, ","), a.Machine.MgmtIP, a.Machine.MgmtPrefix, a.Machine.MgmtGateway))
 	}
 	if !a.Bundle.RDMAExists() {
-		lines = append(lines, "skip all RDMA actions because rdma_exsist=false")
+		lines = append(lines, "skip all RDMA actions because rdma_mode=off")
 	} else if !a.Bundle.RDMAConfigureIPRoute() {
-		lines = append(lines, "skip RDMA IP, ifcfg, route, and policy-rule configuration because rdma_configure_ip_route=false")
+		lines = append(lines, "skip RDMA IP, ifcfg, route, and policy-rule configuration because rdma_mode=names_only")
 	} else {
 		for _, item := range a.Machine.RDMA {
 			lines = append(lines,
 				fmt.Sprintf("write %s with %s/%d mtu %d", ifcfgPath(item.Name), item.IP, item.Prefix, a.Machine.RDMAMTU),
-				fmt.Sprintf("write %s and %s for table %d via %s route_cidr=%s priority=%d", ifcfgRoutePath(item.Name), ifcfgRulePath(item.Name), item.Table, item.Gateway, a.Machine.RouteCIDR, a.Machine.RoutePriority),
+				fmt.Sprintf("write %s and %s for table %d via %s route_cidr=%s priority=%d", ifcfgRoutePath(item.Name), ifcfgRulePath(item.Name), item.Table, item.Gateway, effectiveRDMARouteCIDR(item, a.Machine.RouteCIDR), a.Machine.RoutePriority),
 				fmt.Sprintf("write %s for immediate policy route apply", a.routeScriptPath(item.Name)),
 			)
 		}
@@ -409,11 +421,21 @@ func (a *App) appendNetworkUdevRuleActions(lines []string) []string {
 	if !a.hasPersistentNICNamingTargets() {
 		return lines
 	}
+	lines = a.appendUdevManagedFileActions(lines)
 	return append(lines,
-		fmt.Sprintf("write %s with persistent names for confirmed management and RDMA NIC bindings", udevFile),
 		"run udevadm control --reload-rules",
 		"persistent NIC names take effect after reboot",
 	)
+}
+
+func (a *App) appendUdevManagedFileActions(lines []string) []string {
+	if a.configureManagementNetwork() {
+		lines = append(lines, fmt.Sprintf("write %s with persistent names for confirmed management NIC bindings", managementUdevFile))
+	}
+	if a.Bundle.RDMAExists() && len(a.Machine.RDMA) > 0 {
+		lines = append(lines, fmt.Sprintf("write %s with persistent names for confirmed RDMA NIC bindings", rdmaUdevFile))
+	}
+	return lines
 }
 
 func (a *App) describeYumStage() ([]string, error) {
@@ -494,12 +516,10 @@ func (a *App) plannedFiles() []string {
 				}
 			}
 		}
-		if a.hasPersistentNICNamingTargets() {
-			files = append(files, udevFile)
-		}
+		files = a.appendPlannedUdevFiles(files)
 	}
 	if !networkSelected && a.stageEnabled("udev") && a.hasPersistentNICNamingTargets() {
-		files = append(files, udevFile)
+		files = a.appendPlannedUdevFiles(files)
 	}
 	if a.Stages["all"] || a.Stages["sysctl"] {
 		files = append(files, sysctlFile)
@@ -538,6 +558,16 @@ func (a *App) plannedFiles() []string {
 				}
 			}
 		}
+	}
+	return files
+}
+
+func (a *App) appendPlannedUdevFiles(files []string) []string {
+	if a.configureManagementNetwork() {
+		files = append(files, managementUdevFile)
+	}
+	if a.Bundle.RDMAExists() && len(a.Machine.RDMA) > 0 {
+		files = append(files, rdmaUdevFile)
 	}
 	return files
 }

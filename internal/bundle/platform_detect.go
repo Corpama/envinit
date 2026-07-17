@@ -21,6 +21,8 @@ func defaultPlatformDetector() platformDetector {
 }
 
 func applyDetectedPlatformDefaults(b *spec.Bundle, detector platformDetector) {
+	osFamilyUnset := strings.TrimSpace(b.Platform.OSFamily) == "" || strings.EqualFold(strings.TrimSpace(b.Platform.OSFamily), "auto")
+	packageManagerUnset := strings.TrimSpace(b.Platform.PackageManager) == "" || strings.EqualFold(strings.TrimSpace(b.Platform.PackageManager), "auto")
 	if strings.EqualFold(strings.TrimSpace(b.Platform.OSFamily), "auto") {
 		b.Platform.OSFamily = ""
 	}
@@ -28,10 +30,10 @@ func applyDetectedPlatformDefaults(b *spec.Bundle, detector platformDetector) {
 		b.Platform.PackageManager = ""
 	}
 	detected := detector.detect()
-	if strings.TrimSpace(detected.OSFamily) != "" {
+	if osFamilyUnset && strings.TrimSpace(detected.OSFamily) != "" {
 		b.Platform.OSFamily = detected.OSFamily
 	}
-	if strings.TrimSpace(detected.PackageManager) != "" {
+	if packageManagerUnset && strings.TrimSpace(detected.PackageManager) != "" {
 		b.Platform.PackageManager = detected.PackageManager
 	}
 	b.Platform.NetworkBackend = reconcileDetectedNetworkBackend(detected, b.Platform.NetworkBackend)
@@ -88,7 +90,7 @@ func detectedOSFamily(id string, idLike string) string {
 			return strings.ToLower(strings.TrimSpace(value))
 		case "rhel", "redhat":
 			return "redhat"
-		case "centos", "kylin", "rocky", "almalinux", "anolis":
+		case "kylin", "rocky", "almalinux", "anolis":
 			return strings.ToLower(strings.TrimSpace(value))
 		}
 	}
@@ -124,7 +126,7 @@ func detectedOSFamilyFromPackageManager(packageManager string) string {
 
 func detectedRedHatFamily(osFamily string) bool {
 	switch strings.ToLower(strings.TrimSpace(osFamily)) {
-	case "redhat", "rhel", "centos", "kylin", "rocky", "almalinux", "anolis":
+	case "redhat", "rhel", "kylin", "rocky", "almalinux", "anolis":
 		return true
 	default:
 		return false

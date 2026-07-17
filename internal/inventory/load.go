@@ -101,9 +101,7 @@ func parseRows(rows [][]string) ([]spec.MachineRecord, error) {
 }
 
 func rowToRecord(header map[int]string, row []string) (spec.MachineRecord, error) {
-	record := spec.MachineRecord{
-		RDMA: make([]spec.RDMARecord, 4),
-	}
+	record := spec.MachineRecord{}
 
 	for idx, raw := range row {
 		key := header[idx]
@@ -160,8 +158,11 @@ func assignRDMAField(record *spec.MachineRecord, key string, value string) bool 
 	}
 
 	n, err := strconv.Atoi(rest[:idxEnd])
-	if err != nil || n < 1 || n > len(record.RDMA) {
+	if err != nil || n < 1 {
 		return false
+	}
+	for len(record.RDMA) < n {
+		record.RDMA = append(record.RDMA, spec.RDMARecord{})
 	}
 
 	field := strings.TrimPrefix(rest[idxEnd:], "_")
@@ -179,6 +180,8 @@ func assignRDMAField(record *spec.MachineRecord, key string, value string) bool 
 		item.Name = value
 	case "table":
 		item.Table = value
+	case "route_cidr", "cidr", "network":
+		item.RouteCIDR = value
 	default:
 		return false
 	}

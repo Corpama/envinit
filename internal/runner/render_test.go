@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -45,6 +46,46 @@ func TestRenderRouteScript(t *testing.T) {
 		if !strings.Contains(content, want) {
 			t.Fatalf("expected exact cleanup rule %q in route script, got:\n%s", want, content)
 		}
+	}
+}
+
+func TestRDMARouteCIDRDerivesPerInterfaceSubnetForSplitVLANPlanning(t *testing.T) {
+	item := spec.RDMAConfig{
+		Name:    "xgbe1",
+		IP:      "172.18.12.10",
+		Prefix:  25,
+		Gateway: "172.18.12.126",
+		Table:   101,
+	}
+	if got, want := effectiveRDMARouteCIDR(item, ""), "172.18.12.0/25"; got != want {
+		t.Fatalf("unexpected effective route cidr: got=%s want=%s", got, want)
+	}
+	route := renderIfcfgRoute(item, "")
+	for _, want := range []string{
+		"default via 172.18.12.126 dev xgbe1 table 101",
+		"172.18.12.0/25 dev xgbe1 scope link table 101 src 172.18.12.10 proto static",
+	} {
+		if !strings.Contains(route, want) {
+			t.Fatalf("expected %q in route file:\n%s", want, route)
+		}
+	}
+	script := renderRouteScript(item, "auto", 32761)
+	if !strings.Contains(script, `ROUTE_CIDR="172.18.12.0/25"`) {
+		t.Fatalf("expected auto route script to use per-interface CIDR, got:\n%s", script)
+	}
+}
+
+func TestRDMARouteCIDRAllowsExplicitPerInterfaceOverride(t *testing.T) {
+	item := spec.RDMAConfig{
+		Name:      "xgbe1",
+		IP:        "172.18.12.10",
+		Prefix:    25,
+		Gateway:   "172.18.12.126",
+		Table:     101,
+		RouteCIDR: "172.18.12.0/24",
+	}
+	if got, want := effectiveRDMARouteCIDR(item, "auto"), "172.18.12.0/24"; got != want {
+		t.Fatalf("unexpected explicit route cidr: got=%s want=%s", got, want)
 	}
 }
 
@@ -174,6 +215,68 @@ func TestRenderNetworkManagerIfcfgBondAndRoutes(t *testing.T) {
 	}
 }
 
+func TestWriteIfcfgNetworkFilesUsesStaticBootprotoForIPBearingInterfaces(t *testing.T) {
+	root := t.TempDir()
+	staleBond := filepath.Join(root, strings.TrimPrefix(ifcfgPath("bond0"), "/"))
+	if err := os.MkdirAll(filepath.Dir(staleBond), 0o755); err != nil {
+		t.Fatalf("mkdir ifcfg dir: %v", err)
+	}
+	if err := os.WriteFile(staleBond, []byte("DEVICE=bond0\nBOOTPROTO=none\n"), 0o600); err != nil {
+		t.Fatalf("write stale bond ifcfg: %v", err)
+	}
+	app := &App{
+		Root: root,
+		Bundle: spec.Bundle{
+			Platform: spec.PlatformConfig{NetworkBackend: "networkmanager"},
+		},
+		Machine: spec.MachineConfig{
+			MgmtBondName:  "bond0",
+			MgmtIP:        "10.101.9.11",
+			MgmtPrefix:    24,
+			MgmtGateway:   "10.101.9.1",
+			MgmtIfaces:    []string{"ens20f0np0", "ens20f1np1"},
+			MgmtMTU:       1500,
+			BondMode:      "802.3ad",
+			BondLACPRate:  "slow",
+			BondXmitHash:  "layer3+4",
+			RDMAMTU:       9000,
+			RoutePriority: 32761,
+			RDMA: []spec.RDMAConfig{
+				{Name: "ens11np0", IP: "11.1.1.11", Prefix: 24, Gateway: "11.1.1.1", Table: 101},
+			},
+		},
+		now: func() time.Time {
+			return time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+		},
+	}
+	if err := app.writeIfcfgNetworkFiles(); err != nil {
+		t.Fatalf("write ifcfg files: %v", err)
+	}
+	for _, path := range []string{ifcfgPath("bond0"), ifcfgPath("ens11np0")} {
+		content, err := os.ReadFile(app.targetPath(path))
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(content), "BOOTPROTO=static\n") {
+			t.Fatalf("expected %s to use BOOTPROTO=static, got:\n%s", path, content)
+		}
+	}
+	slave, err := os.ReadFile(app.targetPath(ifcfgPath("ens20f0np0")))
+	if err != nil {
+		t.Fatalf("read slave ifcfg: %v", err)
+	}
+	if !strings.Contains(string(slave), "BOOTPROTO=none\n") || !strings.Contains(string(slave), "MASTER=bond0\n") {
+		t.Fatalf("expected bond slave to use BOOTPROTO=none and MASTER=bond0, got:\n%s", slave)
+	}
+	matches, err := filepath.Glob(staleBond + ".bak.*")
+	if err != nil {
+		t.Fatalf("glob stale bond backups: %v", err)
+	}
+	if len(matches) == 0 {
+		t.Fatalf("expected stale bond ifcfg to be backed up before writing new static config")
+	}
+}
+
 func TestRenderOfflineAPTEntriesUseCopiedTarget(t *testing.T) {
 	app := &App{
 		Bundle: spec.Bundle{
@@ -242,6 +345,186 @@ func TestDescribeOFEDUsesRunningKernel(t *testing.T) {
 	}
 	if !strings.Contains(got, "-k 5.15.0-test-generic") {
 		t.Fatalf("expected running kernel in OFED plan, got:\n%s", got)
+	}
+}
+
+func TestDescribeYumOFEDEnsuresElfutilsDevel(t *testing.T) {
+	binDir := t.TempDir()
+	uname := filepath.Join(binDir, "uname")
+	if err := os.WriteFile(uname, []byte("#!/bin/sh\nprintf '4.19.90-24.4.v2101.ky10.x86_64\\n'\n"), 0o755); err != nil {
+		t.Fatalf("write uname stub: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+
+	app := &App{
+		Bundle: spec.Bundle{
+			Platform: spec.PlatformConfig{PackageManager: "yum"},
+			Artifacts: spec.Artifacts{
+				WorkDir:     "/opt/kunlun",
+				OFEDArchive: "/mnt/usb/ofed.tgz",
+			},
+		},
+		Machine: spec.MachineConfig{HostID: "node01"},
+		Stages:  map[string]bool{"ofed": true},
+		Output:  ioDiscard{},
+	}
+	got, err := app.Describe()
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if !strings.Contains(got, "yum install -y elfutils-devel") {
+		t.Fatalf("expected elfutils-devel prerequisite in OFED plan, got:\n%s", got)
+	}
+}
+
+func TestDescribeUbuntuOFEDEnsuresBuildPrerequisites(t *testing.T) {
+	binDir := t.TempDir()
+	uname := filepath.Join(binDir, "uname")
+	if err := os.WriteFile(uname, []byte("#!/bin/sh\nprintf '5.15.0-100-generic\\n'\n"), 0o755); err != nil {
+		t.Fatalf("write uname stub: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+
+	app := &App{
+		Bundle: spec.Bundle{
+			Platform: spec.PlatformConfig{PackageManager: "apt"},
+			Artifacts: spec.Artifacts{
+				WorkDir:     "/opt/kunlun",
+				OFEDArchive: "/mnt/usb/ofed.tgz",
+			},
+		},
+		Machine: spec.MachineConfig{HostID: "node01"},
+		Stages:  map[string]bool{"ofed": true},
+		Output:  ioDiscard{},
+	}
+	got, err := app.Describe()
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	for _, want := range []string{
+		"apt-get install -y linux-headers-5.15.0-100-generic build-essential debhelper fakeroot",
+		"-k 5.15.0-100-generic",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in OFED plan, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestEnsureOFEDPrerequisitesInstallsMissingElfutilsDevel(t *testing.T) {
+	binDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "yum-called")
+	rpm := filepath.Join(binDir, "rpm")
+	if err := os.WriteFile(rpm, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write rpm stub: %v", err)
+	}
+	yum := filepath.Join(binDir, "yum")
+	yumScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + marker + "\n"
+	if err := os.WriteFile(yum, []byte(yumScript), 0o755); err != nil {
+		t.Fatalf("write yum stub: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+
+	app := &App{
+		Bundle: spec.Bundle{
+			Platform: spec.PlatformConfig{PackageManager: "yum"},
+		},
+		Output: ioDiscard{},
+	}
+	if err := app.ensureOFEDPrerequisites(); err != nil {
+		t.Fatalf("ensure OFED prerequisites: %v", err)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read yum marker: %v", err)
+	}
+	if got, want := strings.TrimSpace(string(data)), "install -y elfutils-devel"; got != want {
+		t.Fatalf("unexpected yum args: got %q want %q", got, want)
+	}
+}
+
+func TestEnsureOFEDPrerequisitesInstallsMissingUbuntuBuildPackages(t *testing.T) {
+	binDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "apt-called")
+	uname := filepath.Join(binDir, "uname")
+	if err := os.WriteFile(uname, []byte("#!/bin/sh\nprintf '5.15.0-100-generic\\n'\n"), 0o755); err != nil {
+		t.Fatalf("write uname stub: %v", err)
+	}
+	dpkg := filepath.Join(binDir, "dpkg")
+	if err := os.WriteFile(dpkg, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write dpkg stub: %v", err)
+	}
+	apt := filepath.Join(binDir, "apt-get")
+	aptScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + marker + "\n"
+	if err := os.WriteFile(apt, []byte(aptScript), 0o755); err != nil {
+		t.Fatalf("write apt-get stub: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+
+	app := &App{
+		Bundle: spec.Bundle{
+			Platform: spec.PlatformConfig{PackageManager: "apt"},
+		},
+		Output: ioDiscard{},
+	}
+	if err := app.ensureOFEDPrerequisites(); err != nil {
+		t.Fatalf("ensure OFED prerequisites: %v", err)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read apt marker: %v", err)
+	}
+	want := "install -y linux-headers-5.15.0-100-generic build-essential debhelper fakeroot"
+	if got := strings.TrimSpace(string(data)); got != want {
+		t.Fatalf("unexpected apt-get args: got %q want %q", got, want)
+	}
+}
+
+func TestEnsureNetplanRouteDispatcherInstallsMissingPackage(t *testing.T) {
+	binDir := t.TempDir()
+	markerDir := t.TempDir()
+	aptMarker := filepath.Join(markerDir, "apt-called")
+	systemctlMarker := filepath.Join(markerDir, "systemctl-called")
+
+	if err := os.WriteFile(filepath.Join(binDir, "dpkg"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write dpkg stub: %v", err)
+	}
+	aptScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + aptMarker + "\n"
+	if err := os.WriteFile(filepath.Join(binDir, "apt-get"), []byte(aptScript), 0o755); err != nil {
+		t.Fatalf("write apt-get stub: %v", err)
+	}
+	systemctlScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + systemctlMarker + "\n"
+	if err := os.WriteFile(filepath.Join(binDir, "systemctl"), []byte(systemctlScript), 0o755); err != nil {
+		t.Fatalf("write systemctl stub: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+
+	app := &App{
+		Bundle: spec.Bundle{
+			Defaults: spec.Defaults{RDMAMode: spec.RDMAModeFull},
+		},
+		Machine: spec.MachineConfig{
+			RDMA: []spec.RDMAConfig{{Name: "ens11np0", IP: "11.1.1.11"}},
+		},
+		Output: ioDiscard{},
+	}
+	if err := app.ensureNetplanRouteDispatcher(); err != nil {
+		t.Fatalf("ensure netplan route dispatcher: %v", err)
+	}
+
+	aptData, err := os.ReadFile(aptMarker)
+	if err != nil {
+		t.Fatalf("read apt marker: %v", err)
+	}
+	if got, want := strings.TrimSpace(string(aptData)), "update\ninstall -y networkd-dispatcher"; got != want {
+		t.Fatalf("unexpected apt-get calls: got %q want %q", got, want)
+	}
+	systemctlData, err := os.ReadFile(systemctlMarker)
+	if err != nil {
+		t.Fatalf("read systemctl marker: %v", err)
+	}
+	if got, want := strings.TrimSpace(string(systemctlData)), "enable --now networkd-dispatcher"; got != want {
+		t.Fatalf("unexpected systemctl args: got %q want %q", got, want)
 	}
 }
 
@@ -1092,7 +1375,8 @@ func TestPlannedFilesRespectSelectedStages(t *testing.T) {
 		"/etc/networkd-dispatcher/routable.d/config_rt_enp10s0.sh",
 		"/etc/netplan/10-kunlun-enp11s0.yaml",
 		"/etc/networkd-dispatcher/routable.d/config_rt_enp11s0.sh",
-		"/etc/udev/rules.d/70-persistent-net.rules",
+		managementUdevFile,
+		rdmaUdevFile,
 		"/etc/sysctl.conf",
 		"/etc/default/grub",
 	}
@@ -1102,10 +1386,9 @@ func TestPlannedFilesRespectSelectedStages(t *testing.T) {
 }
 
 func TestPlannedFilesSkipRDMANetworkFilesWhenRouteConfigDisabled(t *testing.T) {
-	disabled := false
 	bundle := spec.Bundle{
 		Defaults: spec.Defaults{
-			RDMAConfigureIPRoute: &disabled,
+			RDMAMode: spec.RDMAModeNamesOnly,
 		},
 	}
 	bundle.ApplyDefaults()
@@ -1125,7 +1408,8 @@ func TestPlannedFilesSkipRDMANetworkFilesWhenRouteConfigDisabled(t *testing.T) {
 	got := app.plannedFiles()
 	want := []string{
 		"/etc/netplan/00-kunlun-bond.yaml",
-		"/etc/udev/rules.d/70-persistent-net.rules",
+		managementUdevFile,
+		rdmaUdevFile,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected planned files: got=%v want=%v", got, want)
@@ -1133,10 +1417,9 @@ func TestPlannedFilesSkipRDMANetworkFilesWhenRouteConfigDisabled(t *testing.T) {
 }
 
 func TestDescribeSkipsRDMAActionsWhenRDMAIsDisabled(t *testing.T) {
-	disabled := false
 	bundle := spec.Bundle{
 		Defaults: spec.Defaults{
-			RDMAExsist: &disabled,
+			RDMAMode: spec.RDMAModeOff,
 		},
 	}
 	bundle.ApplyDefaults()
@@ -1160,9 +1443,9 @@ func TestDescribeSkipsRDMAActionsWhenRDMAIsDisabled(t *testing.T) {
 		t.Fatalf("describe: %v", err)
 	}
 	for _, want := range []string{
-		"skip all RDMA actions because rdma_exsist=false",
-		"skip mlxconfig: rdma_exsist=false",
-		"skip RDMA post-boot service because rdma_exsist=false",
+		"skip all RDMA actions because rdma_mode=off",
+		"skip mlxconfig: rdma_mode=off",
+		"skip RDMA post-boot service because rdma_mode=off",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expected %q in describe output, got:\n%s", want, got)
@@ -1249,7 +1532,7 @@ func TestDescribeYumAndNetworkManagerActions(t *testing.T) {
 
 	bundle := spec.Bundle{
 		Platform: spec.PlatformConfig{
-			OSFamily:       "centos",
+			OSFamily:       "kylin",
 			PackageManager: "yum",
 			NetworkBackend: "networkmanager",
 		},
@@ -1472,6 +1755,7 @@ func TestDescribeNetworkHonorsManagementAndImmediateApplySwitches(t *testing.T) 
 	}
 	for _, want := range []string{
 		"skip management network configuration because mgmt_ip is empty or configure_management_network=false",
+		"ensure networkd-dispatcher is installed and enabled for RDMA route replay",
 		"write /etc/netplan/10-kunlun-enp10s0.yaml",
 		"skip immediate netplan apply because apply_network_immediately=false",
 	} {
@@ -1541,7 +1825,7 @@ func TestNetworkBeforeUdevRenamesAndAppliesBeforePersistentRules(t *testing.T) {
 		DryRun: true,
 		Bundle: spec.Bundle{
 			Defaults: spec.Defaults{
-				RDMAExsist: boolPtr(true),
+				RDMAMode: spec.RDMAModeFull,
 			},
 		},
 		Machine: spec.MachineConfig{
@@ -1602,7 +1886,7 @@ func TestNetworkStagePersistsUdevWhenPlannedInterfacesAreMissing(t *testing.T) {
 		DryRun: true,
 		Bundle: spec.Bundle{
 			Defaults: spec.Defaults{
-				RDMAExsist: boolPtr(false),
+				RDMAMode: spec.RDMAModeOff,
 			},
 		},
 		Machine: spec.MachineConfig{
@@ -1623,7 +1907,7 @@ func TestNetworkStagePersistsUdevWhenPlannedInterfacesAreMissing(t *testing.T) {
 	if got, want := app.selectedStages(), []string{"network"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected selected stages: got=%v want=%v", got, want)
 	}
-	if got := strings.Join(app.plannedFiles(), "\n"); !strings.Contains(got, udevFile) {
+	if got := strings.Join(app.plannedFiles(), "\n"); !strings.Contains(got, managementUdevFile) {
 		t.Fatalf("expected planned files to include network-owned udev file, got:\n%s", got)
 	}
 
@@ -1649,6 +1933,42 @@ func TestNetworkStagePersistsUdevWhenPlannedInterfacesAreMissing(t *testing.T) {
 	}
 }
 
+func TestPrepareNetworkApplyDefersManagementRenameWhenImmediateApplyDisabled(t *testing.T) {
+	disabled := false
+	var output strings.Builder
+	app := &App{
+		Root:   t.TempDir(),
+		DryRun: true,
+		Bundle: spec.Bundle{Defaults: spec.Defaults{
+			ApplyNetworkImmediately: &disabled,
+			RDMAMode:                spec.RDMAModeFull,
+		}},
+		Machine: spec.MachineConfig{
+			MgmtIfaces: []string{"mgmt-target"},
+			RDMA:       []spec.RDMAConfig{{Name: "rdma-target"}},
+		},
+		confirmedInterfaceBindings: []interfaceBinding{
+			{Kind: "mgmt", Name: "mgmt-target", CurrentName: "mgmt-current", MAC: "aa:bb:cc:dd:ee:01"},
+			{Kind: "rdma", Name: "rdma-target", CurrentName: "rdma-current", MAC: "aa:bb:cc:dd:ee:02"},
+		},
+		interfaceBindingsConfirmed: true,
+		Output:                     &output,
+	}
+	if _, err := app.prepareNetworkApply(); err != nil {
+		t.Fatalf("prepare network apply: %v", err)
+	}
+	got := output.String()
+	if !strings.Contains(got, "defer management interface rename mgmt-current -> mgmt-target until reboot") {
+		t.Fatalf("expected management rename deferral, got:\n%s", got)
+	}
+	if strings.Contains(got, "ip link set dev mgmt-current") {
+		t.Fatalf("did not expect live management interface rename, got:\n%s", got)
+	}
+	if !strings.Contains(got, "ip link set dev rdma-current") {
+		t.Fatalf("expected RDMA interface to be renamed for later stages, got:\n%s", got)
+	}
+}
+
 func TestRunPostStageSkipsWhenConfirmationDenied(t *testing.T) {
 	confirm := true
 	var output strings.Builder
@@ -1667,6 +1987,32 @@ func TestRunPostStageSkipsWhenConfirmationDenied(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "power soft") {
 		t.Fatalf("expected confirmation log, got: %s", output.String())
+	}
+}
+
+func TestRunPostStageRestartsPostBootService(t *testing.T) {
+	var output strings.Builder
+	app := &App{
+		DryRun: true,
+		Bundle: spec.Bundle{
+			Defaults: spec.Defaults{RDMAMode: spec.RDMAModeFull},
+		},
+		Machine: spec.MachineConfig{
+			RDMA: []spec.RDMAConfig{{Name: "ens11np0"}},
+		},
+		Output: &output,
+	}
+	if err := app.runPostStage(); err != nil {
+		t.Fatalf("run post stage: %v", err)
+	}
+	got := output.String()
+	for _, want := range []string{
+		"run: systemctl enable kunlun-post-boot.service",
+		"run: systemctl restart kunlun-post-boot.service",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in post stage output:\n%s", want, got)
+		}
 	}
 }
 
@@ -1863,15 +2209,148 @@ func TestRenderPostBootScriptUsesPlannedRDMAInterfaces(t *testing.T) {
 		},
 	}, "# custom hook\n")
 	for _, want := range []string{
+		`CNP_DSCP="48"`,
 		`"ens11np0"`,
 		`"ens13np0"`,
+		`setpci -s "$pdev" ECAP_ACS+06.w=0000`,
+		`current_mrr=$(setpci -s "$bus_info" CAP_EXP+8.w 2>/dev/null || true)`,
+		`setpci -s "$bus_info" CAP_EXP+8.w="$desired_mrr"`,
 		`if ! ethtool -G "$iface" rx 8192 tx 8192; then`,
 		`if ! bus_info=$(ethtool -i "$iface" 2>/dev/null | awk -F': ' '$1 == "bus-info" {print $2; exit}'); then`,
 		`if ! mlxreg -d "$bus_info" --reg_name ROCE_ACCL --set adaptive_routing_forced_en=0x1 --yes; then`,
+		`echo "$CNP_DSCP" > "/sys/class/net/$iface/ecn/roce_np/cnp_dscp"`,
 		"# custom hook",
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("expected %q in post boot script, got:\n%s", want, content)
+		}
+	}
+}
+
+func TestDisableExistingNetworkFilesBacksUpOnlyEnabledNetworkTargets(t *testing.T) {
+	root := t.TempDir()
+	mgmtIfcfg := filepath.Join(root, strings.TrimPrefix(ifcfgPath("bond0"), "/"))
+	inbandNetplan := filepath.Join(root, strings.TrimPrefix(filepath.Join(netplanDir, "01-inband.yaml"), "/"))
+	rdmaIfcfg := filepath.Join(root, strings.TrimPrefix(ifcfgPath("xgbe1"), "/"))
+	rdmaRoute := filepath.Join(root, strings.TrimPrefix(ifcfgRoutePath("xgbe1"), "/"))
+	rdmaRule := filepath.Join(root, strings.TrimPrefix(ifcfgRulePath("xgbe1"), "/"))
+	rdmaNetplan := filepath.Join(root, strings.TrimPrefix(filepath.Join(netplanDir, "10-kunlun-xgbe1.yaml"), "/"))
+	for _, path := range []string{mgmtIfcfg, inbandNetplan, rdmaIfcfg, rdmaRoute, rdmaRule, rdmaNetplan} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte("existing\n"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	disabled := false
+	app := &App{
+		Root: root,
+		Bundle: spec.Bundle{
+			Defaults: spec.Defaults{
+				ConfigureManagementNetwork: &disabled,
+				RDMAMode:                   spec.RDMAModeFull,
+			},
+		},
+		Machine: spec.MachineConfig{
+			MgmtBondName: "bond0",
+			RDMA:         []spec.RDMAConfig{{Name: "xgbe1"}},
+		},
+		Output: ioDiscard{},
+	}
+	if err := app.disableExistingIfcfg(); err != nil {
+		t.Fatalf("disable ifcfg: %v", err)
+	}
+	if err := app.disableExistingNetplan(); err != nil {
+		t.Fatalf("disable netplan: %v", err)
+	}
+	for _, path := range []string{mgmtIfcfg, inbandNetplan} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected in-band config to remain at %s: %v", path, err)
+		}
+		matches, err := filepath.Glob(path + ".bak.*")
+		if err != nil {
+			t.Fatalf("glob backup: %v", err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("did not expect backup for management-disabled config %s: %v", path, matches)
+		}
+	}
+	for _, path := range []string{rdmaIfcfg, rdmaRoute, rdmaRule, rdmaNetplan} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("expected RDMA target config to be moved before rewrite at %s, stat err=%v", path, err)
+		}
+		matches, err := filepath.Glob(path + ".bak.*")
+		if err != nil {
+			t.Fatalf("glob RDMA backup: %v", err)
+		}
+		if len(matches) != 1 {
+			t.Fatalf("expected one RDMA target backup for %s, got %v", path, matches)
+		}
+	}
+}
+
+func TestDisableExistingNetworkFilesBacksUpOnlyManagementTargetsWhenRDMAIPDisabled(t *testing.T) {
+	root := t.TempDir()
+	mgmtIfcfg := filepath.Join(root, strings.TrimPrefix(ifcfgPath("bond0"), "/"))
+	mgmtNetplan := filepath.Join(root, strings.TrimPrefix(filepath.Join(netplanDir, "00-kunlun-bond.yaml"), "/"))
+	rdmaIfcfg := filepath.Join(root, strings.TrimPrefix(ifcfgPath("xgbe1"), "/"))
+	rdmaRoute := filepath.Join(root, strings.TrimPrefix(ifcfgRoutePath("xgbe1"), "/"))
+	rdmaRule := filepath.Join(root, strings.TrimPrefix(ifcfgRulePath("xgbe1"), "/"))
+	rdmaNetplan := filepath.Join(root, strings.TrimPrefix(filepath.Join(netplanDir, "10-kunlun-xgbe1.yaml"), "/"))
+	for _, path := range []string{mgmtIfcfg, mgmtNetplan, rdmaIfcfg, rdmaRoute, rdmaRule, rdmaNetplan} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte("existing\n"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	app := &App{
+		Root: root,
+		Bundle: spec.Bundle{
+			Defaults: spec.Defaults{
+				RDMAMode: spec.RDMAModeNamesOnly,
+			},
+		},
+		Machine: spec.MachineConfig{
+			MgmtBondName: "bond0",
+			MgmtIfaces:   []string{"ens20f0np0", "ens20f1np1"},
+			MgmtIP:       "10.101.9.11",
+			RDMA:         []spec.RDMAConfig{{Name: "xgbe1"}},
+		},
+		Output: ioDiscard{},
+	}
+	if err := app.disableExistingIfcfg(); err != nil {
+		t.Fatalf("disable ifcfg: %v", err)
+	}
+	if err := app.disableExistingNetplan(); err != nil {
+		t.Fatalf("disable netplan: %v", err)
+	}
+	for _, path := range []string{mgmtIfcfg, mgmtNetplan} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("expected management target config to be moved before rewrite at %s, stat err=%v", path, err)
+		}
+		matches, err := filepath.Glob(path + ".bak.*")
+		if err != nil {
+			t.Fatalf("glob management backup: %v", err)
+		}
+		if len(matches) != 1 {
+			t.Fatalf("expected one management target backup for %s, got %v", path, matches)
+		}
+	}
+	for _, path := range []string{rdmaIfcfg, rdmaRoute, rdmaRule, rdmaNetplan} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected RDMA IP config to remain at %s: %v", path, err)
+		}
+		matches, err := filepath.Glob(path + ".bak.*")
+		if err != nil {
+			t.Fatalf("glob RDMA backup: %v", err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("did not expect RDMA IP backup when rdma_mode=names_only for %s: %v", path, matches)
 		}
 	}
 }
@@ -1902,7 +2381,7 @@ func TestUdevStageDiscoversRDMAByPCIOrderAndRenamesTemporarily(t *testing.T) {
 		DryRun: true,
 		Bundle: spec.Bundle{
 			Defaults: spec.Defaults{
-				RDMAExsist: boolPtr(true),
+				RDMAMode: spec.RDMAModeFull,
 			},
 		},
 		Machine: spec.MachineConfig{
@@ -1954,7 +2433,7 @@ func TestUdevStageDiscoversManagementByPCIOrderAndRenamesTemporarily(t *testing.
 		DryRun: true,
 		Bundle: spec.Bundle{
 			Defaults: spec.Defaults{
-				RDMAExsist: boolPtr(true),
+				RDMAMode: spec.RDMAModeFull,
 			},
 		},
 		Machine: spec.MachineConfig{
@@ -2077,6 +2556,74 @@ func TestManualNICReviewFailsBeforeWritingWhenNoSelectableNICs(t *testing.T) {
 	}
 }
 
+func TestPersistSelectedRDMAInterfacesWritesConfirmedBindings(t *testing.T) {
+	root := t.TempDir()
+	app := &App{
+		Root: root,
+		Bundle: spec.Bundle{
+			Defaults: spec.Defaults{RDMAMode: spec.RDMAModeFull},
+		},
+		Output: ioDiscard{},
+	}
+	bindings := []interfaceBinding{
+		{Kind: "mgmt", Name: "bond0", CurrentName: "eno1", MAC: "aa:bb:cc:dd:ee:01"},
+		{Kind: "rdma", Name: "ens100np0", CurrentName: "enp40s0", MAC: "aa:bb:cc:dd:ee:10"},
+		{Kind: "rdma", Name: "ens108np0", CurrentName: "enp41s0", MAC: "aa:bb:cc:dd:ee:11"},
+	}
+	if err := app.persistSelectedRDMAInterfaces(bindings); err != nil {
+		t.Fatalf("persist selected rdma interfaces: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, strings.TrimPrefix(rdmaSelectedFile, "/")))
+	if err != nil {
+		t.Fatalf("read selected rdma interfaces: %v", err)
+	}
+	content := string(data)
+	for _, want := range []string{
+		"ens100np0 enp40s0 aa:bb:cc:dd:ee:10",
+		"ens108np0 enp41s0 aa:bb:cc:dd:ee:11",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("expected %q in selected interfaces file, got:\n%s", want, content)
+		}
+	}
+	if strings.Contains(content, "bond0") {
+		t.Fatalf("management binding leaked into selected RDMA file:\n%s", content)
+	}
+	legacyPath := filepath.Join(root, strings.TrimPrefix(legacyRDMASelectedFile, "/"))
+	linkTarget, err := os.Readlink(legacyPath)
+	if err != nil {
+		t.Fatalf("read legacy selected RDMA compatibility link: %v", err)
+	}
+	if filepath.Clean(filepath.Join(filepath.Dir(legacyPath), linkTarget)) != filepath.Join(root, strings.TrimPrefix(rdmaSelectedFile, "/")) {
+		t.Fatalf("legacy selected RDMA link points to %q", linkTarget)
+	}
+}
+
+func TestSysctlStageConfirmsNICBindingsWhenRunStandalone(t *testing.T) {
+	root := t.TempDir()
+	mustWriteNetDeviceWithSpeed(t, root, "rdma400", "aa:bb:cc:dd:ee:40", "0000:40:00.0", "mlx5_core", 0, "p0", 400000)
+	app := &App{
+		Root:   root,
+		DryRun: true,
+		Bundle: spec.Bundle{
+			Defaults: spec.Defaults{RDMAMode: spec.RDMAModeFull},
+		},
+		Machine: spec.MachineConfig{
+			RDMA: []spec.RDMAConfig{{Name: "ens100np0", IP: "11.1.1.11", Prefix: 24}},
+		},
+		Output: ioDiscard{},
+	}
+	if err := app.runSysctlStage(); err != nil {
+		t.Fatalf("run sysctl stage: %v", err)
+	}
+	if !app.interfaceBindingsConfirmed {
+		t.Fatal("expected sysctl stage to confirm NIC bindings")
+	}
+	if app.Machine.RDMA[0].MAC != "aa:bb:cc:dd:ee:40" {
+		t.Fatalf("expected confirmed RDMA MAC to be synced, got %#v", app.Machine.RDMA)
+	}
+}
+
 func TestManualMgmtReviewDoesNotLogRDMATwice(t *testing.T) {
 	root := t.TempDir()
 	mustWriteNetDevice(t, root, "eno-a", "aa:bb:cc:dd:ee:11", "0000:20:00.0", "ixgbe", 0, "p0")
@@ -2087,7 +2634,7 @@ func TestManualMgmtReviewDoesNotLogRDMATwice(t *testing.T) {
 	app := &App{
 		Root: root,
 		Bundle: spec.Bundle{
-			Defaults: spec.Defaults{RDMAExsist: boolPtr(true)},
+			Defaults: spec.Defaults{RDMAMode: spec.RDMAModeFull},
 		},
 		Machine: spec.MachineConfig{
 			MgmtIfaces: []string{"ens20f0np0", "ens20f1np1"},
@@ -2132,9 +2679,61 @@ func TestUdevStageRejectsIncompleteManualBindings(t *testing.T) {
 			t.Fatalf("expected %q in error, got %v", want, err)
 		}
 	}
-	if strings.Contains(output.String(), "write /etc/udev/rules.d/70-persistent-net.rules") {
+	if strings.Contains(output.String(), "write "+managementUdevFile) || strings.Contains(output.String(), "write "+rdmaUdevFile) {
 		t.Fatalf("did not expect udev rules to be written with incomplete bindings, got:\n%s", output.String())
 	}
+}
+
+func TestPersistUdevRulesDoesNotTouchManagementRulesWhenManagementDisabled(t *testing.T) {
+	root := t.TempDir()
+	managementPath := resolveTargetPath(root, managementUdevFile)
+	if err := os.MkdirAll(filepath.Dir(managementPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const existingManagement = "# existing management naming must remain unchanged\n"
+	if err := os.WriteFile(managementPath, []byte(existingManagement), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "udevadm"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	configureManagement := false
+	app := &App{
+		Root: root,
+		Bundle: spec.Bundle{Defaults: spec.Defaults{
+			ConfigureManagementNetwork: &configureManagement,
+			RDMAMode:                   spec.RDMAModeFull,
+		}},
+		Machine: spec.MachineConfig{RDMA: []spec.RDMAConfig{{Name: "ens11np0"}}},
+		confirmedInterfaceBindings: []interfaceBinding{{
+			Kind:        "rdma",
+			Name:        "ens11np0",
+			CurrentName: "rdma0",
+			MAC:         "aa:bb:cc:dd:ee:11",
+		}},
+		interfaceBindingsConfirmed: true,
+		Output:                     ioDiscard{},
+	}
+	if err := app.persistUdevRules(); err != nil {
+		t.Fatalf("persist RDMA udev rules: %v", err)
+	}
+	got, err := os.ReadFile(managementPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != existingManagement {
+		t.Fatalf("management udev rules changed: %q", got)
+	}
+	assertFileContainsAll(t, root, rdmaUdevFile, []string{
+		`ATTR{address}=="aa:bb:cc:dd:ee:11"`,
+		`NAME="ens11np0"`,
+	})
 }
 
 func TestRDMADiscoveryFallsBackToManualReviewWithoutAutomaticChoices(t *testing.T) {
@@ -2144,7 +2743,7 @@ func TestRDMADiscoveryFallsBackToManualReviewWithoutAutomaticChoices(t *testing.
 	app := &App{
 		Root: root,
 		Bundle: spec.Bundle{
-			Defaults: spec.Defaults{RDMAExsist: boolPtr(true)},
+			Defaults: spec.Defaults{RDMAMode: spec.RDMAModeFull},
 		},
 		Machine: spec.MachineConfig{
 			RDMA: []spec.RDMAConfig{
@@ -2205,7 +2804,7 @@ func TestRDMADiscoveryFallsBackToExactModelGroupWhenSpeedAmbiguous(t *testing.T)
 	app := &App{
 		Root: root,
 		Bundle: spec.Bundle{
-			Defaults: spec.Defaults{RDMAExsist: boolPtr(true)},
+			Defaults: spec.Defaults{RDMAMode: spec.RDMAModeFull},
 		},
 		Machine: spec.MachineConfig{
 			MgmtMACs: []string{"aa:bb:cc:dd:aa:01", "aa:bb:cc:dd:aa:02"},
@@ -2282,7 +2881,7 @@ func TestRDMADiscoveryPrefersLinkedHighSpeedGroup(t *testing.T) {
 	app := &App{
 		Root: root,
 		Bundle: spec.Bundle{
-			Defaults: spec.Defaults{RDMAExsist: boolPtr(true)},
+			Defaults: spec.Defaults{RDMAMode: spec.RDMAModeFull},
 		},
 		Machine: spec.MachineConfig{
 			RDMA: []spec.RDMAConfig{{Name: "ens11np0"}},
@@ -2294,6 +2893,31 @@ func TestRDMADiscoveryPrefersLinkedHighSpeedGroup(t *testing.T) {
 	}
 	if len(devices) != 1 || devices[0].Name != "rdma400" {
 		t.Fatalf("expected linked 400G RDMA group, got %#v", devices)
+	}
+}
+
+func TestRDMADiscoveryOrdersSelectedDevicesByPCIRegardlessOfLinkState(t *testing.T) {
+	root := t.TempDir()
+	mustWriteNetDeviceWithSpeed(t, root, "rdma-later-up", "aa:bb:cc:dd:ee:40", "0000:40:00.0", "mlx5_core", 0, "p0", 400000)
+	mustWriteNetDeviceWithSpeed(t, root, "rdma-earlier-down", "aa:bb:cc:dd:ee:20", "0000:20:00.0", "mlx5_core", 0, "p0", 400000)
+	mustWriteLinkState(t, root, "rdma-later-up", "1", "up")
+	mustWriteLinkState(t, root, "rdma-earlier-down", "0", "down")
+
+	app := &App{
+		Root: root,
+		Bundle: spec.Bundle{
+			Defaults: spec.Defaults{RDMAMode: spec.RDMAModeFull},
+		},
+		Machine: spec.MachineConfig{
+			RDMA: []spec.RDMAConfig{{Name: "rdma1"}, {Name: "rdma2"}},
+		},
+	}
+	devices, err := app.discoverRDMADevices()
+	if err != nil {
+		t.Fatalf("discover rdma devices: %v", err)
+	}
+	if got := netDeviceNames(devices); !reflect.DeepEqual(got, []string{"rdma-earlier-down", "rdma-later-up"}) {
+		t.Fatalf("expected stable PCI order after candidate selection, got %v", got)
 	}
 }
 
@@ -2545,7 +3169,7 @@ func TestDescribeIncludesMstStartForMlxConfig(t *testing.T) {
 		Bundle: spec.Bundle{
 			MlxConfig: spec.MlxConfig{
 				Settings: map[string]string{
-					"CNP_DSCP_P1": "48",
+					"LINK_TYPE_P1": "2",
 				},
 			},
 		},
@@ -2572,13 +3196,13 @@ func TestDescribeIncludesMstStartForMlxConfig(t *testing.T) {
 	}
 }
 
-func TestMlxconfigDevicesFromGlobFiltersSubfunctions(t *testing.T) {
+func TestMlxconfigDevicesFromGlobKeepsFunctionDevices(t *testing.T) {
 	root := t.TempDir()
 	mstDir := filepath.Join(root, "dev", "mst")
 	if err := os.MkdirAll(mstDir, 0o755); err != nil {
 		t.Fatalf("mkdir mst dir: %v", err)
 	}
-	for _, name := range []string{"mt4129_pciconf0", "mt4129_pciconf0.1", "mt4129_pciconf1", "not-pciconf"} {
+	for _, name := range []string{"mt4129_pciconf0", "mt4129_pciconf0.1", "mt4129_pciconf1", "mt4129_pciconf_0000:41:00.1", "not-pciconf"} {
 		if err := os.WriteFile(filepath.Join(mstDir, name), []byte{}, 0o644); err != nil {
 			t.Fatalf("write mst device %s: %v", name, err)
 		}
@@ -2590,10 +3214,159 @@ func TestMlxconfigDevicesFromGlobFiltersSubfunctions(t *testing.T) {
 	}
 	want := []string{
 		filepath.Join(root, "dev", "mst", "mt4129_pciconf0"),
+		filepath.Join(root, "dev", "mst", "mt4129_pciconf0.1"),
 		filepath.Join(root, "dev", "mst", "mt4129_pciconf1"),
+		filepath.Join(root, "dev", "mst", "mt4129_pciconf_0000:41:00.1"),
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected devices: got=%v want=%v", got, want)
+	}
+}
+
+func TestMlxconfigDevicesPreferRDMAMatchedMSTDevices(t *testing.T) {
+	root := t.TempDir()
+	mstDir := filepath.Join(root, "dev", "mst")
+	if err := os.MkdirAll(mstDir, 0o755); err != nil {
+		t.Fatalf("mkdir mst dir: %v", err)
+	}
+	for _, name := range []string{
+		"mt4129_pciconf_0000:41:00.0",
+		"mt4129_pciconf_0000:42:00.0",
+		"mt4129_pciconf_0000:50:00.0",
+	} {
+		if err := os.WriteFile(filepath.Join(mstDir, name), []byte{}, 0o644); err != nil {
+			t.Fatalf("write mst device %s: %v", name, err)
+		}
+	}
+	mustWriteNetDevice(t, root, "ens11np0", "aa:bb:cc:dd:ee:11", "0000:41:00.0", "mlx5_core", 0, "p0")
+	mustWriteNetDevice(t, root, "ens13np0", "aa:bb:cc:dd:ee:13", "0000:42:00.0", "mlx5_core", 0, "p0")
+
+	var output strings.Builder
+	app := &App{
+		Root:   root,
+		DryRun: true,
+		Bundle: spec.Bundle{
+			Defaults: spec.Defaults{RDMAMode: spec.RDMAModeFull},
+			MlxConfig: spec.MlxConfig{
+				Settings: map[string]string{"LINK_TYPE_P1": "2"},
+			},
+		},
+		Machine: spec.MachineConfig{
+			RDMA: []spec.RDMAConfig{
+				{Name: "ens11np0"},
+				{Name: "ens13np0"},
+			},
+		},
+		Output: &output,
+	}
+	got, err := app.mlxconfigDevices()
+	if err != nil {
+		t.Fatalf("mlxconfig devices: %v", err)
+	}
+	want := []string{
+		"/dev/mst/mt4129_pciconf_0000:41:00.0",
+		"/dev/mst/mt4129_pciconf_0000:42:00.0",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected RDMA-matched MST devices: got=%v want=%v", got, want)
+	}
+	if strings.Contains(strings.Join(got, "\n"), "50:00.0") {
+		t.Fatalf("did not expect unrelated MST device in selection: %v", got)
+	}
+	if !strings.Contains(output.String(), "default selection") {
+		t.Fatalf("expected dry-run default selection log, got:\n%s", output.String())
+	}
+}
+
+func TestMSTStatusNetMappingsPreferConfirmedRDMANames(t *testing.T) {
+	status := `
+DEVICE_TYPE             MST                         PCI       RDMA         NET              NUMA
+ConnectX7(rev:0)        /dev/mst/mt4129_pciconf3.1  a6:00.1   mlx5_7       net-ens17f1np1   4
+ConnectX7(rev:0)        /dev/mst/mt4129_pciconf3    a6:00.0   mlx5_6       net-ens17f0np0   4
+ConnectX7(rev:0)        /dev/mst/mt4129_pciconf2.1  86:00.1   mlx5_5       net-ens15f1np1   7
+ConnectX7(rev:0)        /dev/mst/mt4129_pciconf2    86:00.0   mlx5_4       net-ens15f0np0   7
+ConnectX7(rev:0)        /dev/mst/mt4129_pciconf1.1  66:00.1   mlx5_3       net-ens13f1np1   2
+ConnectX7(rev:0)        /dev/mst/mt4129_pciconf1    66:00.0   mlx5_2       net-ens13f0np0   2
+ConnectX7(rev:0)        /dev/mst/mt4129_pciconf0.1  06:00.1   mlx5_1       net-ens11f1np1   3
+ConnectX7(rev:0)        /dev/mst/mt4129_pciconf0    06:00.0   mlx5_0       net-ens11f0np0   3
+ConnectX6DX(rev:0)      /dev/mst/mt4125_pciconf0.1  41:00.1   mlx5_bond_0  net-bond0        1
+ConnectX6DX(rev:0)      /dev/mst/mt4125_pciconf0    41:00.0   mlx5_bond_0  net-bond0        1
+`
+	parsed := parseMSTStatusDevices(status)
+	if got := parsed["mt4129_pciconf3.1"]; got.PCI != "0000:a6:00.1" || got.Net != "ens17f1np1" {
+		t.Fatalf("unexpected parsed status for mt4129_pciconf3.1: %#v", got)
+	}
+	if got := parsed["mt4125_pciconf0"]; got.PCI != "0000:41:00.0" || got.Net != "bond0" {
+		t.Fatalf("unexpected parsed status for mt4125_pciconf0: %#v", got)
+	}
+
+	app := &App{
+		Machine: spec.MachineConfig{
+			RDMA: []spec.RDMAConfig{
+				{Name: "ens11f0np0"},
+				{Name: "ens11f1np1"},
+				{Name: "ens13f0np0"},
+				{Name: "ens13f1np1"},
+				{Name: "ens15f0np0"},
+				{Name: "ens15f1np1"},
+				{Name: "ens17f0np0"},
+				{Name: "ens17f1np1"},
+			},
+		},
+	}
+	candidates := make([]mstDevice, 0, len(parsed))
+	for name, item := range parsed {
+		candidates = append(candidates, mstDevice{
+			Path: "/dev/mst/" + name,
+			PCI:  item.PCI,
+			Net:  item.Net,
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Path < candidates[j].Path
+	})
+	app.markRecommendedMSTDevices(candidates)
+	selected := defaultMSTSelection(candidates)
+	if len(selected) != 8 {
+		t.Fatalf("expected 8 RDMA MST devices selected, got %d: %#v", len(selected), selected)
+	}
+	for _, device := range selected {
+		if strings.Contains(device.Path, "mt4125") || device.Net == "bond0" {
+			t.Fatalf("management/bond MST device should not be selected by default: %#v", device)
+		}
+		if !strings.HasPrefix(device.Net, "ens") {
+			t.Fatalf("expected selected device to be matched by RDMA net name: %#v", device)
+		}
+	}
+}
+
+func TestMSTDeviceReviewScrollsSelectedDeviceIntoView(t *testing.T) {
+	review := &mstDeviceReview{
+		Index:    5,
+		Devices:  make([]mstDevice, 8),
+		Selected: map[int]bool{5: true},
+	}
+	for idx := range review.Devices {
+		review.Devices[idx] = mstDevice{
+			Path: fmt.Sprintf("/dev/mst/pci%d", idx),
+			PCI:  fmt.Sprintf("0000:4%d:00.0", idx),
+		}
+	}
+
+	var compact strings.Builder
+	renderMSTDeviceReviewCompact(&compact, review, 78, 3)
+	got := compact.String()
+	for _, want := range []string{
+		"... 4 more MST device(s) above",
+		">   [x]  /dev/mst/pci5",
+		"... 1 more MST device(s) below",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in compact MST review:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "/dev/mst/pci0") {
+		t.Fatalf("expected early devices to scroll out of view, got:\n%s", got)
 	}
 }
 
@@ -2614,7 +3387,7 @@ func TestMlxconfigDevicesAutoDiscoversAndPersistsSelection(t *testing.T) {
 		DryRun: true,
 		Bundle: spec.Bundle{
 			MlxConfig: spec.MlxConfig{
-				Settings: map[string]string{"CNP_DSCP_P1": "48"},
+				Settings: map[string]string{"LINK_TYPE_P1": "2"},
 			},
 		},
 		Output: &output,
@@ -2623,39 +3396,165 @@ func TestMlxconfigDevicesAutoDiscoversAndPersistsSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mlxconfig devices: %v", err)
 	}
-	want := []string{"/dev/mst/mt4129_pciconf0", "/dev/mst/mt4129_pciconf2"}
+	want := []string{"/dev/mst/mt4129_pciconf0", "/dev/mst/mt4129_pciconf1.1", "/dev/mst/mt4129_pciconf2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected devices: got=%v want=%v", got, want)
 	}
-	if !strings.Contains(output.String(), "would write /var/lib/envinit/mst-devices.json with 2 MST device") {
+	if !strings.Contains(output.String(), "would write /var/lib/envinit/mst-devices.json with 3 MST device") {
 		t.Fatalf("expected dry-run persistence log, got:\n%s", output.String())
 	}
 }
 
-func TestMlxconfigDevicesUsesPersistedSelection(t *testing.T) {
+func TestValidateMSTSelectionAcceptsConfirmedSchemaV2(t *testing.T) {
 	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "dev", "mst"), 0o755); err != nil {
+	mstDir := filepath.Join(root, "dev", "mst")
+	if err := os.MkdirAll(mstDir, 0o755); err != nil {
 		t.Fatalf("mkdir mst dir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "dev", "mst", "mt4129_pciconf0"), []byte{}, 0o644); err != nil {
-		t.Fatalf("write mst device: %v", err)
+	for _, name := range []string{"mt4129_pciconf0", "mt4129_pciconf0.1"} {
+		if err := os.WriteFile(filepath.Join(mstDir, name), []byte{}, 0o644); err != nil {
+			t.Fatalf("write mst device %s: %v", name, err)
+		}
 	}
-	selection := `{"mlxconfig_devices":[{"mst":"/dev/mst/mt4129_pciconf0","pci":"0000:41:00.0"}]}`
+	app := &App{
+		Root: root,
+		Machine: spec.MachineConfig{
+			RDMA: []spec.RDMAConfig{
+				{Name: "ens11f0np0"},
+				{Name: "ens11f1np1"},
+			},
+		},
+		Output: ioDiscard{},
+	}
+	selection := mstSelection{
+		SchemaVersion:  2,
+		RDMAInterfaces: []string{"ens11f0np0", "ens11f1np1"},
+		Devices: []mstDevice{
+			{Path: "/dev/mst/mt4129_pciconf0", PCI: "0000:06:00.0", Net: "ens11f0np0"},
+			{Path: "/dev/mst/mt4129_pciconf0.1", PCI: "0000:06:00.1", Net: "ens11f1np1"},
+		},
+	}
+	candidates := []mstDevice{
+		{Path: "/dev/mst/mt4129_pciconf0", PCI: "0000:06:00.0", Net: "ens11f0np0"},
+		{Path: "/dev/mst/mt4129_pciconf0.1", PCI: "0000:06:00.1", Net: "ens11f1np1"},
+	}
+	if err := app.validateMSTSelection(selection, candidates); err != nil {
+		t.Fatalf("expected schema v2 selection to validate: %v", err)
+	}
+}
+
+func TestValidateMSTSelectionRejectsUnsafePersistedState(t *testing.T) {
+	root := t.TempDir()
+	mstDir := filepath.Join(root, "dev", "mst")
+	if err := os.MkdirAll(mstDir, 0o755); err != nil {
+		t.Fatalf("mkdir mst dir: %v", err)
+	}
+	for _, name := range []string{"mt4129_pciconf0", "mt4125_pciconf0"} {
+		if err := os.WriteFile(filepath.Join(mstDir, name), []byte{}, 0o644); err != nil {
+			t.Fatalf("write mst device %s: %v", name, err)
+		}
+	}
+	app := &App{
+		Root: root,
+		Machine: spec.MachineConfig{
+			RDMA: []spec.RDMAConfig{{Name: "ens11f0np0"}},
+		},
+		Output: ioDiscard{},
+	}
+	candidates := []mstDevice{
+		{Path: "/dev/mst/mt4129_pciconf0", PCI: "0000:06:00.0", Net: "ens11f0np0"},
+		{Path: "/dev/mst/mt4125_pciconf0", PCI: "0000:41:00.0", Net: "bond0"},
+	}
+	cases := []struct {
+		name      string
+		selection mstSelection
+	}{
+		{
+			name: "legacy schema",
+			selection: mstSelection{
+				Devices: []mstDevice{{Path: "/dev/mst/mt4129_pciconf0", PCI: "0000:06:00.0"}},
+			},
+		},
+		{
+			name: "rdma count mismatch",
+			selection: mstSelection{
+				SchemaVersion:  2,
+				RDMAInterfaces: []string{"ens11f0np0", "ens11f1np1"},
+				Devices: []mstDevice{
+					{Path: "/dev/mst/mt4129_pciconf0", PCI: "0000:06:00.0", Net: "ens11f0np0"},
+					{Path: "/dev/mst/mt4129_pciconf0.1", PCI: "0000:06:00.1", Net: "ens11f1np1"},
+				},
+			},
+		},
+		{
+			name: "non-rdma bond net",
+			selection: mstSelection{
+				SchemaVersion:  2,
+				RDMAInterfaces: []string{"ens11f0np0"},
+				Devices: []mstDevice{
+					{Path: "/dev/mst/mt4125_pciconf0", PCI: "0000:41:00.0", Net: "bond0"},
+				},
+			},
+		},
+		{
+			name: "pci changed",
+			selection: mstSelection{
+				SchemaVersion:  2,
+				RDMAInterfaces: []string{"ens11f0np0"},
+				Devices: []mstDevice{
+					{Path: "/dev/mst/mt4129_pciconf0", PCI: "0000:99:00.0", Net: "ens11f0np0"},
+				},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := app.validateMSTSelection(tc.selection, candidates); err == nil {
+				t.Fatal("expected persisted MST selection validation to fail")
+			}
+		})
+	}
+}
+
+func TestPlanIgnoresPersistedMSTSelection(t *testing.T) {
+	root := t.TempDir()
+	mstDir := filepath.Join(root, "dev", "mst")
+	if err := os.MkdirAll(mstDir, 0o755); err != nil {
+		t.Fatalf("mkdir mst dir: %v", err)
+	}
+	for _, name := range []string{"mt4129_pciconf0", "mt4129_pciconf0.1"} {
+		if err := os.WriteFile(filepath.Join(mstDir, name), []byte{}, 0o644); err != nil {
+			t.Fatalf("write mst device %s: %v", name, err)
+		}
+	}
 	selectionPath := filepath.Join(root, "var", "lib", "envinit", "mst-devices.json")
 	if err := os.MkdirAll(filepath.Dir(selectionPath), 0o755); err != nil {
 		t.Fatalf("mkdir selection dir: %v", err)
 	}
-	if err := os.WriteFile(selectionPath, []byte(selection), 0o644); err != nil {
+	if err := os.WriteFile(selectionPath, []byte(`{"mlxconfig_devices":[{"mst":"/dev/mst/mt4129_pciconf0"}]}`), 0o644); err != nil {
 		t.Fatalf("write selection: %v", err)
 	}
-	app := &App{Root: root, Output: ioDiscard{}}
+
+	var output strings.Builder
+	app := &App{
+		Root:                    root,
+		DryRun:                  true,
+		InteractiveDryRunReview: true,
+		Bundle: spec.Bundle{
+			MlxConfig: spec.MlxConfig{Settings: map[string]string{"LINK_TYPE_P1": "2"}},
+		},
+		Output: &output,
+	}
 	got, err := app.mlxconfigDevices()
 	if err != nil {
 		t.Fatalf("mlxconfig devices: %v", err)
 	}
-	want := []string{"/dev/mst/mt4129_pciconf0"}
+	want := []string{"/dev/mst/mt4129_pciconf0", "/dev/mst/mt4129_pciconf0.1"}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("unexpected persisted devices: got=%v want=%v", got, want)
+		t.Fatalf("expected plan to ignore persisted selection: got=%v want=%v", got, want)
+	}
+	if !strings.Contains(output.String(), "ignore persisted MST mlxconfig device selection during plan") {
+		t.Fatalf("expected persisted-selection ignore log, got:\n%s", output.String())
 	}
 }
 
@@ -2720,7 +3619,7 @@ func TestDescribeIncludesDetailedStageActions(t *testing.T) {
 		"install post package 1/2 with dpkg -i /mnt/usb/pkg-a.deb",
 		"install post package 2/2 with dpkg -i /mnt/usb/pkg-b.deb",
 		"write /usr/local/sbin/kunlun-post-boot.sh",
-		"write and enable /etc/systemd/system/kunlun-post-boot.service",
+		"write, enable, and restart /etc/systemd/system/kunlun-post-boot.service",
 		"post task 1/2: copy /mnt/usb/agent.service to /etc/systemd/system/agent.service",
 		"post task 2/2: run systemctl daemon-reload",
 		"ask for confirmation before running ipmitool power soft",

@@ -219,6 +219,7 @@ func renderBondingOpts(machine spec.MachineConfig) string {
 }
 
 func renderIfcfgRoute(item spec.RDMAConfig, routeCIDR string) string {
+	routeCIDR = effectiveRDMARouteCIDR(item, routeCIDR)
 	var b strings.Builder
 	fmt.Fprintf(&b, "default via %s dev %s table %d\n", item.Gateway, item.Name, item.Table)
 	fmt.Fprintf(&b, "%s dev %s scope link table %d src %s proto static\n", routeCIDR, item.Name, item.Table, item.IP)
@@ -289,6 +290,7 @@ func renderNetworkManagerDispatcher(items []spec.RDMAConfig) string {
 }
 
 func renderRouteScript(item spec.RDMAConfig, routeCIDR string, priority int) string {
+	routeCIDR = effectiveRDMARouteCIDR(item, routeCIDR)
 	var b strings.Builder
 	b.WriteString("#!/usr/bin/env bash\n")
 	b.WriteString("set -euo pipefail\n\n")
@@ -316,16 +318,54 @@ func renderRouteScript(item spec.RDMAConfig, routeCIDR string, priority int) str
 	return b.String()
 }
 
+func effectiveRDMARouteCIDR(item spec.RDMAConfig, fallback string) string {
+	itemCIDR := strings.TrimSpace(item.RouteCIDR)
+	if itemCIDR != "" {
+		if strings.EqualFold(itemCIDR, "auto") {
+			return rdmaConnectedCIDR(item)
+		}
+		return itemCIDR
+	}
+	fallback = strings.TrimSpace(fallback)
+	if fallback == "" || strings.EqualFold(fallback, "auto") {
+		return rdmaConnectedCIDR(item)
+	}
+	return fallback
+}
+
+func rdmaConnectedCIDR(item spec.RDMAConfig) string {
+	ip := net.ParseIP(strings.TrimSpace(item.IP)).To4()
+	if ip == nil || item.Prefix < 0 || item.Prefix > 32 {
+		return strings.TrimSpace(item.RouteCIDR)
+	}
+	mask := net.CIDRMask(item.Prefix, 32)
+	network := ip.Mask(mask)
+	return (&net.IPNet{IP: network, Mask: mask}).String()
+}
+
 func renderPostBootScript(machine spec.MachineConfig, customBlock string) string {
 	var b strings.Builder
 	b.WriteString("#!/usr/bin/env bash\n")
 	b.WriteString("set -euo pipefail\n\n")
 	b.WriteString("# This file is managed by envinit. The custom section is preserved on update.\n")
+	b.WriteString("CNP_DSCP=\"48\"\n")
+	b.WriteString("RDMA_PRIO=\"5\"\n")
 	b.WriteString("RDMA_INTERFACES=(\n")
 	for _, item := range machine.RDMA {
 		fmt.Fprintf(&b, "  %q\n", item.Name)
 	}
 	b.WriteString(")\n\n")
+	b.WriteString("echo \"disable PCIe ACSCtl for devices that expose ACS capability\"\n")
+	b.WriteString("if command -v lspci >/dev/null 2>&1 && command -v setpci >/dev/null 2>&1; then\n")
+	b.WriteString("    while read -r pdev; do\n")
+	b.WriteString("        [ -n \"$pdev\" ] || continue\n")
+	b.WriteString("        if ! setpci -s \"$pdev\" ECAP_ACS+06.w=0000; then\n")
+	b.WriteString("            echo \"skip ACSCtl disable on $pdev: setpci failed\"\n")
+	b.WriteString("        fi\n")
+	b.WriteString("    done < <(lspci -vvv | grep -E \"^[a-f]|^[0-9]|ACSCtl\" | grep ACSCtl -B1 | grep -E \"^[a-f]|^[0-9]\" | awk '{print $1}')\n")
+	b.WriteString("else\n")
+	b.WriteString("    echo \"skip ACSCtl disable: lspci or setpci not found\"\n")
+	b.WriteString("fi\n\n")
 	b.WriteString("for iface in \"${RDMA_INTERFACES[@]}\"; do\n")
 	b.WriteString("    if ! ip link show \"$iface\" >/dev/null 2>&1; then\n")
 	b.WriteString("        echo \"skip missing interface: $iface\"\n")
@@ -343,10 +383,38 @@ func renderPostBootScript(machine spec.MachineConfig, customBlock string) string
 	b.WriteString("        echo \"skip RoCE AR on $iface: missing bus-info\"\n")
 	b.WriteString("        continue\n")
 	b.WriteString("    fi\n")
+	b.WriteString("    if command -v setpci >/dev/null 2>&1; then\n")
+	b.WriteString("        current_mrr=$(setpci -s \"$bus_info\" CAP_EXP+8.w 2>/dev/null || true)\n")
+	b.WriteString("        if [ -n \"$current_mrr\" ]; then\n")
+	b.WriteString("            desired_mrr=$(printf \"%04x\" $(( (0x$current_mrr & 0x8fff) | 0x5000 )))\n")
+	b.WriteString("            echo \"set PCIe MaxReadReq 4096 on $iface ($bus_info), current=$current_mrr desired=$desired_mrr\"\n")
+	b.WriteString("            if ! setpci -s \"$bus_info\" CAP_EXP+8.w=\"$desired_mrr\"; then\n")
+	b.WriteString("                echo \"skip MaxReadReq tuning on $iface: setpci failed\"\n")
+	b.WriteString("            fi\n")
+	b.WriteString("        else\n")
+	b.WriteString("            echo \"skip MaxReadReq tuning on $iface: CAP_EXP+8.w unavailable\"\n")
+	b.WriteString("        fi\n")
+	b.WriteString("    else\n")
+	b.WriteString("        echo \"skip MaxReadReq tuning on $iface: setpci not found\"\n")
+	b.WriteString("    fi\n\n")
 	b.WriteString("    echo \"enable RoCE adaptive routing on $iface ($bus_info)\"\n")
 	b.WriteString("    if ! mlxreg -d \"$bus_info\" --reg_name ROCE_ACCL --set adaptive_routing_forced_en=0x1 --yes; then\n")
 	b.WriteString("        echo \"skip RoCE AR on $iface: mlxreg failed\"\n")
-	b.WriteString("        continue\n")
+	b.WriteString("    fi\n")
+	b.WriteString("    if [ -w \"/sys/class/net/$iface/ecn/roce_np/enable/$RDMA_PRIO\" ]; then\n")
+	b.WriteString("        echo 1 > \"/sys/class/net/$iface/ecn/roce_np/enable/$RDMA_PRIO\"\n")
+	b.WriteString("    else\n")
+	b.WriteString("        echo \"skip RoCE NP enable on $iface: sysfs path unavailable\"\n")
+	b.WriteString("    fi\n")
+	b.WriteString("    if [ -w \"/sys/class/net/$iface/ecn/roce_rp/enable/$RDMA_PRIO\" ]; then\n")
+	b.WriteString("        echo 1 > \"/sys/class/net/$iface/ecn/roce_rp/enable/$RDMA_PRIO\"\n")
+	b.WriteString("    else\n")
+	b.WriteString("        echo \"skip RoCE RP enable on $iface: sysfs path unavailable\"\n")
+	b.WriteString("    fi\n")
+	b.WriteString("    if [ -w \"/sys/class/net/$iface/ecn/roce_np/cnp_dscp\" ]; then\n")
+	b.WriteString("        echo \"$CNP_DSCP\" > \"/sys/class/net/$iface/ecn/roce_np/cnp_dscp\"\n")
+	b.WriteString("    else\n")
+	b.WriteString("        echo \"skip CNP DSCP on $iface: sysfs path unavailable\"\n")
 	b.WriteString("    fi\n")
 	b.WriteString("done\n\n")
 	b.WriteString(postBootCustomBegin + "\n")

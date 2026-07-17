@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"envinit/internal/spec"
 	"path/filepath"
@@ -61,26 +62,26 @@ func localInterfaceIndex(root string) (map[string]string, []string, error) {
 }
 
 func (a *App) disableExistingNetplan() error {
-	dir := a.targetPath(netplanDir)
-	entries, err := filepath.Glob(filepath.Join(dir, "*.yaml"))
-	if err != nil {
-		return fmt.Errorf("scan netplan dir: %w", err)
+	targets := a.netplanBackupTargets()
+	if len(targets) == 0 {
+		a.logf("skip backing up existing netplan files because no netplan network files will be rewritten")
+		return nil
 	}
-	managed := map[string]bool{
-		filepath.Join(dir, "00-kunlun-bond.yaml"): true,
+	return a.backupExistingTargets(targets)
+}
+
+func (a *App) netplanBackupTargets() []string {
+	targets := []string{}
+	if a.configureManagementNetwork() {
+		targets = append(targets, filepath.Join(netplanDir, "00-kunlun-bond.yaml"))
+	}
+	if !a.Bundle.RDMAConfigureIPRoute() {
+		return targets
 	}
 	for _, item := range a.Machine.RDMA {
-		managed[filepath.Join(dir, fmt.Sprintf("10-kunlun-%s.yaml", item.Name))] = true
+		targets = append(targets, filepath.Join(netplanDir, fmt.Sprintf("10-kunlun-%s.yaml", item.Name)))
 	}
-	for _, entry := range entries {
-		if managed[entry] {
-			continue
-		}
-		if err := a.moveToBackup(entry); err != nil {
-			return err
-		}
-	}
-	return nil
+	return targets
 }
 
 func (a *App) disableExistingAptSources() error {
@@ -126,38 +127,45 @@ func (a *App) disableExistingYumRepos(targetFile string) error {
 }
 
 func (a *App) disableExistingIfcfg() error {
-	dir := a.targetPath(networkScriptsDir)
-	patterns := []string{
-		filepath.Join(dir, "ifcfg-*"),
-		filepath.Join(dir, "route-*"),
-		filepath.Join(dir, "rule-*"),
+	targets := a.ifcfgBackupTargets()
+	if len(targets) == 0 {
+		a.logf("skip backing up existing ifcfg files because no ifcfg network files will be rewritten")
+		return nil
 	}
-	managed := map[string]bool{}
-	if len(a.Machine.MgmtIfaces) == 1 {
-		managed[a.targetPath(ifcfgPath(a.Machine.MgmtIfaces[0]))] = true
-	} else {
-		managed[a.targetPath(ifcfgPath(a.Machine.MgmtBondName))] = true
-		for _, iface := range a.Machine.MgmtIfaces {
-			managed[a.targetPath(ifcfgPath(iface))] = true
+	return a.backupExistingTargets(targets)
+}
+
+func (a *App) ifcfgBackupTargets() []string {
+	targets := []string{}
+	if a.configureManagementNetwork() {
+		if len(a.Machine.MgmtIfaces) == 1 {
+			targets = append(targets, ifcfgPath(a.Machine.MgmtIfaces[0]))
+		} else {
+			targets = append(targets, ifcfgPath(a.Machine.MgmtBondName))
+			for _, iface := range a.Machine.MgmtIfaces {
+				targets = append(targets, ifcfgPath(iface))
+			}
 		}
+	}
+	if !a.Bundle.RDMAConfigureIPRoute() {
+		return targets
 	}
 	for _, item := range a.Machine.RDMA {
-		managed[a.targetPath(ifcfgPath(item.Name))] = true
-		managed[a.targetPath(ifcfgRoutePath(item.Name))] = true
-		managed[a.targetPath(ifcfgRulePath(item.Name))] = true
+		targets = append(targets, ifcfgPath(item.Name), ifcfgRoutePath(item.Name), ifcfgRulePath(item.Name))
 	}
-	for _, pattern := range patterns {
-		matches, err := filepath.Glob(pattern)
-		if err != nil {
-			return err
+	return targets
+}
+
+func (a *App) backupExistingTargets(targets []string) error {
+	seen := map[string]bool{}
+	for _, target := range targets {
+		path := a.targetPath(target)
+		if seen[path] {
+			continue
 		}
-		for _, match := range matches {
-			if managed[match] {
-				continue
-			}
-			if err := a.moveToBackup(match); err != nil {
-				return err
-			}
+		seen[path] = true
+		if err := a.moveToBackup(path); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -167,7 +175,11 @@ func (a *App) moveToBackup(path string) error {
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
-	backup := fmt.Sprintf("%s.bak.%s", path, a.now().Format("20060102_150405"))
+	now := a.now
+	if now == nil {
+		now = time.Now
+	}
+	backup := fmt.Sprintf("%s.bak.%s", path, now().Format("20060102_150405"))
 	a.logf("backup %s -> %s", path, backup)
 	if a.DryRun {
 		return nil

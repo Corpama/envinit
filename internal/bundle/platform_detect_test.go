@@ -81,7 +81,7 @@ ID_LIKE=debian
 	}
 }
 
-func TestApplyDetectedPlatformDefaultsOverridesStaleOSAndPackageFields(t *testing.T) {
+func TestApplyDetectedPlatformDefaultsPreservesExplicitOSAndPackageFields(t *testing.T) {
 	path := writeOSRelease(t, `ID=kylin
 ID_LIKE="rhel fedora"
 `)
@@ -98,13 +98,13 @@ ID_LIKE="rhel fedora"
 	})
 	b.ApplyDefaults()
 
-	if b.Platform.OSFamily != "kylin" {
+	if b.Platform.OSFamily != "ubuntu" {
 		t.Fatalf("unexpected os family: %s", b.Platform.OSFamily)
 	}
-	if b.Platform.PackageManager != "yum" {
+	if b.Platform.PackageManager != "apt" {
 		t.Fatalf("unexpected package manager: %s", b.Platform.PackageManager)
 	}
-	if b.Platform.NetworkBackend != "auto" {
+	if b.Platform.NetworkBackend != "netplan" {
 		t.Fatalf("unexpected network backend: %s", b.Platform.NetworkBackend)
 	}
 }

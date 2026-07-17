@@ -11,8 +11,10 @@ COS_BUCKET="${COS_BUCKET:-wxq-1318169049}"
 COS_REGION="${COS_REGION:-ap-guangzhou}"
 COS_ENDPOINT="${COS_ENDPOINT:-cos.${COS_REGION}.myqcloud.com}"
 COS_RELEASE_UPLOAD_ENDPOINT="${COS_RELEASE_UPLOAD_ENDPOINT:-cos.accelerate.myqcloud.com}"
-COS_DATA_PREFIX="${COS_DATA_PREFIX:-env_init/data}"
+COS_PROFILE_PREFIX="${COS_PROFILE_PREFIX:-env_init/data/profiles}"
 COS_RELEASE_PREFIX="${COS_RELEASE_PREFIX:-env_init/releases}"
+COS_RELEASE_KEEP="${COS_RELEASE_KEEP:-2}"
+RELEASE_PROFILES="${RELEASE_PROFILES:-ubuntu22.04-x86_64:kylin10sp3-x86_64}"
 ALIST_BASE_URL="${ALIST_BASE_URL:-https://alt.corpa.me}"
 ALIST_RELEASE_PREFIX="${ALIST_RELEASE_PREFIX:-/releases}"
 
@@ -38,7 +40,7 @@ trap 'rm -rf "$WORK_ROOT"' EXIT
 TOOLS_DIR="${WORK_ROOT}/tools"
 STAGE_DIR="${WORK_ROOT}/stage"
 RELEASE_DIR="${REPO_ROOT}/release"
-mkdir -p "$TOOLS_DIR" "$STAGE_DIR/env_tool" "$STAGE_DIR/env_tool/data"
+mkdir -p "$TOOLS_DIR" "$STAGE_DIR/env_tool" "$RELEASE_DIR"
 rm -rf "$RELEASE_DIR"
 mkdir -p "$RELEASE_DIR"
 
@@ -71,14 +73,62 @@ if [[ -n "${COS_SESSION_TOKEN:-}" ]]; then
   COSCLI_AUTH_ARGS+=(--token "$COS_SESSION_TOKEN")
 fi
 
-echo "==> Assembling env_tool files"
+profile_name() {
+	case "$1" in
+		ubuntu22.04-x86_64) printf 'Ubuntu 22.04 x86_64' ;;
+		kylin10sp3-x86_64) printf 'Kylin V10 SP3 x86_64' ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+profile_description() {
+	case "$1" in
+		ubuntu22.04-x86_64) printf 'Ubuntu apt/deb material profile' ;;
+		kylin10sp3-x86_64) printf 'Kylin yum/rpm material profile' ;;
+		*) printf 'Custom material profile' ;;
+	esac
+}
+
+profile_bundle_template() {
+	case "$1" in
+		ubuntu22.04-x86_64) printf 'examples/bundle.ubuntu22.sample.json' ;;
+		kylin10sp3-x86_64) printf 'examples/bundle.kylin10sp3.sample.json' ;;
+		*) return 1 ;;
+	esac
+}
+
+upload_file() {
+  local local_path="$1"
+  local cos_object="$2"
+  local attempt
+
+  for attempt in 1 2 3; do
+    if "${TOOLS_DIR}/coscli" cp \
+      "$local_path" \
+      "cos://${COS_BUCKET}/${cos_object}" \
+      -e "$COS_RELEASE_UPLOAD_ENDPOINT" \
+      "${COSCLI_AUTH_ARGS[@]}"; then
+      return 0
+    fi
+
+    echo "COS release upload failed (${attempt}/3): ${cos_object}" >&2
+    if [[ -d "${REPO_ROOT}/coscli_output" ]]; then
+      find "${REPO_ROOT}/coscli_output" -maxdepth 2 -type f -print -exec sed -n '1,240p' {} \; >&2
+    fi
+    sleep 5
+  done
+
+  return 1
+}
+
+echo "==> Assembling env_tool base files"
 cp README.md "${STAGE_DIR}/env_tool/README.md"
-mkdir -p "${STAGE_DIR}/env_tool/planning"
+mkdir -p "${STAGE_DIR}/env_tool/planning/templates" "${STAGE_DIR}/env_tool/examples"
+cp examples/inventory.sample.csv "${STAGE_DIR}/env_tool/planning/inventory.sample.csv"
 cp examples/inventory.sample.csv "${STAGE_DIR}/env_tool/planning/inventory.csv"
-cp examples/bundle.sample.json "${STAGE_DIR}/env_tool/planning/bundle.json"
-if [[ -f examples/bundle.redhat.sample.json ]]; then
-  cp examples/bundle.redhat.sample.json "${STAGE_DIR}/env_tool/planning/bundle.redhat.sample.json"
-fi
+cp examples/bundle.ubuntu22.sample.json "${STAGE_DIR}/env_tool/planning/bundle.json"
+cp examples/bundle.ubuntu22.sample.json examples/bundle.kylin10sp3.sample.json "${STAGE_DIR}/env_tool/planning/templates/"
+cp examples/bundle.ubuntu22.sample.json examples/bundle.kylin10sp3.sample.json "${STAGE_DIR}/env_tool/examples/"
 cat > "${STAGE_DIR}/env_tool/run1.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -99,14 +149,6 @@ sudo ./env_init apply \
 EOF
 chmod +x "${STAGE_DIR}/env_tool/run1.sh" "${STAGE_DIR}/env_tool/run2.sh"
 
-echo "==> Downloading COS directory cos://${COS_BUCKET}/${COS_DATA_PREFIX}/"
-"${TOOLS_DIR}/coscli" cp \
-  "cos://${COS_BUCKET}/${COS_DATA_PREFIX}/" \
-  "${STAGE_DIR}/env_tool/data/" \
-  -r \
-  -e "$COS_ENDPOINT" \
-  "${COSCLI_AUTH_ARGS[@]}"
-
 echo "==> Running tests"
 go test ./...
 
@@ -116,41 +158,110 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
   go build -trimpath -o "${STAGE_DIR}/env_tool/env_init_arch" ./cmd/envinit
 
-echo "==> Creating complete env_tool package"
-PACKAGE_NAME="env_tool-${RELEASE_TAG}.tar"
-PACKAGE_PATH="${WORK_ROOT}/${PACKAGE_NAME}"
-COS_RELEASE_OBJECT="${COS_RELEASE_PREFIX}/${RELEASE_TAG}/${PACKAGE_NAME}"
-tar -C "$STAGE_DIR" -cf "$PACKAGE_PATH" env_tool
-PACKAGE_SHA256="$(sha256sum "$PACKAGE_PATH" | awk '{print $1}')"
-printf '%s  %s\n' "$PACKAGE_SHA256" "$PACKAGE_NAME" > "${RELEASE_DIR}/SHA256SUMS"
+echo "==> Creating base env_tool package"
+BASE_PACKAGE_NAME="env_tool-base-${RELEASE_TAG}.tar"
+BASE_PACKAGE_PATH="${WORK_ROOT}/${BASE_PACKAGE_NAME}"
+BASE_ALIST_PATH="${ALIST_RELEASE_PREFIX%/}/${RELEASE_TAG}/${BASE_PACKAGE_NAME}"
+tar -C "$STAGE_DIR" -cf "$BASE_PACKAGE_PATH" env_tool
+BASE_PACKAGE_SHA256="$(sha256sum "$BASE_PACKAGE_PATH" | awk '{print $1}')"
+printf '%s  %s\n' "$BASE_PACKAGE_SHA256" "$BASE_PACKAGE_NAME" > "${RELEASE_DIR}/SHA256SUMS"
+upload_file "$BASE_PACKAGE_PATH" "${COS_RELEASE_PREFIX}/${RELEASE_TAG}/${BASE_PACKAGE_NAME}"
 
-echo "==> Uploading complete package to cos://${COS_BUCKET}/${COS_RELEASE_OBJECT}"
-upload_release_package() {
-  local attempt
+INVENTORY_RELEASE_PATH="${WORK_ROOT}/inventory.sample.csv"
+cp examples/inventory.sample.csv "$INVENTORY_RELEASE_PATH"
+INVENTORY_SHA256="$(sha256sum "$INVENTORY_RELEASE_PATH" | awk '{print $1}')"
+INVENTORY_ALIST_PATH="${ALIST_RELEASE_PREFIX%/}/${RELEASE_TAG}/inventory.sample.csv"
+printf '%s  %s\n' "$INVENTORY_SHA256" "inventory.sample.csv" >> "${RELEASE_DIR}/SHA256SUMS"
+upload_file "$INVENTORY_RELEASE_PATH" "${COS_RELEASE_PREFIX}/${RELEASE_TAG}/inventory.sample.csv"
 
-  for attempt in 1 2 3; do
-    if "${TOOLS_DIR}/coscli" cp \
-      "$PACKAGE_PATH" \
-      "cos://${COS_BUCKET}/${COS_RELEASE_OBJECT}" \
-      -e "$COS_RELEASE_UPLOAD_ENDPOINT" \
-      "${COSCLI_AUTH_ARGS[@]}"; then
-      return 0
-    fi
+BASE_ASSET_JSON="$(
+  jq -nc \
+    --arg name "$BASE_PACKAGE_NAME" \
+    --arg path "$BASE_ALIST_PATH" \
+    --arg sha256 "$BASE_PACKAGE_SHA256" \
+    '{name: $name, path: $path, sha256: $sha256}'
+)"
+INVENTORY_ASSET_JSON="$(
+  jq -nc \
+    --arg name "planning/inventory.sample.csv" \
+    --arg path "$INVENTORY_ALIST_PATH" \
+    --arg sha256 "$INVENTORY_SHA256" \
+    '{name: $name, path: $path, sha256: $sha256}'
+)"
 
-    echo "COS release upload failed (${attempt}/3)." >&2
-    if [[ -d "${REPO_ROOT}/coscli_output" ]]; then
-      find "${REPO_ROOT}/coscli_output" -type f -maxdepth 2 -print -exec sed -n '1,240p' {} \; >&2
-    fi
-    sleep 5
-  done
+IFS=':' read -r -a PROFILE_IDS <<<"$RELEASE_PROFILES"
+PROFILE_ENTRIES=()
+for profile_id in "${PROFILE_IDS[@]}"; do
+  [[ -n "$profile_id" ]] || continue
 
-  return 1
-}
-upload_release_package
+  bundle_template="$(profile_bundle_template "$profile_id")"
+  if [[ ! -f "$bundle_template" ]]; then
+    echo "error: missing bundle template for ${profile_id}: ${bundle_template}" >&2
+    exit 1
+  fi
 
-echo "==> Getting permanent AList download link"
+  echo "==> Creating profile package ${profile_id}"
+  PROFILE_STAGE="${WORK_ROOT}/profiles/${profile_id}/stage"
+  PROFILE_PACKAGE_NAME="env_tool-data-${profile_id}-${RELEASE_TAG}.tar"
+  PROFILE_PACKAGE_PATH="${WORK_ROOT}/${PROFILE_PACKAGE_NAME}"
+  PROFILE_ALIST_PATH="${ALIST_RELEASE_PREFIX%/}/${RELEASE_TAG}/${profile_id}/${PROFILE_PACKAGE_NAME}"
+  mkdir -p "${PROFILE_STAGE}/env_tool/data"
+
+  echo "==> Downloading COS profile cos://${COS_BUCKET}/${COS_PROFILE_PREFIX}/${profile_id}/"
+  "${TOOLS_DIR}/coscli" cp \
+    "cos://${COS_BUCKET}/${COS_PROFILE_PREFIX}/${profile_id}/" \
+    "${PROFILE_STAGE}/env_tool/data/" \
+    -r \
+    -e "$COS_ENDPOINT" \
+    "${COSCLI_AUTH_ARGS[@]}"
+
+  tar -C "$PROFILE_STAGE" -cf "$PROFILE_PACKAGE_PATH" env_tool
+  PROFILE_SHA256="$(sha256sum "$PROFILE_PACKAGE_PATH" | awk '{print $1}')"
+  printf '%s  %s\n' "$PROFILE_SHA256" "$PROFILE_PACKAGE_NAME" >> "${RELEASE_DIR}/SHA256SUMS"
+  upload_file "$PROFILE_PACKAGE_PATH" "${COS_RELEASE_PREFIX}/${RELEASE_TAG}/${profile_id}/${PROFILE_PACKAGE_NAME}"
+
+  BUNDLE_RELEASE_PATH="${WORK_ROOT}/bundle-${profile_id}.json"
+  cp "$bundle_template" "$BUNDLE_RELEASE_PATH"
+  BUNDLE_SHA256="$(sha256sum "$BUNDLE_RELEASE_PATH" | awk '{print $1}')"
+  BUNDLE_ALIST_PATH="${ALIST_RELEASE_PREFIX%/}/${RELEASE_TAG}/${profile_id}/bundle.json"
+  printf '%s  %s\n' "$BUNDLE_SHA256" "${profile_id}/bundle.json" >> "${RELEASE_DIR}/SHA256SUMS"
+  upload_file "$BUNDLE_RELEASE_PATH" "${COS_RELEASE_PREFIX}/${RELEASE_TAG}/${profile_id}/bundle.json"
+
+  PROFILE_ENTRIES+=("$(
+    jq -nc \
+      --arg id "$profile_id" \
+      --arg name "$(profile_name "$profile_id")" \
+      --arg description "$(profile_description "$profile_id")" \
+      --arg asset_name "$PROFILE_PACKAGE_NAME" \
+      --arg asset_path "$PROFILE_ALIST_PATH" \
+      --arg asset_sha256 "$PROFILE_SHA256" \
+      --arg bundle_path "$BUNDLE_ALIST_PATH" \
+      --arg bundle_sha256 "$BUNDLE_SHA256" \
+      --argjson inventory "$INVENTORY_ASSET_JSON" \
+      '{
+        id: $id,
+        name: $name,
+        description: $description,
+        assets: [{name: $asset_name, path: $asset_path, sha256: $asset_sha256}],
+        bundle: {name: "planning/bundle.json", path: $bundle_path, sha256: $bundle_sha256},
+        inventory: $inventory
+      }'
+  )")
+done
+
+MANIFEST_PATH="${RELEASE_DIR}/manifest.json"
+printf '%s\n' "${PROFILE_ENTRIES[@]}" | jq -s \
+  --arg version "$RELEASE_TAG" \
+  --argjson base "$BASE_ASSET_JSON" \
+  '{version: $version, base: $base, profiles: .}' \
+  > "$MANIFEST_PATH"
+MANIFEST_JSON_B64="$(base64 < "$MANIFEST_PATH" | tr -d '\n')"
+
 ALIST_BASE_URL="${ALIST_BASE_URL%/}"
-ALIST_FILE_PATH="${ALIST_RELEASE_PREFIX%/}/${RELEASE_TAG}/${PACKAGE_NAME}"
+ALIST_USERNAME_B64="$(printf '%s' "$ALIST_USERNAME" | base64 | tr -d '\n')"
+ALIST_PASSWORD_B64="$(printf '%s' "$ALIST_PASSWORD" | base64 | tr -d '\n')"
+
+echo "==> Refreshing AList release directories"
 ALIST_LOGIN_RESPONSE="$(
   curl --fail --silent --show-error --retry 3 --retry-delay 2 \
     --request POST \
@@ -160,61 +271,38 @@ ALIST_LOGIN_RESPONSE="$(
     "${ALIST_BASE_URL}/api/auth/login"
 )"
 ALIST_TOKEN="$(jq -er 'select(.code == 200) | .data.token' <<<"$ALIST_LOGIN_RESPONSE")"
-refresh_alist_parent_dirs() {
-  local current_path=""
-  local part
+refresh_alist_dir() {
+  local path="$1"
   local response
-
-  IFS='/' read -r -a parts <<<"${ALIST_FILE_PATH%/*}"
-  for part in "${parts[@]}"; do
-    [[ -z "$part" ]] && continue
-    current_path="${current_path}/${part}"
-    response="$(
-      curl --fail --silent --show-error --retry 3 --retry-delay 2 \
-        --request POST \
-        --header 'Content-Type: application/json' \
-        --header "Authorization: ${ALIST_TOKEN}" \
-        --data "$(jq -nc --arg path "$current_path" \
-          '{path: $path, password: "", page: 1, per_page: 500, refresh: true}')" \
-        "${ALIST_BASE_URL}/api/fs/list"
-    )"
-    echo "AList refresh ${current_path}: $(jq -r '"code=\(.code // "unknown") message=\(.message // "unknown")"' <<<"$response")"
-  done
-}
-
-ALIST_RAW_URL=""
-for attempt in {1..24}; do
-  refresh_alist_parent_dirs
-  ALIST_FILE_RESPONSE="$(
+  response="$(
     curl --fail --silent --show-error --retry 3 --retry-delay 2 \
       --request POST \
       --header 'Content-Type: application/json' \
       --header "Authorization: ${ALIST_TOKEN}" \
-      --data "$(jq -nc --arg path "$ALIST_FILE_PATH" '{path: $path, password: "", refresh: true}')" \
-      "${ALIST_BASE_URL}/api/fs/get"
+      --data "$(jq -nc --arg path "$path" \
+        '{path: $path, password: "", page: 1, per_page: 500, refresh: true}')" \
+      "${ALIST_BASE_URL}/api/fs/list"
   )"
-  if ALIST_RAW_URL="$(jq -er 'select(.code == 200) | .data.raw_url | select(length > 0)' <<<"$ALIST_FILE_RESPONSE")"; then
-    break
-  fi
-  ALIST_ERROR="$(jq -r '"code=\(.code // "unknown") message=\(.message // "unknown")"' <<<"$ALIST_FILE_RESPONSE" 2>/dev/null || printf '%s' "$ALIST_FILE_RESPONSE")"
-  echo "AList has not exposed the uploaded object yet (${attempt}/24): ${ALIST_ERROR}"
-  sleep 5
+  echo "AList refresh ${path}: $(jq -r '"code=\(.code // "unknown") message=\(.message // "unknown")"' <<<"$response")"
+}
+refresh_alist_dir "${ALIST_RELEASE_PREFIX%/}/${RELEASE_TAG}"
+for profile_id in "${PROFILE_IDS[@]}"; do
+  [[ -n "$profile_id" ]] || continue
+  refresh_alist_dir "${ALIST_RELEASE_PREFIX%/}/${RELEASE_TAG}/${profile_id}"
 done
-: "${ALIST_RAW_URL:?AList did not return a raw download URL}"
-
-ALIST_USERNAME_B64="$(printf '%s' "$ALIST_USERNAME" | base64 | tr -d '\n')"
-ALIST_PASSWORD_B64="$(printf '%s' "$ALIST_PASSWORD" | base64 | tr -d '\n')"
 
 echo "==> Building cross-platform downloaders"
 build_downloader() {
   local goos="$1"
   local goarch="$2"
   local output="$3"
+  local ldflags
 
+  ldflags="-s -w -X main.releaseVersion=${RELEASE_TAG} -X main.manifestJSONB64=${MANIFEST_JSON_B64} -X main.alistBaseURL=${ALIST_BASE_URL} -X main.alistUserB64=${ALIST_USERNAME_B64} -X main.alistPassB64=${ALIST_PASSWORD_B64}"
   CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
     go build \
       -trimpath \
-      -ldflags "-s -w -X main.releaseVersion=${RELEASE_TAG} -X main.packageName=${PACKAGE_NAME} -X main.packageSHA256=${PACKAGE_SHA256} -X main.alistBaseURL=${ALIST_BASE_URL} -X main.alistFilePath=${ALIST_FILE_PATH} -X main.alistUserB64=${ALIST_USERNAME_B64} -X main.alistPassB64=${ALIST_PASSWORD_B64}" \
+      -ldflags "$ldflags" \
       -o "${RELEASE_DIR}/${output}" \
       ./cmd/downloader
 }
@@ -229,7 +317,51 @@ build_downloader windows arm64 env_tool_downloader-windows-arm64.exe
 (
   cd "$RELEASE_DIR"
   sha256sum env_tool_downloader-* >> SHA256SUMS
+  sha256sum manifest.json >> SHA256SUMS
 )
+
+cleanup_old_cos_releases() {
+  if ! [[ "$COS_RELEASE_KEEP" =~ ^[0-9]+$ ]]; then
+    echo "warning: COS_RELEASE_KEEP must be a non-negative integer, got ${COS_RELEASE_KEEP}; skip cleanup" >&2
+    return 0
+  fi
+  if [[ "$COS_RELEASE_KEEP" -eq 0 ]]; then
+    echo "warning: COS_RELEASE_KEEP=0 would delete every release; skip cleanup" >&2
+    return 0
+  fi
+
+  local listing
+  if ! listing="$("${TOOLS_DIR}/coscli" ls "cos://${COS_BUCKET}/${COS_RELEASE_PREFIX}/" -e "$COS_ENDPOINT" "${COSCLI_AUTH_ARGS[@]}" 2>/dev/null)"; then
+    echo "warning: could not list COS releases for cleanup; skip cleanup" >&2
+    return 0
+  fi
+
+  mapfile -t releases < <(
+    awk '{print $NF}' <<<"$listing" |
+      sed -E 's#/$##; s#.*/##' |
+      grep -E '^v[0-9A-Za-z._-]+$' |
+      sort -V
+  )
+  local total="${#releases[@]}"
+  if (( total <= COS_RELEASE_KEEP )); then
+    echo "COS release cleanup: ${total} release(s), keep ${COS_RELEASE_KEEP}; nothing to delete"
+    return 0
+  fi
+
+  local delete_count=$((total - COS_RELEASE_KEEP))
+  local idx
+  for ((idx = 0; idx < delete_count; idx++)); do
+    echo "Deleting old COS release cos://${COS_BUCKET}/${COS_RELEASE_PREFIX}/${releases[$idx]}/"
+    "${TOOLS_DIR}/coscli" rm \
+      "cos://${COS_BUCKET}/${COS_RELEASE_PREFIX}/${releases[$idx]}/" \
+      -r \
+      -e "$COS_RELEASE_UPLOAD_ENDPOINT" \
+      "${COSCLI_AUTH_ARGS[@]}"
+  done
+}
+
+echo "==> Cleaning old COS release packages"
+cleanup_old_cos_releases
 
 echo "==> Release files"
 ls -lh "$RELEASE_DIR"

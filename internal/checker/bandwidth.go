@@ -1,7 +1,6 @@
 package checker
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -12,32 +11,25 @@ import (
 	"envinit/internal/spec"
 )
 
-func validateGroup(cfg spec.CheckConfig, group spec.CheckRDMAGroup) error {
+func validateGroup(group spec.CheckRDMAGroup) error {
 	if strings.TrimSpace(group.IBDevice) == "" {
-		return errors.New("check.rdma_groups[].ib_device is required")
-	}
-	if strings.TrimSpace(cfg.MmapDevice) == "" {
-		return nil
-	}
-	if len(group.XPUOffsets) < 1 {
-		return fmt.Errorf("check.rdma_groups[%s].xpu_offsets requires at least 1 offset when bandwidth mmap is enabled", group.IBDevice)
+		return fmt.Errorf("check.bandwidth.rdma_groups[].ib_device is required")
 	}
 	return nil
 }
 
 func runParallel(opts Options, groupsByTarget resolvedRDMAGroups, server Target, client Target) ([]Result, []error) {
-	batches := bandwidthStreamBatches(opts.Bundle.Check)
+	batches := bandwidthStreamBatchesForGroups(opts.Bundle.Check.Bandwidth, groupsByTarget[server.Name], groupsByTarget[client.Name])
 	if opts.DryRun {
 		results := make([]Result, 0)
 		for batchIndex, batch := range batches {
 			fmt.Fprintf(opts.Output, "dry-run bandwidth batch %d %s -> %s: %d stream(s)\n", batchIndex+1, client.Name, server.Name, len(batch))
 			for _, stream := range batch {
-				stream = resolveStreamGroups(groupsByTarget, server, client, stream)
-				serverArgs := ibWriteBWArgs(opts.Bundle.Check, stream.ServerGroup, stream.ServerOffset, "", stream.Port)
-				clientArgs := ibWriteBWArgs(opts.Bundle.Check, stream.ClientGroup, stream.ClientOffset, bandwidthPeerAddress(server, stream), stream.Port)
+				serverArgs := ibWriteBWArgs(opts.Bundle.Check.Bandwidth, stream.ServerGroup, stream.ServerOffset, "", stream.Port)
+				clientArgs := ibWriteBWArgs(opts.Bundle.Check.Bandwidth, stream.ClientGroup, stream.ClientOffset, bandwidthPeerAddress(server, stream), stream.Port)
 				fmt.Fprintf(opts.Output, "dry-run server %s: %s\n", server.Name, shellJoin(serverArgs))
 				fmt.Fprintf(opts.Output, "dry-run client %s: %s\n", client.Name, shellJoin(clientArgs))
-				results = append(results, resultFromOutput(opts.Bundle.Check, server, client, stream, ""))
+				results = append(results, resultFromOutput(opts.Bundle.Check.Bandwidth, server, client, stream, ""))
 			}
 		}
 		return results, nil
@@ -46,9 +38,6 @@ func runParallel(opts Options, groupsByTarget resolvedRDMAGroups, server Target,
 	var results []Result
 	var errs []error
 	for _, batch := range batches {
-		for idx := range batch {
-			batch[idx] = resolveStreamGroups(groupsByTarget, server, client, batch[idx])
-		}
 		batchResults, batchErrs := runParallelBatch(opts, server, client, batch)
 		results = append(results, batchResults...)
 		errs = append(errs, batchErrs...)
@@ -74,7 +63,7 @@ func runParallelBatch(opts Options, server Target, client Target, streams []chec
 	processes := make([]serverProcess, 0, len(streams))
 	var errs []error
 	for _, stream := range streams {
-		serverArgs := ibWriteBWArgs(opts.Bundle.Check, stream.ServerGroup, stream.ServerOffset, "", stream.Port)
+		serverArgs := ibWriteBWArgs(opts.Bundle.Check.Bandwidth, stream.ServerGroup, stream.ServerOffset, "", stream.Port)
 		logPath := fmt.Sprintf("/tmp/envinit-check-%s-%d-%d.log", sanitizeName(stream.ServerGroup.IBDevice), stream.Port, time.Now().UnixNano())
 		serverCmd := fmt.Sprintf("nohup %s > %s 2>&1 & echo $!", shellJoin(serverArgs), shellQuote(logPath))
 		pid, err := runCommand(opts.Bundle.Check, server, serverCmd)
@@ -107,13 +96,13 @@ func runParallelBatch(opts Options, server Target, client Target, streams []chec
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			clientArgs := ibWriteBWArgs(opts.Bundle.Check, process.stream.ClientGroup, process.stream.ClientOffset, bandwidthPeerAddress(server, process.stream), process.stream.Port)
+			clientArgs := ibWriteBWArgs(opts.Bundle.Check.Bandwidth, process.stream.ClientGroup, process.stream.ClientOffset, bandwidthPeerAddress(server, process.stream), process.stream.Port)
 			output, err := runCommand(opts.Bundle.Check, client, shellJoin(clientArgs))
 			if err != nil {
 				ch <- streamResult{index: index, err: fmt.Errorf("run client on %s against %s %s: %w", client.Name, server.Name, streamLabel(process.stream), err)}
 				return
 			}
-			ch <- streamResult{index: index, result: resultFromOutput(opts.Bundle.Check, server, client, process.stream, output)}
+			ch <- streamResult{index: index, result: resultFromOutput(opts.Bundle.Check.Bandwidth, server, client, process.stream, output)}
 		}()
 	}
 	wg.Wait()
@@ -137,13 +126,13 @@ func runParallelBatch(opts Options, server Target, client Target, streams []chec
 }
 
 func runStream(opts Options, server Target, client Target, stream checkStream) (Result, error) {
-	serverArgs := ibWriteBWArgs(opts.Bundle.Check, stream.ServerGroup, stream.ServerOffset, "", stream.Port)
-	clientArgs := ibWriteBWArgs(opts.Bundle.Check, stream.ClientGroup, stream.ClientOffset, bandwidthPeerAddress(server, stream), stream.Port)
+	serverArgs := ibWriteBWArgs(opts.Bundle.Check.Bandwidth, stream.ServerGroup, stream.ServerOffset, "", stream.Port)
+	clientArgs := ibWriteBWArgs(opts.Bundle.Check.Bandwidth, stream.ClientGroup, stream.ClientOffset, bandwidthPeerAddress(server, stream), stream.Port)
 
 	if opts.DryRun {
 		fmt.Fprintf(opts.Output, "dry-run server %s: %s\n", server.Name, shellJoin(serverArgs))
 		fmt.Fprintf(opts.Output, "dry-run client %s: %s\n", client.Name, shellJoin(clientArgs))
-		return resultFromOutput(opts.Bundle.Check, server, client, stream, ""), nil
+		return resultFromOutput(opts.Bundle.Check.Bandwidth, server, client, stream, ""), nil
 	}
 
 	logPath := fmt.Sprintf("/tmp/envinit-check-%s-%d-%d.log", sanitizeName(stream.ServerGroup.IBDevice), stream.Port, time.Now().UnixNano())
@@ -162,10 +151,10 @@ func runStream(opts Options, server Target, client Target, stream checkStream) (
 	if err != nil {
 		return Result{}, fmt.Errorf("run client on %s against %s: %w", client.Name, server.Name, err)
 	}
-	return resultFromOutput(opts.Bundle.Check, server, client, stream, output), nil
+	return resultFromOutput(opts.Bundle.Check.Bandwidth, server, client, stream, output), nil
 }
 
-func resultFromOutput(cfg spec.CheckConfig, server Target, client Target, stream checkStream, output string) Result {
+func resultFromOutput(cfg spec.CheckBandwidthConfig, server Target, client Target, stream checkStream, output string) Result {
 	gbits, ok := ParseBandwidthGBits(output)
 	if !ok {
 		gbits = math.NaN()
@@ -174,6 +163,8 @@ func resultFromOutput(cfg spec.CheckConfig, server Target, client Target, stream
 	if cfg.MinGBits > 0 {
 		passed = ok && gbits >= cfg.MinGBits
 	}
+	serverTopology := groupTopologyLink(stream.ServerGroup, stream.ServerOffset)
+	clientTopology := groupTopologyLink(stream.ClientGroup, stream.ClientOffset)
 	return Result{
 		Server:          server,
 		Client:          client,
@@ -183,6 +174,9 @@ func resultFromOutput(cfg spec.CheckConfig, server Target, client Target, stream
 		ClientRDMAIndex: stream.ClientRDMAIndex,
 		ServerXP:        stream.ServerOffset,
 		ClientXP:        stream.ClientOffset,
+		ServerTopology:  serverTopology,
+		ClientTopology:  clientTopology,
+		Degraded:        topologyLinkDegraded(serverTopology) || topologyLinkDegraded(clientTopology),
 		Port:            stream.Port,
 		GBits:           gbits,
 		Passed:          passed,
@@ -190,16 +184,20 @@ func resultFromOutput(cfg spec.CheckConfig, server Target, client Target, stream
 	}
 }
 
-func bandwidthStreams(cfg spec.CheckConfig) []checkStream {
+func bandwidthStreams(cfg spec.CheckBandwidthConfig) []checkStream {
+	return bandwidthStreamsForGroups(cfg, cfg.RDMAGroups, cfg.RDMAGroups)
+}
+
+func bandwidthStreamsForGroups(cfg spec.CheckBandwidthConfig, serverGroups, clientGroups []spec.CheckRDMAGroup) []checkStream {
 	streams := make([]checkStream, 0)
 	port := bandwidthBasePort(cfg)
 	mmapEnabled := strings.TrimSpace(cfg.MmapDevice) != ""
-	for clientGroupIndex, clientGroup := range cfg.RDMAGroups {
+	for clientGroupIndex, clientGroup := range clientGroups {
 		clientOffsets := []string{""}
 		if mmapEnabled {
 			clientOffsets = clientGroup.XPUOffsets
 		}
-		for serverGroupIndex, serverGroup := range cfg.RDMAGroups {
+		for serverGroupIndex, serverGroup := range serverGroups {
 			serverOffsets := []string{""}
 			if mmapEnabled {
 				serverOffsets = serverGroup.XPUOffsets
@@ -223,14 +221,18 @@ func bandwidthStreams(cfg spec.CheckConfig) []checkStream {
 	return streams
 }
 
-func bandwidthStreamBatches(cfg spec.CheckConfig) [][]checkStream {
-	streams := bandwidthStreams(cfg)
+func bandwidthStreamBatches(cfg spec.CheckBandwidthConfig) [][]checkStream {
+	return bandwidthStreamBatchesForGroups(cfg, cfg.RDMAGroups, cfg.RDMAGroups)
+}
+
+func bandwidthStreamBatchesForGroups(cfg spec.CheckBandwidthConfig, serverGroups, clientGroups []spec.CheckRDMAGroup) [][]checkStream {
+	streams := bandwidthStreamsForGroups(cfg, serverGroups, clientGroups)
 	batches := make([][]checkStream, 0)
 	remaining := append([]checkStream(nil), streams...)
 	for len(remaining) > 0 {
 		usedClients := make(map[int]bool)
 		usedServers := make(map[int]bool)
-		batch := make([]checkStream, 0, len(cfg.RDMAGroups))
+		batch := make([]checkStream, 0, maxInt(len(serverGroups), len(clientGroups)))
 		nextRemaining := make([]checkStream, 0, len(remaining))
 		for _, stream := range remaining {
 			if usedClients[stream.ClientRDMAIndex] || usedServers[stream.ServerRDMAIndex] {
@@ -250,7 +252,7 @@ func bandwidthStreamBatches(cfg spec.CheckConfig) [][]checkStream {
 	return batches
 }
 
-func bandwidthBasePort(cfg spec.CheckConfig) int {
+func bandwidthBasePort(cfg spec.CheckBandwidthConfig) int {
 	if cfg.BasePort > 0 {
 		return cfg.BasePort
 	}
@@ -266,7 +268,7 @@ func bandwidthPeerAddress(server Target, stream checkStream) string {
 	return server.Address
 }
 
-func ibWriteBWArgs(cfg spec.CheckConfig, group spec.CheckRDMAGroup, offset string, serverAddress string, port int) []string {
+func ibWriteBWArgs(cfg spec.CheckBandwidthConfig, group spec.CheckRDMAGroup, offset string, serverAddress string, port int) []string {
 	iterations := cfg.Iterations
 	if iterations == 0 {
 		iterations = 100

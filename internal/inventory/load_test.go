@@ -38,6 +38,51 @@ func TestLoadCSV(t *testing.T) {
 	}
 }
 
+func TestLoadCSVParsesDynamicRDMAColumns(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inventory.csv")
+	content := "host_id,rdma1_name,rdma1_ip,rdma8_name,rdma8_ip,rdma8_mac\n" +
+		"xpu21,ens11f0np0,10.61.13.43,ens17f1np1,10.61.18.43,90:e3:17:4d:5c:a3\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write csv: %v", err)
+	}
+
+	rows, err := Load(path, "")
+	if err != nil {
+		t.Fatalf("load csv: %v", err)
+	}
+	if len(rows[0].RDMA) != 8 {
+		t.Fatalf("expected 8 RDMA records, got %d: %#v", len(rows[0].RDMA), rows[0].RDMA)
+	}
+	if got := rows[0].RDMA[7].Name; got != "ens17f1np1" {
+		t.Fatalf("unexpected rdma8 name: %s", got)
+	}
+	if got := rows[0].RDMA[7].IP; got != "10.61.18.43" {
+		t.Fatalf("unexpected rdma8 ip: %s", got)
+	}
+	if got := rows[0].RDMA[7].MAC; got != "90:e3:17:4d:5c:a3" {
+		t.Fatalf("unexpected rdma8 mac: %s", got)
+	}
+}
+
+func TestLoadCSVParsesRDMARouteCIDR(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inventory.csv")
+	content := "host_id,rdma1_ip,rdma1_prefix,rdma1_gateway,rdma1_route_cidr\n" +
+		"xpu11,172.18.12.10,25,172.18.12.126,auto\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write csv: %v", err)
+	}
+
+	rows, err := Load(path, "")
+	if err != nil {
+		t.Fatalf("load csv: %v", err)
+	}
+	if got := rows[0].RDMA[0].RouteCIDR; got != "auto" {
+		t.Fatalf("unexpected rdma1 route cidr: %s", got)
+	}
+}
+
 func TestLoadXLSX(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "inventory.xlsx")

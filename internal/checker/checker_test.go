@@ -26,15 +26,31 @@ func TestResolveTargetsUsesInventoryMgmtIP(t *testing.T) {
 	}
 }
 
+func TestRunRejectsSingleHostForBandwidth(t *testing.T) {
+	err := Run(Options{
+		Bundle:       spec.Bundle{},
+		Records:      []spec.MachineRecord{{HostID: "node1", MgmtIP: "10.0.0.1"}},
+		Hosts:        []string{"node1"},
+		RunBandwidth: true,
+		DryRun:       true,
+		Output:       io.Discard,
+	})
+	if err == nil || !strings.Contains(err.Error(), "single-host mode is supported only") {
+		t.Fatalf("expected single-host bandwidth rejection, got %v", err)
+	}
+}
+
 func TestRunDryRunPrintsExpectedCommands(t *testing.T) {
 	var output bytes.Buffer
 	bundle := spec.Bundle{
 		Check: spec.CheckConfig{
-			Iterations:  100,
-			ReportGBits: true,
-			RDMAGroups: []spec.CheckRDMAGroup{
-				{
-					IBDevice: "mlx5_1",
+			Bandwidth: spec.CheckBandwidthConfig{
+				Iterations:  100,
+				ReportGBits: true,
+				RDMAGroups: []spec.CheckRDMAGroup{
+					{
+						IBDevice: "mlx5_1",
+					},
 				},
 			},
 		},
@@ -67,6 +83,8 @@ func TestRunDryRunPrintsExpectedCommands(t *testing.T) {
 		"STATUS",
 		"CLIENT",
 		"SERVER",
+		"CLIENT_IP",
+		"SERVER_IP",
 		"18515",
 		"BANDWIDTH",
 		"PASS    node1",
@@ -93,8 +111,87 @@ func TestRunDryRunPrintsExpectedCommands(t *testing.T) {
 	}
 }
 
+func TestRunDryRunDerivesRDMAGroupsFromInventory(t *testing.T) {
+	var output bytes.Buffer
+	bundle := spec.Bundle{Check: spec.CheckConfig{Bandwidth: spec.CheckBandwidthConfig{Iterations: 100}}}
+	bundle.ApplyDefaults()
+	err := Run(Options{
+		Bundle: bundle,
+		Records: []spec.MachineRecord{
+			{
+				HostID: "node1", MgmtIP: "10.157.5.207",
+				RDMA: []spec.RDMARecord{{Name: "ens11np0", IP: "10.247.1.11"}, {Name: "ens13np0", IP: "10.247.2.11"}},
+			},
+			{
+				HostID: "node2", MgmtIP: "10.157.5.206",
+				RDMA: []spec.RDMARecord{{Name: "ens11np0", IP: "10.247.1.12"}, {Name: "ens13np0", IP: "10.247.2.12"}},
+			},
+		},
+		Hosts:  []string{"node1,node2"},
+		DryRun: true,
+		Output: &output,
+	})
+	if err != nil {
+		t.Fatalf("dry-run without rdma_groups: %v", err)
+	}
+	got := output.String()
+	for _, want := range []string{
+		"<resolve-ib-device:ens11np0>",
+		"<resolve-ib-device:ens13np0>",
+		"10.247.1.11",
+		"10.247.2.12",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in inventory-derived dry-run output:\n%s", want, got)
+		}
+	}
+}
+
+func TestRunXDRDryRunPerformsReadOnlyTopologyDiscovery(t *testing.T) {
+	var output bytes.Buffer
+	topologyCalls := 0
+	bundle := spec.Bundle{Check: spec.CheckConfig{Bandwidth: spec.CheckBandwidthConfig{Iterations: 100, MmapDevice: "/dev/xdrdrv"}}}
+	err := Run(Options{
+		Bundle: bundle,
+		Records: []spec.MachineRecord{
+			{HostID: "node1", MgmtIP: "10.157.5.207", RDMA: []spec.RDMARecord{{Name: "ens11np0", IP: "10.247.1.11"}}},
+			{HostID: "node2", MgmtIP: "10.157.5.206", RDMA: []spec.RDMARecord{{Name: "ens11np0", IP: "10.247.1.12"}}},
+		},
+		Hosts:  []string{"node1,node2"},
+		DryRun: true,
+		Output: &output,
+		CommandRunner: func(_ spec.CheckConfig, _ Target, command string) (string, error) {
+			if command == "xpu-smi topo -m" {
+				topologyCalls++
+				return " XPU0 NIC0\nXPU0 X PIX\nNIC Legend:\nNIC0: mlx5_7\n", nil
+			}
+			if strings.Contains(command, "/sys/class/net/") {
+				return "mlx5_7\n", nil
+			}
+			return "", fmt.Errorf("unexpected discovery command: %s", command)
+		},
+	})
+	if err != nil {
+		t.Fatalf("xdr dry-run discovery: %v", err)
+	}
+	if topologyCalls != 2 {
+		t.Fatalf("expected one topology call per target, got %d", topologyCalls)
+	}
+	got := output.String()
+	for _, want := range []string{
+		"dry-run discovery xdr topology",
+		"ib_device=mlx5_7",
+		"'--mmap-offset=0x0000000090001000'",
+		"'-d' 'mlx5_7'",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in xdr discovery dry-run output:\n%s", want, got)
+		}
+	}
+}
+
 func TestIBWriteBWArgsIncludesConfiguredQPs(t *testing.T) {
-	args := ibWriteBWArgs(spec.CheckConfig{
+	args := ibWriteBWArgs(spec.CheckBandwidthConfig{
 		Iterations:   100,
 		BandwidthQPs: 4,
 		ReportGBits:  true,
@@ -106,9 +203,10 @@ func TestIBWriteBWArgsIncludesConfiguredQPs(t *testing.T) {
 }
 
 func TestRunRejectsNegativeBundleBandwidthQPs(t *testing.T) {
-	bundle := spec.Bundle{Check: spec.CheckConfig{
+	bundle := spec.Bundle{Check: spec.CheckConfig{Bandwidth: spec.CheckBandwidthConfig{
 		BandwidthQPs: -1,
 		RDMAGroups:   []spec.CheckRDMAGroup{{IBDevice: "mlx5_1"}},
+	},
 	}}
 	err := Run(Options{
 		Bundle: bundle,
@@ -129,17 +227,19 @@ func TestRunParallelDryRunUsesEmulatedKVTransferAndXDRMmap(t *testing.T) {
 	var output bytes.Buffer
 	bundle := spec.Bundle{
 		Check: spec.CheckConfig{
-			Iterations:  100,
-			MessageSize: 8388608,
-			ReportGBits: true,
-			MmapDevice:  "/dev/xdrdrv",
-			Parallel:    true,
-			RDMAGroups: []spec.CheckRDMAGroup{
-				{
-					IBDevice: "mlx5_1",
-					XPUOffsets: []string{
-						"0x0000000090001000",
-						"0x1000000090001000",
+			Bandwidth: spec.CheckBandwidthConfig{
+				Iterations:  100,
+				MessageSize: 8388608,
+				ReportGBits: true,
+				MmapDevice:  "/dev/xdrdrv",
+				Parallel:    true,
+				RDMAGroups: []spec.CheckRDMAGroup{
+					{
+						IBDevice: "mlx5_1",
+						XPUOffsets: []string{
+							"0x0000000090001000",
+							"0x1000000090001000",
+						},
 					},
 				},
 			},
@@ -180,23 +280,25 @@ func TestRunSequentialXDRMmapCoversEveryOffset(t *testing.T) {
 	var output bytes.Buffer
 	bundle := spec.Bundle{
 		Check: spec.CheckConfig{
-			Iterations:  100,
-			ReportGBits: true,
-			MmapDevice:  "/dev/xdrdrv",
-			Parallel:    false,
-			RDMAGroups: []spec.CheckRDMAGroup{
-				{
-					IBDevice: "mlx5_1",
-					XPUOffsets: []string{
-						"0x0000000090001000",
-						"0x1000000090001000",
+			Bandwidth: spec.CheckBandwidthConfig{
+				Iterations:  100,
+				ReportGBits: true,
+				MmapDevice:  "/dev/xdrdrv",
+				Parallel:    false,
+				RDMAGroups: []spec.CheckRDMAGroup{
+					{
+						IBDevice: "mlx5_1",
+						XPUOffsets: []string{
+							"0x0000000090001000",
+							"0x1000000090001000",
+						},
 					},
-				},
-				{
-					IBDevice: "mlx5_2",
-					XPUOffsets: []string{
-						"0x2000000090001000",
-						"0x3000000090001000",
+					{
+						IBDevice: "mlx5_2",
+						XPUOffsets: []string{
+							"0x2000000090001000",
+							"0x3000000090001000",
+						},
 					},
 				},
 			},
@@ -239,17 +341,19 @@ func TestRunParallelDryRunUsesSameOffsetsAndUniquePorts(t *testing.T) {
 	var output bytes.Buffer
 	bundle := spec.Bundle{
 		Check: spec.CheckConfig{
-			Iterations:  100,
-			MessageSize: 8388608,
-			ReportGBits: true,
-			MmapDevice:  "/dev/xdrdrv",
-			Parallel:    true,
-			RDMAGroups: []spec.CheckRDMAGroup{
-				{
-					IBDevice: "mlx5_1",
-					XPUOffsets: []string{
-						"0x0000000090001000",
-						"0x1000000090001000",
+			Bandwidth: spec.CheckBandwidthConfig{
+				Iterations:  100,
+				MessageSize: 8388608,
+				ReportGBits: true,
+				MmapDevice:  "/dev/xdrdrv",
+				Parallel:    true,
+				RDMAGroups: []spec.CheckRDMAGroup{
+					{
+						IBDevice: "mlx5_1",
+						XPUOffsets: []string{
+							"0x0000000090001000",
+							"0x1000000090001000",
+						},
 					},
 				},
 			},
@@ -295,7 +399,7 @@ func TestRunParallelDryRunUsesSameOffsetsAndUniquePorts(t *testing.T) {
 }
 
 func TestBandwidthStreamBatchesAvoidRDMAGroupOversubscription(t *testing.T) {
-	cfg := spec.CheckConfig{
+	cfg := spec.CheckBandwidthConfig{
 		RDMAGroups: []spec.CheckRDMAGroup{
 			{IBDevice: "mlx5_1"},
 			{IBDevice: "mlx5_2"},
@@ -308,7 +412,7 @@ func TestBandwidthStreamBatchesAvoidRDMAGroupOversubscription(t *testing.T) {
 }
 
 func TestBandwidthStreamBatchesAvoidRDMAGroupOversubscriptionWithXDRMmap(t *testing.T) {
-	cfg := spec.CheckConfig{
+	cfg := spec.CheckBandwidthConfig{
 		MmapDevice: "/dev/xdrdrv",
 		RDMAGroups: []spec.CheckRDMAGroup{
 			{IBDevice: "mlx5_1", XPUOffsets: []string{"0x0", "0x1"}},
@@ -325,11 +429,13 @@ func TestRunDryRunUsesMatchingRDMAAddressWhenPresent(t *testing.T) {
 	var output bytes.Buffer
 	bundle := spec.Bundle{
 		Check: spec.CheckConfig{
-			Iterations:  100,
-			ReportGBits: true,
-			RDMAGroups: []spec.CheckRDMAGroup{
-				{IBDevice: "mlx5_1"},
-				{IBDevice: "mlx5_2"},
+			Bandwidth: spec.CheckBandwidthConfig{
+				Iterations:  100,
+				ReportGBits: true,
+				RDMAGroups: []spec.CheckRDMAGroup{
+					{IBDevice: "mlx5_1"},
+					{IBDevice: "mlx5_2"},
+				},
 			},
 		},
 	}
@@ -359,6 +465,14 @@ func TestRunDryRunUsesMatchingRDMAAddressWhenPresent(t *testing.T) {
 		"'-d' 'mlx5_1' '--report_gbits' '-F' '-R' '-p' '18516' '10.247.2.11'",
 		"'-d' 'mlx5_2' '--report_gbits' '-F' '-R' '-p' '18517' '10.247.1.11'",
 		"'-d' 'mlx5_2' '--report_gbits' '-F' '-R' '-p' '18518' '10.247.2.11'",
+		"CLIENT_NIC",
+		"SERVER_NIC",
+		"CLIENT_IP",
+		"SERVER_IP",
+		"ens11np0",
+		"ens13np0",
+		"10.247.1.11",
+		"10.247.2.12",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expected %q in output:\n%s", want, got)
@@ -458,11 +572,13 @@ func TestRunRDMAPingDryRunUsesJumboPayload(t *testing.T) {
 		"RDMA ping result summary:",
 		"STATUS",
 		"SOURCE",
-		"SOURCE_RDMA",
-		"DEST_RDMA",
+		"SOURCE_NIC",
+		"DEST_NIC",
+		"SOURCE_IP",
 		"DEST_IP",
-		"PASS    node1   node2  rdma1",
-		"PASS    node2   node1  rdma2",
+		"PASS    node1   node2  ens15np0",
+		"PASS    node2   node1  ens16np0",
+		"10.247.1.11",
 		"10.247.1.12",
 		"10.247.2.11",
 		"8972",
@@ -488,7 +604,7 @@ func TestRDMAPingItemsBuildCrossMatrix(t *testing.T) {
 	}
 	source := Target{
 		Name: "node1",
-		RDMA: []spec.RDMARecord{{Name: "ens11np0"}, {Name: "ens13np0"}},
+		RDMA: []spec.RDMARecord{{Name: "ens11np0", IP: "10.247.1.11"}, {Name: "ens13np0", IP: "10.247.2.11"}},
 	}
 	destination := Target{
 		Name: "node2",
@@ -502,10 +618,10 @@ func TestRDMAPingItemsBuildCrossMatrix(t *testing.T) {
 		t.Fatalf("expected 2x2 cross matrix, got %#v", items)
 	}
 	want := []rdmaPingItem{
-		{SourceIndex: 0, DestinationIndex: 0, SourceName: "ens11np0", DestinationIP: "10.247.1.12"},
-		{SourceIndex: 0, DestinationIndex: 1, SourceName: "ens11np0", DestinationIP: "10.247.2.12"},
-		{SourceIndex: 1, DestinationIndex: 0, SourceName: "ens13np0", DestinationIP: "10.247.1.12"},
-		{SourceIndex: 1, DestinationIndex: 1, SourceName: "ens13np0", DestinationIP: "10.247.2.12"},
+		{SourceIndex: 0, DestinationIndex: 0, SourceName: "ens11np0", SourceIP: "10.247.1.11", DestinationName: "ens11np0", DestinationIP: "10.247.1.12"},
+		{SourceIndex: 0, DestinationIndex: 1, SourceName: "ens11np0", SourceIP: "10.247.1.11", DestinationName: "ens13np0", DestinationIP: "10.247.2.12"},
+		{SourceIndex: 1, DestinationIndex: 0, SourceName: "ens13np0", SourceIP: "10.247.2.11", DestinationName: "ens11np0", DestinationIP: "10.247.1.12"},
+		{SourceIndex: 1, DestinationIndex: 1, SourceName: "ens13np0", SourceIP: "10.247.2.11", DestinationName: "ens13np0", DestinationIP: "10.247.2.12"},
 	}
 	for index := range want {
 		if items[index] != want[index] {
@@ -570,6 +686,22 @@ func TestMarkLocalTargetsUsesLoopbackAddress(t *testing.T) {
 	targets := markLocalTargets([]Target{{Name: "self", Address: "127.0.0.1"}})
 	if len(targets) != 1 || !targets[0].Local {
 		t.Fatalf("expected loopback target to be local: %#v", targets)
+	}
+}
+
+func TestMarkLocalTargetsUsesHostname(t *testing.T) {
+	names := localHostnameSet()
+	var hostname string
+	for name := range names {
+		hostname = name
+		break
+	}
+	if hostname == "" {
+		t.Skip("local hostname is unavailable")
+	}
+	targets := markLocalTargets([]Target{{Input: hostname, Name: hostname, Address: hostname}})
+	if len(targets) != 1 || !targets[0].Local {
+		t.Fatalf("expected hostname target to be local: %#v", targets)
 	}
 }
 
@@ -715,7 +847,7 @@ counters.port_xmit_data: 10
 func TestCompareRDMADeviceCounterSnapshotsSummarizesAbnormalDeltas(t *testing.T) {
 	var output bytes.Buffer
 	opts := Options{
-		Bundle: spec.Bundle{Check: spec.CheckConfig{RDMAGroups: []spec.CheckRDMAGroup{{IBDevice: "mlx5_1"}}}},
+		Bundle: spec.Bundle{Check: spec.CheckConfig{Bandwidth: spec.CheckBandwidthConfig{RDMAGroups: []spec.CheckRDMAGroup{{IBDevice: "mlx5_1"}}}}},
 		Output: &output,
 	}
 	target := Target{Name: "node1"}

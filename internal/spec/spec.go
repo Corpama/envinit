@@ -1,6 +1,8 @@
 package spec
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -10,22 +12,19 @@ import (
 )
 
 type Bundle struct {
-	Defaults                     Defaults         `json:"defaults"`
-	Platform                     PlatformConfig   `json:"platform"`
-	PlatformOptions              PlatformOptions  `json:"platform_options"`
-	OfflineAPT                   OfflineAPTConfig `json:"offline_apt"`
-	OfflineRepo                  OfflineAPTConfig `json:"offline_repo"`
-	Packages                     []string         `json:"packages"`
-	Artifacts                    Artifacts        `json:"artifacts"`
-	XRE                          XREConfig        `json:"xre"`
-	MlxConfig                    MlxConfig        `json:"mlxconfig"`
-	Check                        CheckConfig      `json:"check"`
-	TopLevelRDMAExsist           *bool            `json:"rdma_exsist,omitempty"`
-	TopLevelRDMAExist            *bool            `json:"rdma_exist,omitempty"`
-	TopLevelRDMAConfigureIPRoute *bool            `json:"rdma_configure_ip_route,omitempty"`
-	PostPackages                 []string         `json:"post_packages"`
-	PostTasks                    []PostTask       `json:"post_tasks"`
-	PostPowerAction              PostPowerAction  `json:"post_power_action"`
+	Defaults        Defaults         `json:"defaults"`
+	Platform        PlatformConfig   `json:"platform"`
+	PlatformOptions PlatformOptions  `json:"platform_options"`
+	OfflineAPT      OfflineAPTConfig `json:"offline_apt"`
+	OfflineRepo     OfflineAPTConfig `json:"offline_repo"`
+	Packages        []string         `json:"packages"`
+	Artifacts       Artifacts        `json:"artifacts"`
+	XRE             XREConfig        `json:"xre"`
+	MlxConfig       MlxConfig        `json:"mlxconfig"`
+	Check           CheckConfig      `json:"check"`
+	PostPackages    []string         `json:"post_packages"`
+	PostTasks       []PostTask       `json:"post_tasks"`
+	PostPowerAction PostPowerAction  `json:"post_power_action"`
 }
 
 type Defaults struct {
@@ -44,9 +43,7 @@ type Defaults struct {
 	RDMAMTU                    int                    `json:"rdma_mtu"`
 	RDMARouteCIDR              string                 `json:"rdma_route_cidr"`
 	RoutePriority              int                    `json:"route_priority"`
-	RDMAExsist                 *bool                  `json:"rdma_exsist,omitempty"`
-	RDMAExist                  *bool                  `json:"rdma_exist,omitempty"`
-	RDMAConfigureIPRoute       *bool                  `json:"rdma_configure_ip_route,omitempty"`
+	RDMAMode                   string                 `json:"rdma_mode,omitempty"`
 	ConfigureManagementNetwork *bool                  `json:"configure_management_network,omitempty"`
 	ApplyNetworkImmediately    *bool                  `json:"apply_network_immediately,omitempty"`
 	BackupExistingNetplan      bool                   `json:"backup_existing_netplan"`
@@ -56,9 +53,16 @@ type Defaults struct {
 	RDMAInterfaces             []RDMAInterfaceDefault `json:"rdma_interfaces"`
 }
 
+const (
+	RDMAModeFull      = "full"
+	RDMAModeNamesOnly = "names_only"
+	RDMAModeOff       = "off"
+)
+
 type PlatformOptions struct {
 	Ubuntu UbuntuPlatformOptions `json:"ubuntu"`
-	RedHat RedHatPlatformOptions `json:"redhat"`
+	Kylin  YumPlatformOptions    `json:"kylin"`
+	RedHat YumPlatformOptions    `json:"redhat"`
 }
 
 type UbuntuPlatformOptions struct {
@@ -66,7 +70,7 @@ type UbuntuPlatformOptions struct {
 	DisableExistingAptSources *bool `json:"disable_existing_apt_sources,omitempty"`
 }
 
-type RedHatPlatformOptions struct {
+type YumPlatformOptions struct {
 	BackupExistingNetwork *bool `json:"backup_existing_network,omitempty"`
 	DisableExistingRepos  *bool `json:"disable_existing_repos,omitempty"`
 }
@@ -113,27 +117,139 @@ type MlxConfig struct {
 }
 
 type CheckConfig struct {
-	Duration            int              `json:"duration"`
-	GIDIndex            int              `json:"gid_index"`
-	Iterations          int              `json:"iterations"`
-	BandwidthQPs        int              `json:"bandwidth_qps"`
-	MessageSize         int              `json:"message_size"`
-	ReportGBits         bool             `json:"report_gbits"`
-	MmapDevice          string           `json:"mmap_device"`
-	MinGBits            float64          `json:"min_gbits"`
-	Parallel            bool             `json:"parallel"`
-	BasePort            int              `json:"base_port"`
-	RDMAPingCount       int              `json:"rdma_ping_count"`
-	RDMAPingPayloadSize int              `json:"rdma_ping_payload_size"`
-	RDMAPingTimeout     int              `json:"rdma_ping_timeout"`
-	SSHUser             string           `json:"ssh_user"`
-	SSHOptions          []string         `json:"ssh_options"`
-	RDMAGroups          []CheckRDMAGroup `json:"rdma_groups"`
+	Bandwidth CheckBandwidthConfig `json:"bandwidth"`
+	RDMAPing  CheckRDMAPingConfig  `json:"rdma_ping"`
+	SSH       CheckSSHConfig       `json:"ssh"`
+	XCCL      CheckXCCLConfig      `json:"xccl"`
+}
+
+type CheckBandwidthConfig struct {
+	Duration     int              `json:"duration"`
+	GIDIndex     int              `json:"gid_index"`
+	Iterations   int              `json:"iterations"`
+	BandwidthQPs int              `json:"bandwidth_qps"`
+	MessageSize  int              `json:"message_size"`
+	ReportGBits  bool             `json:"report_gbits"`
+	MmapDevice   string           `json:"mmap_device"`
+	MinGBits     float64          `json:"min_gbits"`
+	Parallel     bool             `json:"parallel"`
+	BasePort     int              `json:"base_port"`
+	RDMAGroups   []CheckRDMAGroup `json:"rdma_groups,omitempty"`
+}
+
+type CheckRDMAPingConfig struct {
+	Count       int `json:"count"`
+	PayloadSize int `json:"payload_size"`
+	Timeout     int `json:"timeout"`
+}
+
+type CheckSSHConfig struct {
+	User    string   `json:"user"`
+	Options []string `json:"options"`
+}
+
+func (c *CheckConfig) UnmarshalJSON(data []byte) error {
+	type checkConfigAlias CheckConfig
+	var decoded checkConfigAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	allowed := map[string]bool{
+		"bandwidth": true, "rdma_ping": true, "ssh": true, "xccl": true,
+		"duration": true, "gid_index": true, "iterations": true, "bandwidth_qps": true,
+		"message_size": true, "report_gbits": true, "mmap_device": true, "min_gbits": true,
+		"parallel": true, "base_port": true, "rdma_groups": true,
+		"rdma_ping_count": true, "rdma_ping_payload_size": true, "rdma_ping_timeout": true,
+		"ssh_user": true, "ssh_options": true,
+	}
+	for key := range raw {
+		if !allowed[key] {
+			return fmt.Errorf("json: unknown field %q", key)
+		}
+	}
+	for key, target := range map[string]any{
+		"bandwidth": &decoded.Bandwidth,
+		"rdma_ping": &decoded.RDMAPing,
+		"ssh":       &decoded.SSH,
+		"xccl":      &decoded.XCCL,
+	} {
+		value, ok := raw[key]
+		if !ok {
+			continue
+		}
+		if err := decodeStrictJSON(value, target); err != nil {
+			return err
+		}
+	}
+	if _, nested := raw["bandwidth"]; !nested {
+		var legacy CheckBandwidthConfig
+		if err := json.Unmarshal(data, &legacy); err != nil {
+			return err
+		}
+		decoded.Bandwidth = legacy
+	}
+	var legacy struct {
+		RDMAPingCount       int      `json:"rdma_ping_count"`
+		RDMAPingPayloadSize int      `json:"rdma_ping_payload_size"`
+		RDMAPingTimeout     int      `json:"rdma_ping_timeout"`
+		SSHUser             string   `json:"ssh_user"`
+		SSHOptions          []string `json:"ssh_options"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+	if _, nested := raw["rdma_ping"]; !nested {
+		decoded.RDMAPing = CheckRDMAPingConfig{
+			Count:       legacy.RDMAPingCount,
+			PayloadSize: legacy.RDMAPingPayloadSize,
+			Timeout:     legacy.RDMAPingTimeout,
+		}
+	}
+	if _, nested := raw["ssh"]; !nested {
+		decoded.SSH = CheckSSHConfig{
+			User:    legacy.SSHUser,
+			Options: legacy.SSHOptions,
+		}
+	}
+	*c = CheckConfig(decoded)
+	return nil
+}
+
+func decodeStrictJSON(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(target)
+}
+
+type CheckXCCLConfig struct {
+	Enabled            bool              `json:"enabled"`
+	MPICHArchive       string            `json:"mpich_archive"`
+	XCCLArchive        string            `json:"xccl_archive"`
+	WorkRoot           string            `json:"work_root"`
+	XPUHome            string            `json:"xpu_home"`
+	Test               string            `json:"test"`
+	MinBytes           string            `json:"min_bytes"`
+	MaxBytes           string            `json:"max_bytes"`
+	StepFactor         int               `json:"step_factor"`
+	WarmupIterations   int               `json:"warmup_iterations"`
+	Iterations         int               `json:"iterations"`
+	DataType           string            `json:"data_type"`
+	Timeout            int               `json:"timeout"`
+	EnableXDR          *bool             `json:"enable_xdr,omitempty"`
+	Supernode          bool              `json:"supernode"`
+	SocketInterface    string            `json:"socket_interface"`
+	MinBusBandwidthGBs float64           `json:"min_bus_bandwidth_gbs"`
+	Environment        map[string]string `json:"environment"`
 }
 
 type CheckRDMAGroup struct {
-	IBDevice   string   `json:"ib_device"`
-	XPUOffsets []string `json:"xpu_offsets"`
+	IBDevice         string            `json:"ib_device"`
+	XPUOffsets       []string          `json:"xpu_offsets"`
+	XPUTopologyLinks map[string]string `json:"-"`
 }
 
 type PostTask struct {
@@ -167,12 +283,13 @@ type MachineRecord struct {
 }
 
 type RDMARecord struct {
-	Name    string
-	MAC     string
-	IP      string
-	Prefix  string
-	Gateway string
-	Table   string
+	Name      string
+	MAC       string
+	IP        string
+	Prefix    string
+	Gateway   string
+	Table     string
+	RouteCIDR string
 }
 
 type MachineConfig struct {
@@ -198,12 +315,13 @@ type MachineConfig struct {
 }
 
 type RDMAConfig struct {
-	Name    string
-	MAC     string
-	IP      string
-	Prefix  int
-	Gateway string
-	Table   int
+	Name      string
+	MAC       string
+	IP        string
+	Prefix    int
+	Gateway   string
+	Table     int
+	RouteCIDR string
 }
 
 func (b *Bundle) ApplyDefaults() {
@@ -235,12 +353,10 @@ func (b *Bundle) ApplyDefaults() {
 	if b.Defaults.RDMAMTU == 0 {
 		b.Defaults.RDMAMTU = 9000
 	}
-	if b.Defaults.RDMARouteCIDR == "" {
-		b.Defaults.RDMARouteCIDR = "11.1.0.0/21"
-	}
 	if b.Defaults.RoutePriority == 0 {
 		b.Defaults.RoutePriority = 32761
 	}
+	b.Defaults.RDMAMode = normalizeRDMAMode(b.Defaults.RDMAMode)
 	if b.RDMAExists() && len(b.Defaults.RDMAInterfaces) == 0 {
 		b.Defaults.RDMAInterfaces = []RDMAInterfaceDefault{
 			{Name: "ens11np0", Table: 101},
@@ -275,30 +391,67 @@ func (b *Bundle) ApplyDefaults() {
 	if b.Artifacts.WorkDir == "" {
 		b.Artifacts.WorkDir = "/opt/kunlun"
 	}
-	if b.Check.Duration == 0 {
-		b.Check.Duration = 1
+	if b.Check.Bandwidth.Duration == 0 {
+		b.Check.Bandwidth.Duration = 1
 	}
-	if b.Check.GIDIndex == 0 {
-		b.Check.GIDIndex = 3
+	if b.Check.Bandwidth.GIDIndex == 0 {
+		b.Check.Bandwidth.GIDIndex = 3
 	}
-	if b.Check.Iterations == 0 {
-		b.Check.Iterations = 100
+	if b.Check.Bandwidth.Iterations == 0 {
+		b.Check.Bandwidth.Iterations = 100
 	}
-	b.Check.ReportGBits = true
-	if b.Check.BasePort == 0 {
-		b.Check.BasePort = 18515
+	b.Check.Bandwidth.ReportGBits = true
+	if b.Check.Bandwidth.BasePort == 0 {
+		b.Check.Bandwidth.BasePort = 18515
 	}
-	if b.Check.RDMAPingCount == 0 {
-		b.Check.RDMAPingCount = 3
+	if b.Check.RDMAPing.Count == 0 {
+		b.Check.RDMAPing.Count = 3
 	}
-	if b.Check.RDMAPingPayloadSize == 0 {
-		b.Check.RDMAPingPayloadSize = 8972
+	if b.Check.RDMAPing.PayloadSize == 0 {
+		b.Check.RDMAPing.PayloadSize = 8972
 	}
-	if b.Check.RDMAPingTimeout == 0 {
-		b.Check.RDMAPingTimeout = 2
+	if b.Check.RDMAPing.Timeout == 0 {
+		b.Check.RDMAPing.Timeout = 2
 	}
-	if b.Check.SSHUser == "" {
-		b.Check.SSHUser = "root"
+	if b.Check.SSH.User == "" {
+		b.Check.SSH.User = "root"
+	}
+	if b.Check.XCCL.WorkRoot == "" {
+		b.Check.XCCL.WorkRoot = "/tmp/envinit-xccl-check"
+	}
+	if b.Check.XCCL.XPUHome == "" {
+		b.Check.XCCL.XPUHome = "/usr/local/xpu"
+	}
+	if b.Check.XCCL.Test == "" {
+		b.Check.XCCL.Test = "all_reduce"
+	}
+	if b.Check.XCCL.MinBytes == "" {
+		b.Check.XCCL.MinBytes = "128m"
+	}
+	if b.Check.XCCL.MaxBytes == "" {
+		b.Check.XCCL.MaxBytes = "128m"
+	}
+	if b.Check.XCCL.StepFactor == 0 {
+		b.Check.XCCL.StepFactor = 2
+	}
+	if b.Check.XCCL.WarmupIterations == 0 {
+		b.Check.XCCL.WarmupIterations = 5
+	}
+	if b.Check.XCCL.Iterations == 0 {
+		b.Check.XCCL.Iterations = 20
+	}
+	if b.Check.XCCL.DataType == "" {
+		b.Check.XCCL.DataType = "float"
+	}
+	if b.Check.XCCL.Timeout == 0 {
+		b.Check.XCCL.Timeout = 120
+	}
+	if b.Check.XCCL.EnableXDR == nil {
+		enabled := true
+		b.Check.XCCL.EnableXDR = &enabled
+	}
+	if b.Check.XCCL.Environment == nil {
+		b.Check.XCCL.Environment = map[string]string{}
 	}
 	if b.PostPowerAction.Action == "" {
 		confirm := true
@@ -310,7 +463,15 @@ func (b *Bundle) ApplyDefaults() {
 }
 
 func (b Bundle) Validate() error {
-	return b.Platform.Validate()
+	if err := b.Platform.Validate(); err != nil {
+		return err
+	}
+	switch normalizeRDMAMode(b.Defaults.RDMAMode) {
+	case RDMAModeFull, RDMAModeNamesOnly, RDMAModeOff:
+		return nil
+	default:
+		return fmt.Errorf("defaults.rdma_mode %q is not supported; use full, names_only, or off", b.Defaults.RDMAMode)
+	}
 }
 
 func (p *PlatformConfig) ApplyDefaults() {
@@ -410,7 +571,7 @@ func inferOSFamily(packageManager string, networkBackend string) string {
 
 func isRedHatFamily(osFamily string) bool {
 	switch strings.TrimSpace(strings.ToLower(osFamily)) {
-	case "redhat", "rhel", "centos", "kylin", "rocky", "almalinux", "anolis":
+	case "redhat", "rhel", "kylin", "rocky", "almalinux", "anolis":
 		return true
 	default:
 		return false
@@ -418,14 +579,19 @@ func isRedHatFamily(osFamily string) bool {
 }
 
 func (b Bundle) RDMAExists() bool {
-	return firstConfiguredBool(true, b.TopLevelRDMAExist, b.TopLevelRDMAExsist, b.Defaults.RDMAExist, b.Defaults.RDMAExsist)
+	return normalizeRDMAMode(b.Defaults.RDMAMode) != RDMAModeOff
 }
 
 func (b Bundle) RDMAConfigureIPRoute() bool {
-	if !b.RDMAExists() {
-		return false
+	return normalizeRDMAMode(b.Defaults.RDMAMode) == RDMAModeFull
+}
+
+func normalizeRDMAMode(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return RDMAModeFull
 	}
-	return firstConfiguredBool(true, b.TopLevelRDMAConfigureIPRoute, b.Defaults.RDMAConfigureIPRoute)
+	return value
 }
 
 func (b Bundle) ConfigureManagementNetwork() bool {
@@ -445,11 +611,30 @@ func (b Bundle) DisableExistingAptSources() bool {
 }
 
 func (b Bundle) BackupExistingNetwork() bool {
-	return firstConfiguredBool(b.Defaults.BackupExistingNetwork, b.PlatformOptions.RedHat.BackupExistingNetwork)
+	return firstConfiguredBool(b.Defaults.BackupExistingNetwork, b.yumPlatformOptions().BackupExistingNetwork)
 }
 
 func (b Bundle) DisableExistingRepos() bool {
-	return firstConfiguredBool(b.Defaults.DisableExistingRepos || b.Defaults.DisableExistingAptSources, b.PlatformOptions.RedHat.DisableExistingRepos)
+	return firstConfiguredBool(b.Defaults.DisableExistingRepos || b.Defaults.DisableExistingAptSources, b.yumPlatformOptions().DisableExistingRepos)
+}
+
+func (b Bundle) yumPlatformOptions() YumPlatformOptions {
+	switch strings.TrimSpace(strings.ToLower(b.Platform.OSFamily)) {
+	case "kylin":
+		return mergeYumPlatformOptions(b.PlatformOptions.RedHat, b.PlatformOptions.Kylin)
+	default:
+		return b.PlatformOptions.RedHat
+	}
+}
+
+func mergeYumPlatformOptions(fallback YumPlatformOptions, override YumPlatformOptions) YumPlatformOptions {
+	if override.BackupExistingNetwork == nil {
+		override.BackupExistingNetwork = fallback.BackupExistingNetwork
+	}
+	if override.DisableExistingRepos == nil {
+		override.DisableExistingRepos = fallback.DisableExistingRepos
+	}
+	return override
 }
 
 func firstConfiguredBool(defaultValue bool, values ...*bool) bool {
@@ -529,14 +714,22 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 		}
 	}
 
-	rdma := make([]RDMAConfig, 0, len(bundle.Defaults.RDMAInterfaces))
+	rdmaCount := maxInt(len(bundle.Defaults.RDMAInterfaces), len(record.RDMA))
+	rdma := make([]RDMAConfig, 0, rdmaCount)
 	if bundle.RDMAExists() {
-		for idx, def := range bundle.Defaults.RDMAInterfaces {
+		for idx := 0; idx < rdmaCount; idx++ {
+			def := RDMAInterfaceDefault{
+				Table: 101 + idx,
+			}
+			if idx < len(bundle.Defaults.RDMAInterfaces) {
+				def = bundle.Defaults.RDMAInterfaces[idx]
+			}
 			item := RDMAConfig{
-				Name:    def.Name,
-				Prefix:  bundle.Defaults.RDMAPrefix,
-				Gateway: strings.TrimSpace(def.Gateway),
-				Table:   def.Table,
+				Name:      def.Name,
+				Prefix:    bundle.Defaults.RDMAPrefix,
+				Gateway:   strings.TrimSpace(def.Gateway),
+				Table:     def.Table,
+				RouteCIDR: strings.TrimSpace(bundle.Defaults.RDMARouteCIDR),
 			}
 			if idx < len(record.RDMA) {
 				row := record.RDMA[idx]
@@ -565,6 +758,12 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 					}
 					item.Table = t
 				}
+				if strings.TrimSpace(row.RouteCIDR) != "" {
+					item.RouteCIDR = strings.TrimSpace(row.RouteCIDR)
+				}
+			}
+			if item.Name == "" {
+				item.Name = fmt.Sprintf("rdma%d", idx+1)
 			}
 			if bundle.RDMAConfigureIPRoute() && item.IP == "" {
 				return MachineConfig{}, fmt.Errorf("inventory row missing rdma%d_ip", idx+1)
@@ -629,6 +828,11 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 		if item.Gateway != "" {
 			if err := validateIPv4(item.Gateway); err != nil {
 				return MachineConfig{}, fmt.Errorf("invalid %s gateway: %w", item.Name, err)
+			}
+		}
+		if item.RouteCIDR != "" && !strings.EqualFold(item.RouteCIDR, "auto") {
+			if err := validateIPv4CIDR(item.RouteCIDR); err != nil {
+				return MachineConfig{}, fmt.Errorf("invalid %s route CIDR: %w", item.Name, err)
 			}
 		}
 	}
@@ -711,6 +915,14 @@ func validateIPv4(ip string) error {
 	return nil
 }
 
+func validateIPv4CIDR(cidr string) error {
+	parsedIP, parsedCIDR, err := net.ParseCIDR(strings.TrimSpace(cidr))
+	if err != nil || parsedIP == nil || parsedIP.To4() == nil || parsedCIDR == nil {
+		return fmt.Errorf("%q is not a valid IPv4 CIDR", cidr)
+	}
+	return nil
+}
+
 func NormalizeMAC(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -764,6 +976,13 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func maxInt(left int, right int) int {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func stringInSlice(needle string, haystack []string) bool {

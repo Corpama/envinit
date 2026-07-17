@@ -1,0 +1,121 @@
+{
+  "defaults": {
+    "configure_management_network": true,
+    "apply_network_immediately": false,
+    "mgmt_bond_name": "bond0",
+    "mgmt_interfaces": [],
+    "mgmt_prefix": 26,
+    "mgmt_gateway": "10.101.9.1",
+    "mgmt_nameservers": [],
+    "mgmt_mtu": 1500,
+    "bond_mode": "802.3ad",
+    "bond_lacp_rate": "slow",
+    "bond_transmit_hash_policy": "layer3+4",
+    "bond_mii_monitor_interval": 100,
+    "bond_primary": "",
+    "rdma_prefix": 24,
+    "rdma_mtu": 9000,
+    "rdma_route_cidr": "",
+    "rdma_mode": "full",
+    "route_priority": 32761,
+    "rdma_interfaces": []
+  },
+  "platform": {
+    "os_family": "kylin",
+    "package_manager": "yum",
+    "network_backend": "auto",
+    "kernel_headers_package": "",
+    "kernel_headers_dir": ""
+  },
+  "platform_options": {
+    "kylin": {
+      "backup_existing_network": true,
+      "disable_existing_repos": false
+    }
+  },
+  "offline_repo": {
+    "enabled": true,
+    "material_path": "data/rpm-repo",
+    "copy_to": "/opt/kunlun-rpm-repo",
+    "target_file": "",
+    "entries": []
+  },
+  "packages": [
+    "gcc",
+    "make",
+    "bzip2",
+    "lsof",
+    "ipmitool"
+  ],
+  "artifacts": {
+    "work_dir": "/opt/kunlun",
+    "ofed_archive": "data/hca/mellanox/MLNX_OFED_LINUX-24.01-0.3.3.1-kylin10sp3-x86_64.tar",
+    "xre_installer": "data/xpu_driver/xre-Linux-x86_64-5.19.0.0.run",
+    "xre_args": [
+      "-q"
+    ],
+    "xdr_archive": "data/xpu_driver/xdr_copy-x86_64_1.1.0.6.tar.gz",
+    "firmware_archive": "data/xpu_firmware/p800/update_fw_p800_2.15_1.48.tar.gz",
+    "container_packages": [
+      "data/xpu_container_toolkit/libxpu-container-tools-1.0.5-1.x86_64.rpm",
+      "data/xpu_container_toolkit/libxpu-container1-1.0.5-1.x86_64.rpm",
+      "data/xpu_container_toolkit/xpu-container-toolkit-1.0.13-1.x86_64.rpm"
+    ]
+  },
+  "xre": {
+    "card_model": "P800"
+  },
+  "mlxconfig": {
+    "device_glob": "",
+    "settings": {}
+  },
+  "check": {
+    "bandwidth": {
+      "duration": 0,
+      "gid_index": 0,
+      "iterations": 100,
+      "bandwidth_qps": 0,
+      "message_size": 0,
+      "report_gbits": true,
+      "mmap_device": "",
+      "min_gbits": 0,
+      "parallel": false,
+      "base_port": 0
+    },
+    "rdma_ping": {
+      "count": 3,
+      "payload_size": 8972,
+      "timeout": 2
+    },
+    "ssh": {
+      "user": "root",
+      "options": []
+    },
+    "xccl": {
+      "enabled": true,
+      "mpich_archive": "data/misc/mpich-5.0.1-kylin10sp3-x86_64.tar.gz",
+      "xccl_archive": "data/misc/xccl_Linux_x86_64-3.2.2.0.tar.gz",
+      "work_root": "/tmp/envinit-xccl-check",
+      "xpu_home": "/usr/local/xpu",
+      "test": "all_reduce",
+      "min_bytes": "128m",
+      "max_bytes": "128m",
+      "step_factor": 2,
+      "warmup_iterations": 5,
+      "iterations": 20,
+      "data_type": "float",
+      "timeout": 120,
+      "enable_xdr": true,
+      "supernode": false,
+      "socket_interface": "",
+      "min_bus_bandwidth_gbs": 0,
+      "environment": {}
+    }
+  },
+  "post_packages": [],
+  "post_tasks": [],
+  "post_power_action": {
+    "action": "soft",
+    "confirm": true
+  }
+}

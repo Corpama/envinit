@@ -19,3 +19,18 @@ env_tool/data/
 # Release assembly output
 /.release-work/
 /release/
+
+# Local release materials and build outputs
+/data/
+/dist/
+/env_tool_test/
+/extracted/
+/iso/
+/tmp/
+/build/*
+!/build/mpich-5.0.1/
+/build/mpich-5.0.1/*
+!/build/mpich-5.0.1/build-ubuntu.sh
+!/build/mpich-5.0.1/build-kylin.sh
+!/build/mpich-5.0.1/container-build.sh
+!/build/mpich-5.0.1/hello.c

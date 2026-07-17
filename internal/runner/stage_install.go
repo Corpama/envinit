@@ -140,6 +140,9 @@ func (a *App) runOFEDStage() error {
 		a.logf("skip ofed: ofed_archive not configured")
 		return nil
 	}
+	if err := a.ensureOFEDPrerequisites(); err != nil {
+		return err
+	}
 
 	extractDir := filepath.Join(a.Bundle.Artifacts.WorkDir, "ofed-"+a.now().Format("20060102-150405"))
 	if !a.DryRun {
@@ -171,6 +174,70 @@ func (a *App) runOFEDStage() error {
 		"--skip-distro-check",
 		"--force",
 	)
+}
+
+func (a *App) ensureOFEDPrerequisites() error {
+	packages, err := a.ofedPrerequisitePackages()
+	if err != nil {
+		return err
+	}
+	if len(packages) == 0 {
+		return nil
+	}
+	if a.DryRun {
+		a.logf("dry-run: would ensure OFED prerequisite packages before install: %s", strings.Join(packages, " "))
+		return nil
+	}
+	missing, err := a.missingOFEDPrerequisitePackages(packages)
+	if err != nil {
+		return err
+	}
+	if len(missing) == 0 {
+		a.logf("OFED prerequisite packages are already installed: %s", strings.Join(packages, " "))
+		return nil
+	}
+	a.logf("install missing OFED prerequisite packages: %s", strings.Join(missing, " "))
+	if a.usesYum() {
+		args := append([]string{"install", "-y"}, missing...)
+		return a.runCmd("", nil, "yum", args...)
+	}
+	if err := a.runCmd("", nil, "apt-get", "update"); err != nil {
+		return err
+	}
+	args := append([]string{"install", "-y"}, missing...)
+	return a.runCmd("", nil, "apt-get", args...)
+}
+
+func (a *App) ofedPrerequisitePackages() ([]string, error) {
+	if a.usesYum() {
+		return []string{"elfutils-devel"}, nil
+	}
+	unameR, err := a.unameR()
+	if err != nil {
+		return nil, err
+	}
+	return []string{
+		expandUnameTemplate("linux-headers-{{uname_r}}", unameR),
+		"build-essential",
+		"debhelper",
+		"fakeroot",
+	}, nil
+}
+
+func (a *App) missingOFEDPrerequisitePackages(packages []string) ([]string, error) {
+	missing := make([]string, 0, len(packages))
+	for _, pkg := range packages {
+		var err error
+		if a.usesYum() {
+			_, err = a.captureCmd("", nil, "rpm", "-q", pkg)
+		} else {
+			_, err = a.captureCmd("", nil, "dpkg", "-s", pkg)
+		}
+		if err != nil {
+			missing = append(missing, pkg)
+		}
+	}
+	return missing, nil
 }
 
 func (a *App) runXREStage() error {
@@ -411,12 +478,17 @@ func (a *App) installLocalPackages(packages []string) error {
 
 func (a *App) runMlxConfigStage() error {
 	if !a.Bundle.RDMAExists() {
-		a.logf("skip mlxconfig: rdma_exsist=false")
+		a.logf("skip mlxconfig: rdma_mode=off")
 		return nil
 	}
 	if len(a.Bundle.MlxConfig.Settings) == 0 {
 		a.logf("skip mlxconfig: no settings configured")
 		return nil
+	}
+	if a.canConfirmNICBindingsForStandaloneStage() {
+		if _, err := a.confirmedNICBindings(); err != nil {
+			return err
+		}
 	}
 	if err := a.runCmd("", nil, "mst", "start"); err != nil {
 		return err
@@ -453,6 +525,11 @@ func (a *App) runMlxConfigStage() error {
 }
 
 func (a *App) runSysctlStage() error {
+	if a.canConfirmNICBindingsForStandaloneStage() {
+		if _, err := a.confirmedNICBindings(); err != nil {
+			return err
+		}
+	}
 	if err := a.ensureSysctlSettings(); err != nil {
 		return err
 	}

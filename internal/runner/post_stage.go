@@ -24,11 +24,16 @@ func (a *App) runPostStage() error {
 		return err
 	}
 	if a.Bundle.RDMAExists() {
+		if a.canConfirmNICBindingsForStandaloneStage() {
+			if _, err := a.confirmedNICBindings(); err != nil {
+				return err
+			}
+		}
 		if err := a.ensurePostBootService(); err != nil {
 			return err
 		}
 	} else {
-		a.logf("skip RDMA post-boot service: rdma_exsist=false")
+		a.logf("skip RDMA post-boot service: rdma_mode=off")
 	}
 	if err := a.runPostTasks(); err != nil {
 		return err
@@ -235,7 +240,10 @@ func (a *App) ensurePostBootService() error {
 	if err := a.runCmd("", nil, "systemctl", "daemon-reload"); err != nil {
 		return err
 	}
-	return a.runCmd("", nil, "systemctl", "enable", filepath.Base(postBootService))
+	if err := a.runCmd("", nil, "systemctl", "enable", filepath.Base(postBootService)); err != nil {
+		return err
+	}
+	return a.runCmd("", nil, "systemctl", "restart", filepath.Base(postBootService))
 }
 
 func (a *App) renderPostBootScriptWithExistingCustom() (string, error) {

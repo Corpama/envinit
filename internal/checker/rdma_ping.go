@@ -21,15 +21,15 @@ func runRDMAPingChecks(opts Options, targets []Target) []string {
 				if err != nil {
 					failures = append(failures, err.Error())
 					rows = append(rows, rdmaPingResultRow{
-						Status:          "FAIL",
-						Source:          pair[0].Name,
-						Destination:     pair[1].Name,
-						SourceRDMA:      "-",
-						DestinationRDMA: "-",
-						SourceIface:     "-",
-						Payload:         strconv.Itoa(opts.Bundle.Check.RDMAPingPayloadSize),
-						Result:          err.Error(),
-						Failure:         true,
+						Status:         "FAIL",
+						Source:         pair[0].Name,
+						Destination:    pair[1].Name,
+						SourceNIC:      "-",
+						DestinationNIC: "-",
+						SourceIP:       "-",
+						Payload:        strconv.Itoa(opts.Bundle.Check.RDMAPing.PayloadSize),
+						Result:         err.Error(),
+						Failure:        true,
 					})
 					continue
 				}
@@ -59,29 +59,29 @@ func runRDMAPingPair(opts Options, source Target, destination Target, items []rd
 		if errs[index] != nil {
 			failed++
 			rows[index] = rdmaPingResultRow{
-				Status:          "FAIL",
-				Source:          source.Name,
-				Destination:     destination.Name,
-				SourceRDMA:      rdmaLabel(item.SourceIndex),
-				DestinationRDMA: rdmaLabel(item.DestinationIndex),
-				SourceIface:     item.SourceName,
-				DestinationIP:   item.DestinationIP,
-				Payload:         strconv.Itoa(opts.Bundle.Check.RDMAPingPayloadSize),
-				Result:          compactTableCell(errs[index].Error()),
-				Failure:         true,
+				Status:         "FAIL",
+				Source:         source.Name,
+				Destination:    destination.Name,
+				SourceNIC:      firstNonEmpty(item.SourceName, rdmaNICLabel(source, item.SourceIndex)),
+				DestinationNIC: firstNonEmpty(item.DestinationName, rdmaNICLabel(destination, item.DestinationIndex)),
+				SourceIP:       item.SourceIP,
+				DestinationIP:  item.DestinationIP,
+				Payload:        strconv.Itoa(opts.Bundle.Check.RDMAPing.PayloadSize),
+				Result:         compactTableCell(errs[index].Error()),
+				Failure:        true,
 			}
 			continue
 		}
 		rows[index] = rdmaPingResultRow{
-			Status:          "PASS",
-			Source:          source.Name,
-			Destination:     destination.Name,
-			SourceRDMA:      rdmaLabel(item.SourceIndex),
-			DestinationRDMA: rdmaLabel(item.DestinationIndex),
-			SourceIface:     item.SourceName,
-			DestinationIP:   item.DestinationIP,
-			Payload:         strconv.Itoa(opts.Bundle.Check.RDMAPingPayloadSize),
-			Result:          "ok",
+			Status:         "PASS",
+			Source:         source.Name,
+			Destination:    destination.Name,
+			SourceNIC:      firstNonEmpty(item.SourceName, rdmaNICLabel(source, item.SourceIndex)),
+			DestinationNIC: firstNonEmpty(item.DestinationName, rdmaNICLabel(destination, item.DestinationIndex)),
+			SourceIP:       item.SourceIP,
+			DestinationIP:  item.DestinationIP,
+			Payload:        strconv.Itoa(opts.Bundle.Check.RDMAPing.PayloadSize),
+			Result:         "ok",
 		}
 	}
 	if failed > 0 {
@@ -137,9 +137,9 @@ func printRDMAPingResultTable(output io.Writer, rows []rdmaPingResultRow) {
 		for _, pair := range [][2]string{
 			{left.Source, right.Source},
 			{left.Destination, right.Destination},
-			{left.SourceRDMA, right.SourceRDMA},
-			{left.DestinationRDMA, right.DestinationRDMA},
-			{left.SourceIface, right.SourceIface},
+			{left.SourceNIC, right.SourceNIC},
+			{left.DestinationNIC, right.DestinationNIC},
+			{left.SourceIP, right.SourceIP},
 			{left.DestinationIP, right.DestinationIP},
 		} {
 			if pair[0] != pair[1] {
@@ -149,7 +149,7 @@ func printRDMAPingResultTable(output io.Writer, rows []rdmaPingResultRow) {
 		return false
 	})
 
-	headers := []string{"STATUS", "SOURCE", "DEST", "SOURCE_RDMA", "DEST_RDMA", "IFACE", "DEST_IP", "PAYLOAD", "RESULT"}
+	headers := []string{"STATUS", "SOURCE", "DEST", "SOURCE_NIC", "DEST_NIC", "SOURCE_IP", "DEST_IP", "PAYLOAD", "RESULT"}
 	widths := make([]int, len(headers))
 	for idx, header := range headers {
 		widths[idx] = len(header)
@@ -160,9 +160,9 @@ func printRDMAPingResultTable(output io.Writer, rows []rdmaPingResultRow) {
 			row.Status,
 			row.Source,
 			row.Destination,
-			row.SourceRDMA,
-			row.DestinationRDMA,
-			firstNonEmpty(row.SourceIface, "-"),
+			row.SourceNIC,
+			row.DestinationNIC,
+			firstNonEmpty(row.SourceIP, "-"),
 			firstNonEmpty(row.DestinationIP, "-"),
 			row.Payload,
 			firstNonEmpty(row.Result, "-"),
@@ -190,12 +190,21 @@ func printRDMAPingResultTable(output io.Writer, rows []rdmaPingResultRow) {
 func rdmaPingItems(bundle spec.Bundle, source Target, destination Target) ([]rdmaPingItem, error) {
 	maxItems := maxInt(len(source.RDMA), len(destination.RDMA), len(bundle.Defaults.RDMAInterfaces))
 	sourceNames := make([]string, maxItems)
+	sourceIPs := make([]string, maxItems)
+	destinationNames := make([]string, maxItems)
 	destinationIPs := make([]string, maxItems)
 	var missing []string
 	for idx := 0; idx < maxItems; idx++ {
 		destinationIP := ""
 		if idx < len(destination.RDMA) {
 			destinationIP = strings.TrimSpace(destination.RDMA[idx].IP)
+		}
+		destinationName := ""
+		if idx < len(destination.RDMA) {
+			destinationName = strings.TrimSpace(destination.RDMA[idx].Name)
+		}
+		if destinationName == "" && idx < len(bundle.Defaults.RDMAInterfaces) {
+			destinationName = strings.TrimSpace(bundle.Defaults.RDMAInterfaces[idx].Name)
 		}
 		sourceName := ""
 		if idx < len(source.RDMA) {
@@ -207,13 +216,22 @@ func rdmaPingItems(bundle spec.Bundle, source Target, destination Target) ([]rdm
 		if sourceName == "" && idx < len(source.RDMA) {
 			sourceName = strings.TrimSpace(source.RDMA[idx].IP)
 		}
+		sourceIP := ""
+		if idx < len(source.RDMA) {
+			sourceIP = strings.TrimSpace(source.RDMA[idx].IP)
+		}
 		if destinationIP == "" {
 			missing = append(missing, fmt.Sprintf("%s rdma%d_ip", destination.Name, idx+1))
+		}
+		if sourceIP == "" {
+			missing = append(missing, fmt.Sprintf("%s rdma%d_ip", source.Name, idx+1))
 		}
 		if sourceName == "" {
 			missing = append(missing, fmt.Sprintf("%s rdma%d_name", source.Name, idx+1))
 		}
 		sourceNames[idx] = sourceName
+		sourceIPs[idx] = sourceIP
+		destinationNames[idx] = destinationName
 		destinationIPs[idx] = destinationIP
 	}
 	if maxItems == 0 {
@@ -232,6 +250,8 @@ func rdmaPingItems(bundle spec.Bundle, source Target, destination Target) ([]rdm
 				SourceIndex:      sourceIndex,
 				DestinationIndex: destinationIndex,
 				SourceName:       sourceName,
+				SourceIP:         sourceIPs[sourceIndex],
+				DestinationName:  destinationNames[destinationIndex],
 				DestinationIP:    destinationIP,
 			})
 		}
@@ -246,7 +266,7 @@ func runRDMAPingOne(opts Options, source Target, destination Target, item rdmaPi
 		return nil
 	}
 	output, err := runCommand(opts.Bundle.Check, source, shellJoin(args))
-	path := fmt.Sprintf("%s %s(%s) -> %s %s(%s)", source.Name, rdmaLabel(item.SourceIndex), item.SourceName, destination.Name, rdmaLabel(item.DestinationIndex), item.DestinationIP)
+	path := fmt.Sprintf("%s %s -> %s %s(%s)", source.Name, firstNonEmpty(item.SourceName, rdmaLabel(item.SourceIndex)), destination.Name, firstNonEmpty(item.DestinationName, rdmaLabel(item.DestinationIndex)), item.DestinationIP)
 	if err != nil {
 		return fmt.Errorf("ping %s: %s", path, pingFailureSummary(output, err))
 	}
@@ -315,10 +335,10 @@ func compactTableCell(text string) string {
 func rdmaPingArgs(cfg spec.CheckConfig, item rdmaPingItem) []string {
 	return []string{
 		"ping",
-		"-c", strconv.Itoa(cfg.RDMAPingCount),
-		"-W", strconv.Itoa(cfg.RDMAPingTimeout),
+		"-c", strconv.Itoa(cfg.RDMAPing.Count),
+		"-W", strconv.Itoa(cfg.RDMAPing.Timeout),
 		"-M", "do",
-		"-s", strconv.Itoa(cfg.RDMAPingPayloadSize),
+		"-s", strconv.Itoa(cfg.RDMAPing.PayloadSize),
 		"-I", item.SourceName,
 		item.DestinationIP,
 	}
