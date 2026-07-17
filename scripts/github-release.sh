@@ -191,6 +191,7 @@ INVENTORY_ASSET_JSON="$(
 
 IFS=':' read -r -a PROFILE_IDS <<<"$RELEASE_PROFILES"
 PROFILE_ENTRIES=()
+ALIST_VERIFY_PATHS=("$BASE_ALIST_PATH" "$INVENTORY_ALIST_PATH")
 for profile_id in "${PROFILE_IDS[@]}"; do
   [[ -n "$profile_id" ]] || continue
 
@@ -247,6 +248,7 @@ for profile_id in "${PROFILE_IDS[@]}"; do
         inventory: $inventory
       }'
   )")
+  ALIST_VERIFY_PATHS+=("$PROFILE_ALIST_PATH" "$BUNDLE_ALIST_PATH")
 
   # Each profile contains several gigabytes of offline material. Release the
   # extracted tree and tar as soon as their hashes and manifest entry are
@@ -289,12 +291,48 @@ refresh_alist_dir() {
         '{path: $path, password: "", page: 1, per_page: 500, refresh: true}')" \
       "${ALIST_BASE_URL}/api/fs/list"
   )"
-  echo "AList refresh ${path}: $(jq -r '"code=\(.code // "unknown") message=\(.message // "unknown")"' <<<"$response")"
+  if ! jq -e 'select(.code == 200)' >/dev/null <<<"$response"; then
+    echo "error: AList refresh ${path} failed: $(jq -r '"code=\(.code // "unknown") message=\(.message // "unknown")"' <<<"$response")" >&2
+    return 1
+  fi
+  echo "AList refresh ${path}: code=200"
 }
+refresh_alist_dir "${ALIST_RELEASE_PREFIX%/}"
 refresh_alist_dir "${ALIST_RELEASE_PREFIX%/}/${RELEASE_TAG}"
 for profile_id in "${PROFILE_IDS[@]}"; do
   [[ -n "$profile_id" ]] || continue
   refresh_alist_dir "${ALIST_RELEASE_PREFIX%/}/${RELEASE_TAG}/${profile_id}"
+done
+
+verify_alist_file() {
+  local path="$1"
+  local attempt
+  local response
+
+  for attempt in {1..24}; do
+    response="$(
+      curl --fail --silent --show-error --retry 3 --retry-delay 2 \
+        --request POST \
+        --header 'Content-Type: application/json' \
+        --header "Authorization: ${ALIST_TOKEN}" \
+        --data "$(jq -nc --arg path "$path" \
+          '{path: $path, password: "", refresh: true}')" \
+        "${ALIST_BASE_URL}/api/fs/get"
+    )"
+    if jq -e 'select(.code == 200) | .data.raw_url | select(length > 0)' >/dev/null <<<"$response"; then
+      echo "AList verified ${path}"
+      return 0
+    fi
+    echo "AList file is not ready (${attempt}/24): ${path}: $(jq -r '"code=\(.code // "unknown") message=\(.message // "unknown")"' <<<"$response")"
+    sleep 5
+  done
+
+  echo "error: AList did not expose release file: ${path}" >&2
+  return 1
+}
+
+for alist_path in "${ALIST_VERIFY_PATHS[@]}"; do
+  verify_alist_file "$alist_path"
 done
 
 echo "==> Building cross-platform downloaders"
