@@ -113,7 +113,7 @@ func TestDownloadMaterialFileDoesNotSkipMissingNonEmptyFile(t *testing.T) {
 		RemotePath:   "/data/profiles/test/missing.rpm",
 		RelativePath: "missing.rpm",
 		Size:         1024,
-	})
+	}, nil)
 	if err == nil {
 		t.Fatal("downloadMaterialFile() succeeded for a missing non-empty file")
 	}
@@ -472,7 +472,7 @@ func TestRunManifestModeDownloadsAndAssemblesMaterialDirectory(t *testing.T) {
 	if got := materialRawDownloads.Load(); got != 2 {
 		t.Fatalf("completed materials were downloaded again, raw downloads=%d", got)
 	}
-	for _, want := range []string{"3 files from /data/profiles/kylin", "WARNING material " + staleZeroSizePath, "assembled: 2 files", "skipped 1 stale zero-size entry"} {
+	for _, want := range []string{"3 files from /data/profiles/kylin", "WARNING material " + staleZeroSizePath, "100.00%", "3/3 files", "assembled: 2 files", "skipped 1 stale zero-size entry"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("missing material output %q:\n%s", want, output.String())
 		}

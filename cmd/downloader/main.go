@@ -408,6 +408,8 @@ func downloadProfileMaterials(outputDir string, profile manifestProfile, token s
 		stdout = io.Discard
 	}
 	fmt.Fprintf(stdout, "Material profile %s: %d files from %s using %d workers\n", profile.ID, len(files), root, jobs)
+	progress := newMaterialProgress(stdout, files)
+	progress.start()
 
 	queue := make(chan materialFile, len(files))
 	for _, file := range files {
@@ -431,11 +433,12 @@ func downloadProfileMaterials(outputDir string, profile manifestProfile, token s
 				if stopped {
 					continue
 				}
-				if err := downloadMaterialFile(outputDir, profile.ID, token, file); err != nil {
+				if err := downloadMaterialFile(outputDir, profile.ID, token, file, progress); err != nil {
 					mu.Lock()
 					if errors.Is(err, errSkipStaleZeroSizeMaterial) {
 						skipped++
-						fmt.Fprintf(stdout, "WARNING material %s is listed as an empty file but its storage object is missing; skipping stale entry\n", file.RemotePath)
+						progress.completeFile()
+						progress.warning("material %s is listed as an empty file but its storage object is missing; skipping stale entry", file.RemotePath)
 					} else if firstErr == nil {
 						firstErr = err
 					}
@@ -449,6 +452,7 @@ func downloadProfileMaterials(outputDir string, profile manifestProfile, token s
 		}()
 	}
 	wg.Wait()
+	progress.finish()
 	if firstErr != nil {
 		return firstErr
 	}
@@ -606,7 +610,7 @@ func hashInfoValue(raw json.RawMessage, algorithm string) string {
 	return ""
 }
 
-func downloadMaterialFile(outputDir, profileID, token string, file materialFile) error {
+func downloadMaterialFile(outputDir, profileID, token string, file materialFile, progress *materialProgress) error {
 	dataRoot := filepath.Join(outputDir, "data")
 	output, err := assetOutputPath(dataRoot, filepath.FromSlash(file.RelativePath))
 	if err != nil {
@@ -617,6 +621,8 @@ func downloadMaterialFile(outputDir, profileID, token string, file materialFile)
 		return err
 	}
 	if complete {
+		progress.addExisting(file.Size)
+		progress.completeFile()
 		return nil
 	}
 	// Directory enumeration already refreshed the material tree. Avoid forcing
@@ -626,7 +632,7 @@ func downloadMaterialFile(outputDir, profileID, token string, file materialFile)
 		return fmt.Errorf("resolve material %s: %w", file.RemotePath, err)
 	}
 	partialOutput := output + ".part"
-	if err := downloadFile(partialOutput, downloadURL, false); err != nil {
+	if err := downloadFileWithProgress(partialOutput, downloadURL, false, progress.addExisting, progress.addDownloaded); err != nil {
 		var statusErr *downloadHTTPStatusError
 		if file.Size == 0 && file.SHA256 == "" && errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
 			_ = os.Remove(partialOutput)
@@ -652,6 +658,7 @@ func downloadMaterialFile(outputDir, profileID, token string, file materialFile)
 	if err := writeMaterialMarker(outputDir, profileID, file); err != nil {
 		return err
 	}
+	progress.completeFile()
 	return nil
 }
 
@@ -1034,6 +1041,10 @@ func download(output, url string) error {
 }
 
 func downloadFile(output, url string, reportProgress bool) error {
+	return downloadFileWithProgress(output, url, reportProgress, nil, nil)
+}
+
+func downloadFileWithProgress(output, url string, reportProgress bool, onExisting, onDownloaded func(int64)) error {
 	var offset int64
 	if info, err := os.Stat(output); err == nil {
 		offset = info.Size()
@@ -1047,6 +1058,9 @@ func downloadFile(output, url string, reportProgress bool) error {
 		return fmt.Errorf("create download request: %w", err)
 	}
 	if offset > 0 {
+		if onExisting != nil {
+			onExisting(offset)
+		}
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 		if reportProgress {
 			fmt.Printf("Resuming at byte %d\n", offset)
@@ -1080,6 +1094,9 @@ func downloadFile(output, url string, reportProgress bool) error {
 	case offset > 0 && resp.StatusCode == http.StatusPartialContent:
 		flags |= os.O_APPEND
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		if offset > 0 && onExisting != nil {
+			onExisting(-offset)
+		}
 		flags |= os.O_TRUNC
 	default:
 		return &downloadHTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
@@ -1095,7 +1112,11 @@ func downloadFile(output, url string, reportProgress bool) error {
 	defer file.Close()
 
 	start := time.Now()
-	written, err := io.Copy(file, body)
+	reader := io.Reader(body)
+	if onDownloaded != nil {
+		reader = io.TeeReader(body, byteProgressWriter{add: onDownloaded})
+	}
+	written, err := io.Copy(file, reader)
 	if err != nil {
 		return fmt.Errorf("write output: %w", err)
 	}

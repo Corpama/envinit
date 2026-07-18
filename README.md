@@ -162,6 +162,14 @@ chmod +x env_tool_downloader-linux-amd64
 
 base、bundle 和 inventory 使用 manifest 中的 SHA256 校验。profile 物料如果 AList 提供 SHA256，也逐文件校验；否则使用远端路径、大小和修改时间形成完成标记。记录保存在 `.envinit-downloads/`，中断下载会保留 `.part` 文件供续传，使用同一输出目录重复运行时会跳过未变化且已完成的文件。
 
+profile 物料开始组装后会显示聚合进度，而不是为 1000 多个文件分别刷屏：
+
+```text
+Material [===========                   ]  37.42%  2.67 GiB/7.14 GiB  183.60 MiB/s  641/1529 files
+```
+
+百分比和容量以 AList 列出的整个 profile 总字节数为分母；文件数表示已处理条目和总条目。速度只统计本轮实际从网络收到的字节，不把已校验文件或已有 `.part` 算入下载速度。交互终端中进度条会在同一行刷新；输出重定向到日志文件时只打印起始和最终状态，避免产生大量重复行。
+
 如果 AList 目录缓存中残留一个“大小为 0、没有 SHA256、实际 COS 对象已经不存在”的悬空条目，downloader 会输出 `WARNING ... skipping stale entry` 并跳过；本地正式 profile 不应包含这类条目，仍建议从 COS/AList 清理。任何非零物料或带 SHA256 的物料返回 404 都会继续作为错误终止，避免静默生成缺包的交付目录。
 
 版本边界需要特别区分：base、bundle 和 inventory 固定属于 downloader 对应的 release；`material_root` 指向长期维护的 profile 目录，物料本身不随 GitHub release tag 再复制一份。因此以后再次运行旧 downloader 时，会读取该 profile 目录当时可见的物料。需要完整复现某次历史交付时，应保留当时已经组装好的 `env_tool` 目录，不能只保留 downloader。
