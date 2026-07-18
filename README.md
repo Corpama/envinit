@@ -99,7 +99,7 @@ data/profiles/
     └── single_rpm/
 ```
 
-`data/profiles/` 是长期维护的物料区，不属于每个 GitHub release 的版本包。发版脚本不会读取、下载或重新打包这些大文件，只发布轻量的 base、各 profile 的 bundle、inventory 样例、manifest 和跨平台 downloader。manifest 为每个 profile 记录稳定物料目录，例如 `/data/profiles/ubuntu22.04-x86_64`。
+`data/profiles/` 是长期维护的物料区，不属于每个 GitHub release 的版本包。发版脚本不会读取、下载或重新打包这些大文件，只发布轻量的 base、各 profile 的 bundle、`inventory.csv`、manifest 和跨平台 downloader。manifest 为每个 profile 记录稳定物料目录，例如 `/data/profiles/ubuntu22.04-x86_64`。
 
 downloader 执行时才登录 AList，递归读取所选 profile 的物料目录，并把该目录下面的内容直接组装到输出目录的 `data/`。因此发布新版本不会为了几 GB 的离线源和驱动包触发一次完整物料读取，交付人员也不需要手工解包或搬运 profile 归档。
 
@@ -154,11 +154,11 @@ chmod +x env_tool_downloader-linux-amd64
 | `--jobs <n>` | profile 物料并发下载数，默认 6，最大 32 |
 | `--output <path>` | 仅兼容旧版“单归档 downloader”；当前内置 manifest/profile 的 release 不使用该参数，请使用 `--output-dir` |
 
-下载完成后，`planning/bundle.json` 会使用所选系统的模板，`data/` 来自该 profile 根目录，不会再携带另一个 profile 的目录。downloader 的筛选粒度到 profile 为止：除 `.DS_Store`、AppleDouble、`Thumbs.db` 外，它会递归拉取该根目录下的全部文件，不会再根据 bundle 路径自动过滤历史版本、源码展开目录或备用包。因此 AList 的 `/data/profiles/<profile>` 本身必须整理成可直接交付的最终物料集合。
+下载完成后只保留一个 `planning/` 目录，其中 `planning/bundle.json` 是 downloader 根据所选系统 profile 单独下载的模板，`planning/inventory.csv` 是一份可编辑的规划表。交付目录不再携带 `examples/`、`planning/templates/`、`inventory.sample.csv`，也不会同时放入两个系统的 bundle。`data/` 来自所选 profile 根目录，不会再携带另一个 profile 的目录。downloader 的筛选粒度到 profile 为止：除 `.DS_Store`、AppleDouble、`Thumbs.db` 外，它会递归拉取该根目录下的全部文件，不会再根据 bundle 路径自动过滤历史版本、源码展开目录或备用包。因此 AList 的 `/data/profiles/<profile>` 本身必须整理成可直接交付的最终物料集合。
 
 `--output-dir` 建议指向一个新的空目录，或者此前由同一 profile 组装的目录。同一 profile 重复运行是安全的，下载器会续传或跳过已完成文件；不要直接在 Ubuntu 已完成目录上改选 Kylin，下载器不会删除新 profile 中不存在的旧文件，否则两个系统的物料会混在一起。需要切换 profile 时请使用另一个输出目录，或先人工确认并清空旧交付目录。
 
-下载器会先校验并自动解包轻量 base，再写入所选 profile 的 bundle 和 inventory 样例，最后递归组装 profile 物料。它不依赖目标电脑预装 `tar`；Linux、macOS 和 Windows 分别使用对应的权限或文件属性处理逻辑，脚本和 `.run` 文件会恢复为可执行文件。目录遍历会忽略 `.DS_Store`、AppleDouble 和 `Thumbs.db` 等系统杂项文件。
+下载器会先校验并自动解包轻量 base，再把所选 profile 的 bundle 写为 `planning/bundle.json`、把统一规划表写为 `planning/inventory.csv`，最后递归组装 profile 物料。它不依赖目标电脑预装 `tar`；Linux、macOS 和 Windows 分别使用对应的权限或文件属性处理逻辑，脚本和 `.run` 文件会恢复为可执行文件。目录遍历会忽略 `.DS_Store`、AppleDouble 和 `Thumbs.db` 等系统杂项文件。
 
 base、bundle 和 inventory 使用 manifest 中的 SHA256 校验。bundle 本身是 JSON 文件，即使 COS 返回 `Content-Type: application/json` 也会作为正常资产下载；只有响应同时具有 AList 的 `code/message/data` 错误信封且 `code != 200` 时才按接口错误终止。profile 物料如果 AList 提供 SHA256，也逐文件校验；否则使用远端路径、大小和修改时间形成完成标记。记录保存在 `.envinit-downloads/`，中断下载会保留 `.part` 文件供续传，使用同一输出目录重复运行时会跳过未变化且已完成的文件。
 

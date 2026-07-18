@@ -243,6 +243,27 @@ func TestListAndSelectProfiles(t *testing.T) {
 	}
 }
 
+func TestProfileDownloadAssetsUseSinglePlanningDirectory(t *testing.T) {
+	manifest := releaseManifest{
+		Base: manifestAsset{Name: "env_tool-base.tar", Path: "/releases/v-test/env_tool-base.tar"},
+	}
+	profile := manifestProfile{
+		Bundle:    manifestAsset{Path: "/releases/v-test/kylin/bundle.json"},
+		Inventory: manifestAsset{Path: "/releases/v-test/inventory.csv"},
+	}
+
+	assets := profileDownloadAssets(manifest, profile)
+	if len(assets) != 3 {
+		t.Fatalf("profile assets = %d, want 3: %#v", len(assets), assets)
+	}
+	wantNames := []string{"env_tool-base.tar", "planning/bundle.json", "planning/inventory.csv"}
+	for idx, want := range wantNames {
+		if assets[idx].Name != want {
+			t.Fatalf("asset %d name = %q, want %q", idx, assets[idx].Name, want)
+		}
+	}
+}
+
 func TestRunManifestModeSupportsLegacyProfileArchives(t *testing.T) {
 	contents := map[string][]byte{
 		"/releases/v-test/env_tool-base.tar": deliveryTar(t, map[string]string{
@@ -371,6 +392,7 @@ func TestRunManifestModeDownloadsAndAssemblesMaterialDirectory(t *testing.T) {
 			"env_tool/README.md": "base readme",
 		}),
 		"/releases/v-test/kylin/bundle.json":                []byte(`{"platform":{"os_family":"kylin"}}`),
+		"/releases/v-test/inventory.csv":                    []byte("host_id,hostname\nnode1,node1\n"),
 		"/data/profiles/kylin/rpm-repo/repodata/repomd.xml": []byte("kylin repo"),
 		"/data/profiles/kylin/misc/install.sh":              []byte("#!/bin/sh\necho install\n"),
 	}
@@ -389,6 +411,10 @@ func TestRunManifestModeDownloadsAndAssemblesMaterialDirectory(t *testing.T) {
 			Bundle: manifestAsset{
 				Path:   "/releases/v-test/kylin/bundle.json",
 				SHA256: testSHA256(contents["/releases/v-test/kylin/bundle.json"]),
+			},
+			Inventory: manifestAsset{
+				Path:   "/releases/v-test/inventory.csv",
+				SHA256: testSHA256(contents["/releases/v-test/inventory.csv"]),
 			},
 		}},
 	}
@@ -484,6 +510,19 @@ func TestRunManifestModeDownloadsAndAssemblesMaterialDirectory(t *testing.T) {
 	}
 	assertFileContent(t, filepath.Join(outputDir, "env_init"), "base binary")
 	assertFileContent(t, filepath.Join(outputDir, "planning", "bundle.json"), `{"platform":{"os_family":"kylin"}}`)
+	assertFileContent(t, filepath.Join(outputDir, "planning", "inventory.csv"), "host_id,hostname\nnode1,node1\n")
+	planningEntries, err := os.ReadDir(filepath.Join(outputDir, "planning"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planningEntries) != 2 || planningEntries[0].Name() != "bundle.json" || planningEntries[1].Name() != "inventory.csv" {
+		t.Fatalf("planning entries = %v, want only bundle.json and inventory.csv", planningEntries)
+	}
+	for _, legacyPath := range []string{"examples", filepath.Join("planning", "templates"), filepath.Join("planning", "inventory.sample.csv")} {
+		if _, err := os.Stat(filepath.Join(outputDir, legacyPath)); !os.IsNotExist(err) {
+			t.Fatalf("legacy delivery path %s should not exist, stat err=%v", legacyPath, err)
+		}
+	}
 	assertFileContent(t, filepath.Join(outputDir, "data", "rpm-repo", "repodata", "repomd.xml"), "kylin repo")
 	assertFileContent(t, filepath.Join(outputDir, "data", "misc", "install.sh"), "#!/bin/sh\necho install\n")
 	if info, err := os.Stat(filepath.Join(outputDir, "data", "misc", "install.sh")); err != nil || info.Mode().Perm()&0o111 == 0 {

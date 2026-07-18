@@ -123,12 +123,6 @@ upload_file() {
 
 echo "==> Assembling env_tool base files"
 cp README.md "${STAGE_DIR}/env_tool/README.md"
-mkdir -p "${STAGE_DIR}/env_tool/planning/templates" "${STAGE_DIR}/env_tool/examples"
-cp examples/inventory.sample.csv "${STAGE_DIR}/env_tool/planning/inventory.sample.csv"
-cp examples/inventory.sample.csv "${STAGE_DIR}/env_tool/planning/inventory.csv"
-cp examples/bundle.ubuntu22.sample.json "${STAGE_DIR}/env_tool/planning/bundle.json"
-cp examples/bundle.ubuntu22.sample.json examples/bundle.kylin10sp3.sample.json "${STAGE_DIR}/env_tool/planning/templates/"
-cp examples/bundle.ubuntu22.sample.json examples/bundle.kylin10sp3.sample.json "${STAGE_DIR}/env_tool/examples/"
 cat > "${STAGE_DIR}/env_tool/run1.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -167,12 +161,12 @@ BASE_PACKAGE_SHA256="$(sha256sum "$BASE_PACKAGE_PATH" | awk '{print $1}')"
 printf '%s  %s\n' "$BASE_PACKAGE_SHA256" "$BASE_PACKAGE_NAME" > "${RELEASE_DIR}/SHA256SUMS"
 upload_file "$BASE_PACKAGE_PATH" "${COS_RELEASE_PREFIX}/${RELEASE_TAG}/${BASE_PACKAGE_NAME}"
 
-INVENTORY_RELEASE_PATH="${WORK_ROOT}/inventory.sample.csv"
+INVENTORY_RELEASE_PATH="${WORK_ROOT}/inventory.csv"
 cp examples/inventory.sample.csv "$INVENTORY_RELEASE_PATH"
 INVENTORY_SHA256="$(sha256sum "$INVENTORY_RELEASE_PATH" | awk '{print $1}')"
-INVENTORY_ALIST_PATH="${ALIST_RELEASE_PREFIX%/}/${RELEASE_TAG}/inventory.sample.csv"
-printf '%s  %s\n' "$INVENTORY_SHA256" "inventory.sample.csv" >> "${RELEASE_DIR}/SHA256SUMS"
-upload_file "$INVENTORY_RELEASE_PATH" "${COS_RELEASE_PREFIX}/${RELEASE_TAG}/inventory.sample.csv"
+INVENTORY_ALIST_PATH="${ALIST_RELEASE_PREFIX%/}/${RELEASE_TAG}/inventory.csv"
+printf '%s  %s\n' "$INVENTORY_SHA256" "inventory.csv" >> "${RELEASE_DIR}/SHA256SUMS"
+upload_file "$INVENTORY_RELEASE_PATH" "${COS_RELEASE_PREFIX}/${RELEASE_TAG}/inventory.csv"
 
 BASE_ASSET_JSON="$(
   jq -nc \
@@ -183,7 +177,7 @@ BASE_ASSET_JSON="$(
 )"
 INVENTORY_ASSET_JSON="$(
   jq -nc \
-    --arg name "planning/inventory.sample.csv" \
+    --arg name "planning/inventory.csv" \
     --arg path "$INVENTORY_ALIST_PATH" \
     --arg sha256 "$INVENTORY_SHA256" \
     '{name: $name, path: $path, sha256: $sha256}'

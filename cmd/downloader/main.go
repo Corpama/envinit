@@ -344,7 +344,7 @@ func profileDownloadAssets(manifest releaseManifest, profile manifestProfile) []
 	if strings.TrimSpace(profile.Inventory.Path) != "" {
 		inventory := profile.Inventory
 		if strings.TrimSpace(inventory.Name) == "" {
-			inventory.Name = "planning/inventory.sample.csv"
+			inventory.Name = "planning/inventory.csv"
 		}
 		assets = append(assets, inventory)
 	}
