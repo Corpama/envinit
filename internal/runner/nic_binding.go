@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"envinit/internal/nicdetect"
 	"envinit/internal/spec"
 )
 
@@ -21,6 +22,8 @@ type interfaceBinding struct {
 	Gateway     string
 	Table       int
 	NeedsReview bool
+	Reason      string
+	Confidence  string
 }
 
 type netDevice struct {
@@ -29,6 +32,8 @@ type netDevice struct {
 	PCI           string
 	Driver        string
 	SpeedMbps     int
+	MaxSpeedMbps  int
+	MTU           int
 	VendorID      string
 	DeviceID      string
 	PhysPortName  string
@@ -67,17 +72,24 @@ func (a *App) ensureAutoManagementInterfaces() error {
 	if len(a.Machine.MgmtIfaces) > 0 {
 		return nil
 	}
-	devices, err := a.discoverMgmtDevices()
+	allDevices, err := a.discoverNetDevices()
 	if err != nil {
 		return err
 	}
-	switch len(devices) {
-	case 0:
-		return fmt.Errorf("no management interfaces are configured and no non-RDMA management candidates were discovered; configure defaults.mgmt_interfaces or inventory mgmt_iface fields")
-	case 1, 2:
-	default:
-		return fmt.Errorf("no management interfaces are configured and discovered %d management candidates: %s; configure defaults.mgmt_interfaces or inventory mgmt_iface fields to avoid ambiguous bonding", len(devices), describeNetDevices(devices))
+	var matches [][]netDevice
+	for _, count := range []int{1, 2} {
+		decision := recommendNICRolesWithPlan(allDevices, nicdetect.Plan{ManagementCount: count})
+		if (decision.Confidence == nicdetect.ConfidenceStrong || decision.Confidence == nicdetect.ConfidenceExact) && len(decision.Management) == count {
+			matches = append(matches, netDevicesForBindings(allDevices, decision.Management))
+		}
 	}
+	if len(matches) == 0 {
+		return fmt.Errorf("no management interfaces are configured and no non-RDMA management candidates were discovered; configure defaults.mgmt_interfaces or inventory mgmt_iface fields")
+	}
+	if len(matches) > 1 {
+		return fmt.Errorf("management interface count is ambiguous between one and two ports: %s; configure defaults.mgmt_interfaces or inventory mgmt_iface fields", describeNetDevices(allDevices))
+	}
+	devices := matches[0]
 	a.Machine.MgmtIfaces = make([]string, 0, len(devices))
 	a.Machine.MgmtMACs = make([]string, 0, len(devices))
 	for _, device := range devices {
@@ -126,6 +138,8 @@ func (a *App) mgmtInterfaceBindings(deviceByMAC map[string]netDevice) ([]interfa
 			CurrentName: current,
 			Address:     plannedAddress(a.Machine.MgmtIP, a.Machine.MgmtPrefix),
 			Gateway:     a.Machine.MgmtGateway,
+			Reason:      "existing name/MAC",
+			Confidence:  nicdetect.ConfidenceExact,
 		})
 	}
 	return out, nil
@@ -160,6 +174,8 @@ func (a *App) rdmaInterfaceBindings(deviceByMAC map[string]netDevice) ([]interfa
 			Address:     plannedAddress(item.IP, item.Prefix),
 			Gateway:     item.Gateway,
 			Table:       item.Table,
+			Reason:      "MAC exact",
+			Confidence:  nicdetect.ConfidenceExact,
 		})
 	}
 	return out, nil
@@ -190,6 +206,8 @@ func (a *App) discoverMgmtBindings() ([]interfaceBinding, error) {
 			CurrentName: device.Name,
 			Address:     plannedAddress(a.Machine.MgmtIP, a.Machine.MgmtPrefix),
 			Gateway:     a.Machine.MgmtGateway,
+			Reason:      "unified hardware group",
+			Confidence:  nicdetect.ConfidenceStrong,
 		})
 	}
 	return out, nil
@@ -205,6 +223,8 @@ func (a *App) manualMgmtBindings(autoCandidates []netDevice) ([]interfaceBinding
 			Address:     plannedAddress(a.Machine.MgmtIP, a.Machine.MgmtPrefix),
 			Gateway:     a.Machine.MgmtGateway,
 			NeedsReview: true,
+			Reason:      "ambiguous hardware groups",
+			Confidence:  nicdetect.ConfidenceAmbiguous,
 		})
 	}
 	return out, nil
@@ -233,6 +253,8 @@ func (a *App) discoverRDMABindings() ([]interfaceBinding, error) {
 			Address:     plannedAddress(item.IP, item.Prefix),
 			Gateway:     item.Gateway,
 			Table:       item.Table,
+			Reason:      "unified hardware group",
+			Confidence:  nicdetect.ConfidenceStrong,
 		})
 	}
 	return out, nil
@@ -249,6 +271,8 @@ func (a *App) manualRDMABindings(autoCandidates []netDevice) []interfaceBinding 
 			Gateway:     item.Gateway,
 			Table:       item.Table,
 			NeedsReview: true,
+			Reason:      "ambiguous hardware groups",
+			Confidence:  nicdetect.ConfidenceAmbiguous,
 		})
 	}
 	return out
@@ -407,30 +431,14 @@ func (a *App) discoverMgmtDevices() ([]netDevice, error) {
 	if err != nil {
 		return nil, err
 	}
-	rdmaNames := map[string]bool{}
-	for _, item := range a.Machine.RDMA {
-		rdmaNames[item.Name] = true
-	}
-	rdmaMACs := map[string]bool{}
-	for _, item := range a.Machine.RDMA {
-		if strings.TrimSpace(item.MAC) != "" {
-			rdmaMACs[strings.TrimSpace(item.MAC)] = true
+	decision := a.recommendNICRoles(devices, len(a.Machine.MgmtIfaces), false)
+	if decision.Confidence == nicdetect.ConfidenceStrong || decision.Confidence == nicdetect.ConfidenceExact {
+		selected := netDevicesForBindings(devices, decision.Management)
+		if len(selected) == len(a.Machine.MgmtIfaces) {
+			return selected, nil
 		}
 	}
-	candidates := make([]netDevice, 0, len(devices))
-	for _, device := range devices {
-		if rdmaNames[device.Name] || rdmaMACs[device.MAC] {
-			continue
-		}
-		candidates = append(candidates, device)
-	}
-	if len(a.Machine.MgmtIfaces) == 0 {
-		sortNetDevices(candidates)
-		return candidates, nil
-	}
-	selected := selectMgmtDevices(candidates, len(a.Machine.MgmtIfaces))
-	sortNetDevicesPhysical(selected)
-	return selected, nil
+	return netDevicesExcludingBindings(devices, decision.RDMA), nil
 }
 
 func (a *App) discoverManualMgmtDevices() ([]netDevice, error) {
@@ -464,26 +472,91 @@ func (a *App) discoverRDMADevices() ([]netDevice, error) {
 	if err != nil {
 		return nil, err
 	}
-	mgmtNames := map[string]bool{}
-	for _, name := range a.Machine.MgmtIfaces {
-		mgmtNames[name] = true
-	}
-	mgmtMACs := map[string]bool{}
-	for _, mac := range a.Machine.MgmtMACs {
-		if strings.TrimSpace(mac) != "" {
-			mgmtMACs[strings.TrimSpace(mac)] = true
+	decision := a.recommendNICRoles(devices, len(a.Machine.MgmtIfaces), false)
+	if decision.Confidence == nicdetect.ConfidenceStrong || decision.Confidence == nicdetect.ConfidenceExact {
+		selected := netDevicesForBindings(devices, decision.RDMA)
+		if len(selected) == len(a.Machine.RDMA) {
+			return selected, nil
 		}
 	}
-	candidates := make([]netDevice, 0, len(devices))
-	for _, device := range devices {
-		if mgmtNames[device.Name] || mgmtMACs[device.MAC] {
-			continue
-		}
-		candidates = append(candidates, device)
+	return netDevicesExcludingBindings(devices, decision.Management), nil
+}
+
+func (a *App) recommendNICRoles(devices []netDevice, managementCount int, allowRDMAExpansion bool) nicdetect.Decision {
+	plan := nicdetect.Plan{
+		ManagementCount:    managementCount,
+		RDMACount:          len(a.Machine.RDMA),
+		AllowRDMAExpansion: allowRDMAExpansion,
 	}
-	selected := selectRDMADevices(candidates, len(a.Machine.RDMA))
-	sortNetDevicesPhysical(selected)
-	return selected, nil
+	for idx, name := range a.Machine.MgmtIfaces {
+		hint := nicdetect.SlotHint{Index: idx, Name: name, IP: a.Machine.MgmtIP, Prefix: a.Machine.MgmtPrefix}
+		if idx < len(a.Machine.MgmtMACs) {
+			hint.MAC = a.Machine.MgmtMACs[idx]
+		}
+		plan.ManagementHints = append(plan.ManagementHints, hint)
+	}
+	for idx, item := range a.Machine.RDMA {
+		plan.RDMAHints = append(plan.RDMAHints, nicdetect.SlotHint{Index: idx, Name: item.Name, MAC: item.MAC, IP: item.IP, Prefix: item.Prefix})
+	}
+	return recommendNICRolesWithPlan(devices, plan)
+}
+
+func recommendNICRolesWithPlan(devices []netDevice, plan nicdetect.Plan) nicdetect.Decision {
+	facts := make([]nicdetect.Facts, 0, len(devices))
+	for _, item := range devices {
+		facts = append(facts, netDeviceFacts(item))
+	}
+	return nicdetect.Recommend(plan, facts)
+}
+
+func netDeviceFacts(item netDevice) nicdetect.Facts {
+	return nicdetect.Facts{
+		Name:             item.Name,
+		MAC:              item.MAC,
+		PCI:              item.PCI,
+		Driver:           item.Driver,
+		VendorID:         item.VendorID,
+		DeviceID:         item.DeviceID,
+		CurrentSpeedMbps: item.SpeedMbps,
+		MaxSpeedMbps:     item.MaxSpeedMbps,
+		MTU:              item.MTU,
+		LinkUp:           item.CarrierUp,
+		LinkKnown:        item.CarrierKnown,
+		HasRDMA:          item.HasInfiniband || strings.EqualFold(item.Driver, "mlx5_core"),
+		PhysPortName:     item.PhysPortName,
+		DevPort:          item.DevPort,
+		HasDevPort:       item.HasDevPort,
+	}
+}
+
+func netDevicesForBindings(devices []netDevice, bindings []nicdetect.Binding) []netDevice {
+	byName := map[string]netDevice{}
+	for _, item := range devices {
+		byName[item.Name] = item
+	}
+	out := make([]netDevice, 0, len(bindings))
+	for _, binding := range bindings {
+		if item, ok := byName[binding.NIC.Name]; ok {
+			out = append(out, item)
+		}
+	}
+	sortNetDevicesPhysical(out)
+	return out
+}
+
+func netDevicesExcludingBindings(devices []netDevice, bindings []nicdetect.Binding) []netDevice {
+	excluded := map[string]bool{}
+	for _, binding := range bindings {
+		excluded[binding.NIC.Name] = true
+	}
+	var out []netDevice
+	for _, item := range devices {
+		if !excluded[item.Name] {
+			out = append(out, item)
+		}
+	}
+	sortNetDevices(out)
+	return out
 }
 
 func (a *App) discoverNetDevices() ([]netDevice, error) {
@@ -526,6 +599,11 @@ func (a *App) discoverNetDevicesWithOptions(allowInvalidMAC bool) ([]netDevice, 
 		}
 		devPort, hasDevPort := readOptionalInt(filepath.Join(dir, name, "dev_port"))
 		speed, _ := readOptionalInt(filepath.Join(dir, name, "speed"))
+		maxSpeed := ethtoolMaxSupportedSpeed(name)
+		if maxSpeed <= 0 {
+			maxSpeed = speed
+		}
+		mtu, _ := readOptionalInt(filepath.Join(dir, name, "mtu"))
 		carrier, carrierKnown := a.detectLinkState(name, filepath.Join(dir, name, "carrier"))
 		devices = append(devices, netDevice{
 			Name:          name,
@@ -533,6 +611,8 @@ func (a *App) discoverNetDevicesWithOptions(allowInvalidMAC bool) ([]netDevice, 
 			PCI:           pci,
 			Driver:        driver,
 			SpeedMbps:     speed,
+			MaxSpeedMbps:  maxSpeed,
+			MTU:           mtu,
 			VendorID:      readDeviceOptionalTrim(devicePath, "vendor"),
 			DeviceID:      readDeviceOptionalTrim(devicePath, "device"),
 			PhysPortName:  readOptionalTrim(filepath.Join(dir, name, "phys_port_name")),
@@ -682,269 +762,6 @@ func netDeviceAutoOrderScore(device netDevice) int {
 	return score
 }
 
-type netDeviceSpeedGroup struct {
-	Speed   int
-	Devices []netDevice
-}
-
-type netDeviceModelGroup struct {
-	Key     string
-	Speed   int
-	Devices []netDevice
-}
-
-func selectMgmtDevices(devices []netDevice, need int) []netDevice {
-	if need <= 0 {
-		return nil
-	}
-	groups := speedGroups(devices, true)
-	selected := selectFromSortedSpeedGroups(groups, need, true)
-	if len(selected) == need {
-		return selected
-	}
-	if byModel := selectFromModelGroups(devices, need, true); len(byModel) == need {
-		return byModel
-	}
-	return selected
-}
-
-func selectRDMADevices(devices []netDevice, need int) []netDevice {
-	if need <= 0 {
-		return nil
-	}
-	groups := speedGroups(devices, false)
-	selected := selectFromSortedSpeedGroups(groups, need, false)
-	if len(selected) == need {
-		return selected
-	}
-	if byModel := selectFromModelGroups(devices, need, false); len(byModel) == need {
-		return byModel
-	}
-	if len(selected) > 0 {
-		return selected
-	}
-	return selectLegacyRDMADevices(devices, need)
-}
-
-func speedGroups(devices []netDevice, forMgmt bool) []netDeviceSpeedGroup {
-	bySpeed := map[int][]netDevice{}
-	for _, device := range devices {
-		if device.SpeedMbps <= 0 {
-			continue
-		}
-		if !forMgmt && device.SpeedMbps < 200000 && !device.HasInfiniband && !strings.EqualFold(device.Driver, "mlx5_core") {
-			continue
-		}
-		bySpeed[device.SpeedMbps] = append(bySpeed[device.SpeedMbps], device)
-	}
-	groups := make([]netDeviceSpeedGroup, 0, len(bySpeed))
-	for speed, items := range bySpeed {
-		sortNetDevices(items)
-		groups = append(groups, netDeviceSpeedGroup{Speed: speed, Devices: items})
-	}
-	return groups
-}
-
-func selectFromSortedSpeedGroups(groups []netDeviceSpeedGroup, need int, preferLowerSpeed bool) []netDevice {
-	if len(groups) == 0 {
-		return nil
-	}
-	sortSpeedGroups(groups, preferLowerSpeed)
-	return selectFromSpeedGroups(groups, need, preferLowerSpeed)
-}
-
-func selectFromSpeedGroups(groups []netDeviceSpeedGroup, need int, preferLowerSpeed bool) []netDevice {
-	var eligible []netDeviceSpeedGroup
-	for _, group := range groups {
-		if len(group.Devices) >= need {
-			eligible = append(eligible, group)
-		}
-	}
-	if len(eligible) == 0 {
-		return nil
-	}
-
-	var linked []netDeviceSpeedGroup
-	for _, group := range eligible {
-		if linkUpCount(group.Devices) >= need {
-			linked = append(linked, group)
-		}
-	}
-	if len(linked) > 0 {
-		sortSpeedGroups(linked, preferLowerSpeed)
-		return firstN(linkUpFirst(linked[0].Devices), need)
-	}
-
-	var exact []netDeviceSpeedGroup
-	for _, group := range eligible {
-		if len(group.Devices) == need {
-			exact = append(exact, group)
-		}
-	}
-	if len(exact) > 0 {
-		sortSpeedGroups(exact, preferLowerSpeed)
-		return firstN(exact[0].Devices, need)
-	}
-
-	sortSpeedGroups(eligible, preferLowerSpeed)
-	// Ambiguous: enough devices exist in this speed group, but link state does
-	// not identify exactly which ports should be used. Return the whole group
-	// so the caller falls back to the manual review path.
-	return eligible[0].Devices
-}
-
-func selectFromModelGroups(devices []netDevice, need int, preferLowerSpeed bool) []netDevice {
-	groups := modelGroups(devices)
-	if len(groups) == 0 {
-		return nil
-	}
-
-	var exact []netDeviceModelGroup
-	for _, group := range groups {
-		if len(group.Devices) == need {
-			exact = append(exact, group)
-		}
-	}
-	if len(exact) > 0 {
-		sortModelGroups(exact, preferLowerSpeed)
-		return firstN(exact[0].Devices, need)
-	}
-
-	var linked []netDeviceModelGroup
-	for _, group := range groups {
-		if len(group.Devices) > need && linkUpCount(group.Devices) >= need {
-			linked = append(linked, group)
-		}
-	}
-	if len(linked) > 0 {
-		sortModelGroups(linked, preferLowerSpeed)
-		return firstN(linkUpFirst(linked[0].Devices), need)
-	}
-
-	return nil
-}
-
-func modelGroups(devices []netDevice) []netDeviceModelGroup {
-	byModel := map[string][]netDevice{}
-	for _, device := range devices {
-		key := deviceModelGroupKey(device)
-		if key == "" {
-			continue
-		}
-		byModel[key] = append(byModel[key], device)
-	}
-
-	groups := make([]netDeviceModelGroup, 0, len(byModel))
-	for key, items := range byModel {
-		sortNetDevices(items)
-		groups = append(groups, netDeviceModelGroup{
-			Key:     key,
-			Speed:   representativeSpeed(items),
-			Devices: items,
-		})
-	}
-	return groups
-}
-
-func deviceModelGroupKey(device netDevice) string {
-	vendor := strings.ToLower(strings.TrimSpace(device.VendorID))
-	deviceID := strings.ToLower(strings.TrimSpace(device.DeviceID))
-	if vendor != "" || deviceID != "" {
-		return "pci:" + vendor + ":" + deviceID
-	}
-	driver := strings.ToLower(strings.TrimSpace(device.Driver))
-	if driver != "" {
-		return "driver:" + driver
-	}
-	return ""
-}
-
-func representativeSpeed(devices []netDevice) int {
-	for _, device := range devices {
-		if device.SpeedMbps > 0 {
-			return device.SpeedMbps
-		}
-	}
-	return 0
-}
-
-func selectLegacyRDMADevices(devices []netDevice, need int) []netDevice {
-	var out []netDevice
-	for _, device := range devices {
-		if strings.EqualFold(device.Driver, "mlx5_core") || device.HasInfiniband {
-			out = append(out, device)
-		}
-	}
-	sortNetDevices(out)
-	if len(out) >= need {
-		return out
-	}
-	return nil
-}
-
-func sortModelGroups(groups []netDeviceModelGroup, lowerFirst bool) {
-	sort.Slice(groups, func(i, j int) bool {
-		leftLinked := linkUpCount(groups[i].Devices)
-		rightLinked := linkUpCount(groups[j].Devices)
-		if leftLinked != rightLinked {
-			return leftLinked > rightLinked
-		}
-		if groups[i].Speed != groups[j].Speed {
-			if lowerFirst {
-				return groups[i].Speed < groups[j].Speed
-			}
-			return groups[i].Speed > groups[j].Speed
-		}
-		return groups[i].Key < groups[j].Key
-	})
-}
-
-func sortSpeedGroups(groups []netDeviceSpeedGroup, lowerFirst bool) {
-	sort.Slice(groups, func(i, j int) bool {
-		leftLinked := linkUpCount(groups[i].Devices)
-		rightLinked := linkUpCount(groups[j].Devices)
-		if leftLinked != rightLinked {
-			return leftLinked > rightLinked
-		}
-		if lowerFirst {
-			return groups[i].Speed < groups[j].Speed
-		}
-		return groups[i].Speed > groups[j].Speed
-	})
-}
-
-func linkUpCount(devices []netDevice) int {
-	count := 0
-	for _, device := range devices {
-		if device.CarrierKnown && device.CarrierUp {
-			count++
-		}
-	}
-	return count
-}
-
-func linkUpFirst(devices []netDevice) []netDevice {
-	out := append([]netDevice(nil), devices...)
-	sort.SliceStable(out, func(i, j int) bool {
-		left, right := out[i], out[j]
-		if left.CarrierKnown && right.CarrierKnown && left.CarrierUp != right.CarrierUp {
-			return left.CarrierUp
-		}
-		if left.CarrierKnown != right.CarrierKnown {
-			return left.CarrierKnown
-		}
-		return false
-	})
-	return out
-}
-
-func firstN(devices []netDevice, n int) []netDevice {
-	if len(devices) <= n {
-		return devices
-	}
-	return append([]netDevice(nil), devices[:n]...)
-}
-
 func readOptionalTrim(path string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -1005,6 +822,41 @@ func ethtoolLinkDetected(iface string) (bool, bool) {
 		}
 	}
 	return false, false
+}
+
+func ethtoolMaxSupportedSpeed(iface string) int {
+	if strings.TrimSpace(iface) == "" {
+		return 0
+	}
+	output, err := exec.Command("ethtool", iface).CombinedOutput()
+	if err != nil {
+		return 0
+	}
+	inSupportedModes := false
+	maxSpeed := 0
+	for _, line := range strings.Split(string(output), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "Supported link modes:") {
+			inSupportedModes = true
+		}
+		if inSupportedModes && strings.HasPrefix(trimmed, "Supported ") && !strings.HasPrefix(trimmed, "Supported link modes:") {
+			break
+		}
+		if !inSupportedModes {
+			continue
+		}
+		for _, field := range strings.Fields(trimmed) {
+			idx := strings.Index(field, "base")
+			if idx <= 0 {
+				continue
+			}
+			value, err := strconv.Atoi(field[:idx])
+			if err == nil && value > maxSpeed {
+				maxSpeed = value
+			}
+		}
+	}
+	return maxSpeed
 }
 
 func hasInfinibandDevice(devicePath string) bool {

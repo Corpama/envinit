@@ -80,7 +80,7 @@ func TestXCCLRankScriptExportsRuntimeAndTopologyEnvironment(t *testing.T) {
 		"BKCL_RDMA_VERBS='1'",
 		"BKCL_TREE_THRESHOLD='0'",
 		"BKCL_DEBUG='1'",
-		"exec '/tmp/envinit-xccl-check/run/runtime/xccl_Linux_x86_64/perf/all_reduce' \"$@\"",
+		"exec '/tmp/envinit-xccl-check/run/runtime/xccl_Linux_x86_64/systest/xccl_perf' \"$@\"",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("expected %q in rank script:\n%s", want, script)
@@ -100,6 +100,80 @@ XCCL running perf test all_reduce on 16 ranks
 	}
 	if rows[1].SizeBytes != 134217728 || rows[1].BusGBs != 59.92 || rows[1].Operation != "sum" {
 		t.Fatalf("unexpected parsed row: %#v", rows[1])
+	}
+	if rows[1].Mode != "out-of-place" {
+		t.Fatalf("legacy perf row mode = %q, want out-of-place", rows[1].Mode)
+	}
+}
+
+func TestParseXCCLSysTestPerformanceRowsUsesInPlaceColumns(t *testing.T) {
+	output := `
+#   size      count    type  redop root           out-of-place                       in-place
+#    (B)   (elements)                         time  algbw  busbw #wrong      time  algbw  busbw #wrong
+     1024          256 float sum -1             47   0.02   0.04 N/A          46   0.02   0.04 N/A
+134217728     33554432 float sum -1           2073  64.73 113.29 N/A        2081  64.47 112.82 N/A
+268435456     67108864 float sum -1           4186  64.11 112.20 N/A        4205  63.83 111.70 N/A
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 41.9883
+`
+	rows := parseXCCLPerformanceRows(output)
+	if len(rows) != 6 {
+		t.Fatalf("unexpected systest rows: %#v", rows)
+	}
+	last := rows[5]
+	if last.SizeBytes != 268435456 || last.Mode != "in-place" || last.TimeUS != 4205 || last.AlgGBs != 63.83 || last.BusGBs != 111.70 {
+		t.Fatalf("unexpected in-place systest row: %#v", last)
+	}
+	if rows[4].Mode != "out-of-place" || rows[4].BusGBs != 112.20 {
+		t.Fatalf("unexpected out-of-place systest row: %#v", rows[4])
+	}
+	selected := selectXCCLPerformanceRow(rows)
+	if selected.SizeBytes != 134217728 || selected.BusGBs != 112.82 {
+		t.Fatalf("SOP evaluation row = %#v, want second-largest size with in-place busbw", selected)
+	}
+	var details bytes.Buffer
+	printXCCLSizeResults(&details, rows, selected)
+	for _, want := range []string{
+		"XCCL size result details",
+		"out-of-place",
+		"in-place",
+		"134217728",
+		"112.82",
+		"268435456",
+		"111.70",
+	} {
+		if !strings.Contains(details.String(), want) {
+			t.Fatalf("expected %q in size details:\n%s", want, details.String())
+		}
+	}
+}
+
+func TestSelectXCCLPerformanceRowFallsBackToOnlySize(t *testing.T) {
+	row := xcclPerformanceRow{SizeBytes: 134217728, BusGBs: 59.92}
+	if got := selectXCCLPerformanceRow([]xcclPerformanceRow{row}); got != row {
+		t.Fatalf("single-size selection = %#v, want %#v", got, row)
+	}
+}
+
+func TestXCCLMPIRunArgsUseSysTestInterface(t *testing.T) {
+	cfg := spec.CheckXCCLConfig{
+		Test:             "all_reduce",
+		MinBytes:         "1024",
+		MaxBytes:         "256m",
+		StepFactor:       2,
+		WarmupIterations: 5,
+		Iterations:       20,
+		DataType:         "float",
+	}
+	got := strings.Join(xcclMPIRunArgs(cfg, "/tmp/envinit-xccl-check/run", 8, false), " ")
+	for _, want := range []string{
+		"mpiexec.hydra -launcher fork -n 8",
+		"-wdir /tmp/envinit-xccl-check/run",
+		"run-rank.sh -O allReduce -x 1 -b 1024 -e 256m -f 2 -w 5 -n 20 -c 0 -d float",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in systest command:\n%s", want, got)
+		}
 	}
 }
 
@@ -215,7 +289,7 @@ func TestRunSingleHostXCCLDryRunUsesLocalLauncherWithoutSSHAuthorization(t *test
 		CommandRunner: func(_ spec.CheckConfig, _ Target, command string) (string, error) {
 			switch {
 			case command == "xpu-smi topo -m":
-				return sampleXPUTopology, nil
+				return sampleDirectIBDeviceXPUTopology, nil
 			case strings.Contains(command, "/sys/class/net/"):
 				for idx, iface := range []string{"ens11np0", "ens13np0", "ens15np0", "ens17np0"} {
 					if strings.Contains(command, iface) {

@@ -90,7 +90,7 @@ func copyLocalFile(source, target string) error {
 
 func runSCPOnce(cfg spec.CheckConfig, target Target, localPath, remotePath string) error {
 	args := append([]string{}, cfg.SSH.Options...)
-	destination := target.Address
+	destination := targetControlAddress(target)
 	if strings.TrimSpace(cfg.SSH.User) != "" {
 		destination = cfg.SSH.User + "@" + destination
 	}
@@ -106,7 +106,7 @@ func runSCPOnce(cfg spec.CheckConfig, target Target, localPath, remotePath strin
 
 func runSSHCommandOnce(cfg spec.CheckConfig, target Target, remoteCommand string) (string, error) {
 	args := append([]string{}, cfg.SSH.Options...)
-	destination := target.Address
+	destination := targetControlAddress(target)
 	if strings.TrimSpace(cfg.SSH.User) != "" {
 		destination = cfg.SSH.User + "@" + destination
 	}

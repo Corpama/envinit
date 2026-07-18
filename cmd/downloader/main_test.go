@@ -8,12 +8,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -153,7 +155,7 @@ func TestListAndSelectProfiles(t *testing.T) {
 	}
 }
 
-func TestRunManifestModeDownloadsSelectedProfileAssets(t *testing.T) {
+func TestRunManifestModeSupportsLegacyProfileArchives(t *testing.T) {
 	contents := map[string][]byte{
 		"/releases/v-test/env_tool-base.tar": deliveryTar(t, map[string]string{
 			"env_tool/env_init":  "base binary",
@@ -271,6 +273,209 @@ func TestRunManifestModeDownloadsSelectedProfileAssets(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "profile kylin10sp3-x86_64") {
 		t.Fatalf("expected selected profile in output, got:\n%s", output.String())
+	}
+}
+
+func TestRunManifestModeDownloadsAndAssemblesMaterialDirectory(t *testing.T) {
+	contents := map[string][]byte{
+		"/releases/v-test/env_tool-base.tar": deliveryTar(t, map[string]string{
+			"env_tool/env_init":  "base binary",
+			"env_tool/README.md": "base readme",
+		}),
+		"/releases/v-test/kylin/bundle.json":                []byte(`{"platform":{"os_family":"kylin"}}`),
+		"/data/profiles/kylin/rpm-repo/repodata/repomd.xml": []byte("kylin repo"),
+		"/data/profiles/kylin/misc/install.sh":              []byte("#!/bin/sh\necho install\n"),
+	}
+	manifest := releaseManifest{
+		Version: "v-test",
+		Base: manifestAsset{
+			Name:   "env_tool-base.tar",
+			Path:   "/releases/v-test/env_tool-base.tar",
+			SHA256: testSHA256(contents["/releases/v-test/env_tool-base.tar"]),
+		},
+		Profiles: []manifestProfile{{
+			ID:           "kylin10sp3-x86_64",
+			Name:         "Kylin V10 SP3 x86_64",
+			MaterialRoot: "/data/profiles/kylin",
+			Bundle: manifestAsset{
+				Path:   "/releases/v-test/kylin/bundle.json",
+				SHA256: testSHA256(contents["/releases/v-test/kylin/bundle.json"]),
+			},
+		}},
+	}
+	rawManifest, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var materialRawDownloads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/login":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"code":200,"message":"success","data":{"token":"jwt-token"}}`))
+		case "/api/fs/list":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			directory, _ := body["path"].(string)
+			var content []map[string]any
+			switch directory {
+			case "/data/profiles/kylin":
+				content = []map[string]any{
+					{"name": "rpm-repo", "is_dir": true},
+					{"name": "misc", "is_dir": true},
+					{"name": ".DS_Store", "size": 9, "is_dir": false},
+				}
+			case "/data/profiles/kylin/rpm-repo":
+				content = []map[string]any{{"name": "repodata", "is_dir": true}}
+			case "/data/profiles/kylin/rpm-repo/repodata":
+				file := contents["/data/profiles/kylin/rpm-repo/repodata/repomd.xml"]
+				content = []map[string]any{{"name": "repomd.xml", "size": len(file), "modified": "2026-07-18T01:02:03Z", "hash_info": map[string]string{"sha256": testSHA256(file)}}}
+			case "/data/profiles/kylin/misc":
+				file := contents["/data/profiles/kylin/misc/install.sh"]
+				content = []map[string]any{{"name": "install.sh", "size": len(file), "modified": "2026-07-18T01:02:04Z"}}
+			default:
+				t.Fatalf("unexpected AList directory: %s", directory)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"code": 200, "message": "success", "data": map[string]any{"content": content, "total": len(content)}})
+		case "/api/fs/get":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			filePath, _ := body["path"].(string)
+			if _, ok := contents[filePath]; !ok {
+				t.Fatalf("unexpected AList path lookup: %s", filePath)
+			}
+			if strings.HasPrefix(filePath, "/data/profiles/") {
+				if refresh, _ := body["refresh"].(bool); refresh {
+					http.Error(w, "material file lookup should reuse the refreshed directory metadata", http.StatusBadRequest)
+					return
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"code":200,"message":"success","data":{"raw_url":"` + serverRawURL(r, filePath) + `"}}`))
+		case "/raw":
+			filePath := r.URL.Query().Get("path")
+			content, ok := contents[filePath]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			if strings.HasPrefix(filePath, "/data/profiles/") {
+				materialRawDownloads.Add(1)
+			}
+			w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	oldBaseURL, oldUser, oldPass, oldManifest, oldManifestB64 := alistBaseURL, alistUserB64, alistPassB64, manifestJSON, manifestJSONB64
+	t.Cleanup(func() {
+		alistBaseURL, alistUserB64, alistPassB64, manifestJSON, manifestJSONB64 = oldBaseURL, oldUser, oldPass, oldManifest, oldManifestB64
+	})
+	alistBaseURL = server.URL
+	alistUserB64 = base64.StdEncoding.EncodeToString([]byte("release-reader"))
+	alistPassB64 = base64.StdEncoding.EncodeToString([]byte("secret"))
+	manifestJSON = string(rawManifest)
+
+	outputDir := t.TempDir()
+	var output strings.Builder
+	opts := runOptions{OutputDir: outputDir, Profile: "kylin10sp3-x86_64", Jobs: 2, Stdout: &output}
+	if err := run(opts); err != nil {
+		t.Fatalf("run material profile mode: %v", err)
+	}
+	assertFileContent(t, filepath.Join(outputDir, "env_init"), "base binary")
+	assertFileContent(t, filepath.Join(outputDir, "planning", "bundle.json"), `{"platform":{"os_family":"kylin"}}`)
+	assertFileContent(t, filepath.Join(outputDir, "data", "rpm-repo", "repodata", "repomd.xml"), "kylin repo")
+	assertFileContent(t, filepath.Join(outputDir, "data", "misc", "install.sh"), "#!/bin/sh\necho install\n")
+	if info, err := os.Stat(filepath.Join(outputDir, "data", "misc", "install.sh")); err != nil || info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("material shell script should be executable, info=%v err=%v", info, err)
+	}
+	if _, err := os.Stat(filepath.Join(outputDir, "data", ".DS_Store")); !os.IsNotExist(err) {
+		t.Fatalf(".DS_Store should be skipped, stat err=%v", err)
+	}
+	if got := materialRawDownloads.Load(); got != 2 {
+		t.Fatalf("material raw downloads = %d, want 2", got)
+	}
+	if err := run(opts); err != nil {
+		t.Fatalf("rerun material profile mode: %v", err)
+	}
+	if got := materialRawDownloads.Load(); got != 2 {
+		t.Fatalf("completed materials were downloaded again, raw downloads=%d", got)
+	}
+	for _, want := range []string{"2 files from /data/profiles/kylin", "assembled: 2/2 files"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("missing material output %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestCollectMaterialFilesRejectsTraversalEntry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/fs/list" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"code":200,"message":"success","data":{"content":[{"name":"../outside","size":3,"is_dir":false}],"total":1}}`))
+	}))
+	defer server.Close()
+	oldBaseURL := alistBaseURL
+	t.Cleanup(func() { alistBaseURL = oldBaseURL })
+	alistBaseURL = server.URL
+	_, err := collectMaterialFiles("jwt-token", "/data/profiles/test")
+	if err == nil || !strings.Contains(err.Error(), "not a single path component") {
+		t.Fatalf("expected traversal entry rejection, got %v", err)
+	}
+}
+
+func TestListAListDirectoryPaginatesWhenTotalIsMissing(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/fs/list" {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		page, _ := body["page"].(float64)
+		content := make([]map[string]any, 0, 500)
+		switch int(page) {
+		case 1:
+			for idx := 0; idx < 500; idx++ {
+				content = append(content, map[string]any{"name": fmt.Sprintf("file-%03d", idx), "size": 1})
+			}
+		case 2:
+			content = append(content, map[string]any{"name": "file-500", "size": 1})
+		default:
+			t.Fatalf("unexpected page %v", page)
+		}
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"code": 200,
+			"data": map[string]any{"content": content},
+		})
+	}))
+	defer server.Close()
+
+	oldBaseURL := alistBaseURL
+	t.Cleanup(func() { alistBaseURL = oldBaseURL })
+	alistBaseURL = server.URL
+	entries, err := listAListDirectory("/data/profiles/test", "jwt-token")
+	if err != nil {
+		t.Fatalf("list directory: %v", err)
+	}
+	if len(entries) != 501 || calls.Load() != 2 {
+		t.Fatalf("entries=%d calls=%d, want 501 entries from 2 calls", len(entries), calls.Load())
 	}
 }
 

@@ -27,15 +27,21 @@ type DiscoverOptions struct {
 	Confirm       bool
 	DryRun        bool
 	Output        io.Writer
+	CommandRunner func(spec.CheckConfig, Target, string) (string, error)
 }
 
 type Target struct {
-	Input            string
-	Name             string
-	ExpectedHostname string
-	Address          string
-	RDMA             []spec.RDMARecord
-	Local            bool
+	Input              string
+	Name               string
+	ExpectedHostname   string
+	DiscoveredHostname string
+	InventoryIdentity  string
+	InventoryMatched   bool
+	ExplicitIdentity   bool
+	ControlAddress     string
+	Address            string
+	RDMA               []spec.RDMARecord
+	Local              bool
 }
 
 type Result struct {
@@ -155,6 +161,7 @@ type xcclPerformanceRow struct {
 	Count     int64
 	DataType  string
 	Operation string
+	Mode      string
 	TimeUS    float64
 	AlgGBs    float64
 	BusGBs    float64

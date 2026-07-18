@@ -418,10 +418,10 @@ func (b *Bundle) ApplyDefaults() {
 		b.Check.XCCL.Test = "all_reduce"
 	}
 	if b.Check.XCCL.MinBytes == "" {
-		b.Check.XCCL.MinBytes = "128m"
+		b.Check.XCCL.MinBytes = "1024"
 	}
 	if b.Check.XCCL.MaxBytes == "" {
-		b.Check.XCCL.MaxBytes = "128m"
+		b.Check.XCCL.MaxBytes = "256m"
 	}
 	if b.Check.XCCL.StepFactor == 0 {
 		b.Check.XCCL.StepFactor = 2

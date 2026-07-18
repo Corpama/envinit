@@ -11,12 +11,12 @@ COS_BUCKET="${COS_BUCKET:-wxq-1318169049}"
 COS_REGION="${COS_REGION:-ap-guangzhou}"
 COS_ENDPOINT="${COS_ENDPOINT:-cos.${COS_REGION}.myqcloud.com}"
 COS_RELEASE_UPLOAD_ENDPOINT="${COS_RELEASE_UPLOAD_ENDPOINT:-cos.accelerate.myqcloud.com}"
-COS_PROFILE_PREFIX="${COS_PROFILE_PREFIX:-env_init/data/profiles}"
 COS_RELEASE_PREFIX="${COS_RELEASE_PREFIX:-env_init/releases}"
 COS_RELEASE_KEEP="${COS_RELEASE_KEEP:-2}"
 RELEASE_PROFILES="${RELEASE_PROFILES:-ubuntu22.04-x86_64:kylin10sp3-x86_64}"
 ALIST_BASE_URL="${ALIST_BASE_URL:-https://alt.corpa.me}"
 ALIST_RELEASE_PREFIX="${ALIST_RELEASE_PREFIX:-/releases}"
+ALIST_PROFILE_PREFIX="${ALIST_PROFILE_PREFIX:-/data/profiles}"
 
 : "${COS_SECRET_ID:?Please configure COS_SECRET_ID in GitHub Actions repository secrets}"
 : "${COS_SECRET_KEY:?Please configure COS_SECRET_KEY in GitHub Actions repository secrets}"
@@ -201,26 +201,6 @@ for profile_id in "${PROFILE_IDS[@]}"; do
     exit 1
   fi
 
-  echo "==> Creating profile package ${profile_id}"
-  PROFILE_STAGE="${WORK_ROOT}/profiles/${profile_id}/stage"
-  PROFILE_PACKAGE_NAME="env_tool-data-${profile_id}-${RELEASE_TAG}.tar"
-  PROFILE_PACKAGE_PATH="${WORK_ROOT}/${PROFILE_PACKAGE_NAME}"
-  PROFILE_ALIST_PATH="${ALIST_RELEASE_PREFIX%/}/${RELEASE_TAG}/${profile_id}/${PROFILE_PACKAGE_NAME}"
-  mkdir -p "${PROFILE_STAGE}/env_tool/data"
-
-  echo "==> Downloading COS profile cos://${COS_BUCKET}/${COS_PROFILE_PREFIX}/${profile_id}/"
-  "${TOOLS_DIR}/coscli" cp \
-    "cos://${COS_BUCKET}/${COS_PROFILE_PREFIX}/${profile_id}/" \
-    "${PROFILE_STAGE}/env_tool/data/" \
-    -r \
-    -e "$COS_ENDPOINT" \
-    "${COSCLI_AUTH_ARGS[@]}"
-
-  tar -C "$PROFILE_STAGE" -cf "$PROFILE_PACKAGE_PATH" env_tool
-  PROFILE_SHA256="$(sha256sum "$PROFILE_PACKAGE_PATH" | awk '{print $1}')"
-  printf '%s  %s\n' "$PROFILE_SHA256" "$PROFILE_PACKAGE_NAME" >> "${RELEASE_DIR}/SHA256SUMS"
-  upload_file "$PROFILE_PACKAGE_PATH" "${COS_RELEASE_PREFIX}/${RELEASE_TAG}/${profile_id}/${PROFILE_PACKAGE_NAME}"
-
   BUNDLE_RELEASE_PATH="${WORK_ROOT}/bundle-${profile_id}.json"
   cp "$bundle_template" "$BUNDLE_RELEASE_PATH"
   BUNDLE_SHA256="$(sha256sum "$BUNDLE_RELEASE_PATH" | awk '{print $1}')"
@@ -233,9 +213,7 @@ for profile_id in "${PROFILE_IDS[@]}"; do
       --arg id "$profile_id" \
       --arg name "$(profile_name "$profile_id")" \
       --arg description "$(profile_description "$profile_id")" \
-      --arg asset_name "$PROFILE_PACKAGE_NAME" \
-      --arg asset_path "$PROFILE_ALIST_PATH" \
-      --arg asset_sha256 "$PROFILE_SHA256" \
+      --arg material_root "${ALIST_PROFILE_PREFIX%/}/${profile_id}" \
       --arg bundle_path "$BUNDLE_ALIST_PATH" \
       --arg bundle_sha256 "$BUNDLE_SHA256" \
       --argjson inventory "$INVENTORY_ASSET_JSON" \
@@ -243,17 +221,16 @@ for profile_id in "${PROFILE_IDS[@]}"; do
         id: $id,
         name: $name,
         description: $description,
-        assets: [{name: $asset_name, path: $asset_path, sha256: $asset_sha256}],
+        material_root: $material_root,
+        assets: [],
         bundle: {name: "planning/bundle.json", path: $bundle_path, sha256: $bundle_sha256},
         inventory: $inventory
       }'
   )")
-  ALIST_VERIFY_PATHS+=("$PROFILE_ALIST_PATH" "$BUNDLE_ALIST_PATH")
+  ALIST_VERIFY_PATHS+=("$BUNDLE_ALIST_PATH")
 
-  # Each profile contains several gigabytes of offline material. Release the
-  # extracted tree and tar as soon as their hashes and manifest entry are
-  # complete so the next profile does not double the runner disk peak.
-  rm -rf "${WORK_ROOT}/profiles/${profile_id}" "$PROFILE_PACKAGE_PATH"
+  # Profile material is intentionally not read or repackaged during release.
+  # The downloader consumes material_root and assembles data/ on demand.
   rm -f "$BUNDLE_RELEASE_PATH"
 done
 

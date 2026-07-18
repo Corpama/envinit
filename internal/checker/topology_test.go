@@ -32,6 +32,80 @@ NIC Legend:
   NIC4: mlx5_4
 `
 
+const sampleDirectIBDeviceXPUTopology = `
+       XPU0 XPU1 XPU2 XPU3 XPU4 XPU5 XPU6 XPU7 mlx5_0 mlx5_1 mlx5_2 mlx5_3 mlx5_4 CPU Affinity NUMA Affinity
+XPU0   X    XL   XL   XL   XL   SYS  SYS  SYS  NODE   PIX    NODE   SYS    SYS    0-51,104-155 0
+XPU1   XL   X    XL   XL   SYS  XL   SYS  SYS  NODE   PIX    NODE   SYS    SYS    0-51,104-155 0
+XPU2   XL   XL   X    XL   SYS  SYS  XL   SYS  NODE   NODE   PIX    SYS    SYS    0-51,104-155 0
+XPU3   XL   XL   XL   X    SYS  SYS  SYS  XL   NODE   NODE   PIX    SYS    SYS    0-51,104-155 0
+XPU4   XL   SYS  SYS  SYS  X    XL   XL   XL   SYS    SYS    SYS    PIX    NODE   52-103,156-207 1
+XPU5   SYS  XL   SYS  SYS  XL   X    XL   XL   SYS    SYS    SYS    PIX    NODE   52-103,156-207 1
+XPU6   SYS  SYS  XL   SYS  XL   XL   X    XL   SYS    SYS    SYS    NODE   PIX    52-103,156-207 1
+XPU7   SYS  SYS  SYS  XL   XL   XL   XL   X    SYS    SYS    SYS    NODE   PIX    52-103,156-207 1
+mlx5_0 NODE NODE NODE NODE SYS SYS SYS SYS X NODE NODE SYS SYS
+mlx5_1 PIX  PIX  NODE NODE SYS SYS SYS SYS NODE X NODE SYS SYS
+mlx5_2 NODE NODE PIX  PIX  SYS SYS SYS SYS NODE NODE X SYS SYS
+mlx5_3 SYS  SYS  SYS  SYS  PIX PIX NODE NODE SYS SYS SYS X NODE
+mlx5_4 SYS  SYS  SYS  SYS  NODE NODE PIX PIX SYS SYS SYS NODE X
+
+Legend:
+  X = Self
+  PIX = Connection traversing at most a single PCIe bridge
+`
+
+func TestParseDirectIBDeviceHeadersWithoutNICLegend(t *testing.T) {
+	topology, err := parseXPUTopology(sampleDirectIBDeviceXPUTopology)
+	if err != nil {
+		t.Fatalf("parse direct IB device topology: %v", err)
+	}
+	groups, assignments, err := assignXPUOffsetsByTopology([]spec.CheckRDMAGroup{
+		{IBDevice: "mlx5_1"},
+		{IBDevice: "mlx5_2"},
+		{IBDevice: "mlx5_3"},
+		{IBDevice: "mlx5_4"},
+	}, topology)
+	if err != nil {
+		t.Fatalf("assign direct IB device topology: %v", err)
+	}
+	want := map[int][]int{0: {0, 1}, 1: {2, 3}, 2: {4, 5}, 3: {6, 7}}
+	if !reflect.DeepEqual(assignments, want) {
+		t.Fatalf("direct-header assignments: got %#v want %#v", assignments, want)
+	}
+	for idx, group := range groups {
+		if len(group.XPUOffsets) != 2 {
+			t.Fatalf("group %d offsets = %#v, want two XPUs", idx, group.XPUOffsets)
+		}
+	}
+}
+
+func TestParseDirectIBDeviceHeadersWithANSIFormatting(t *testing.T) {
+	output := strings.Replace(sampleDirectIBDeviceXPUTopology, "mlx5_0 mlx5_1 mlx5_2 mlx5_3 mlx5_4", "\x1b[1;32mmlx5_0\x1b[0m \x1b[1;32mmlx5_1\x1b[0m \x1b[1;32mmlx5_2\x1b[0m \x1b[1;32mmlx5_3\x1b[0m \x1b[1;32mmlx5_4\x1b[0m", 1)
+	topology, err := parseXPUTopology(output)
+	if err != nil {
+		t.Fatalf("parse ANSI-formatted topology: %v", err)
+	}
+	if got := topology.NICDevices["mlx5_4"]; got != "mlx5_4" {
+		t.Fatalf("ANSI-formatted mlx5_4 mapping = %q, want mlx5_4", got)
+	}
+}
+
+func TestParseNICHeadersWithoutLegendUsesDeviceRows(t *testing.T) {
+	output := strings.Replace(sampleXPUTopology, "NIC Legend:\n  NIC0: mlx5_0\n  NIC1: mlx5_1\n  NIC2: mlx5_2\n  NIC3: mlx5_3\n  NIC4: mlx5_4", "", 1)
+	output = strings.Replace(output, "Legend:\n  X = Self", "mlx5_0 NODE NODE NODE NODE SYS SYS SYS SYS X NODE NODE SYS SYS\nmlx5_1 PIX PIX NODE NODE SYS SYS SYS SYS NODE X NODE SYS SYS\nmlx5_2 NODE NODE PIX PIX SYS SYS SYS SYS NODE NODE X SYS SYS\nmlx5_3 SYS SYS SYS SYS PIX PIX NODE NODE SYS SYS SYS X NODE\nmlx5_4 SYS SYS SYS SYS NODE NODE PIX PIX SYS SYS SYS NODE X\n\nLegend:\n  X = Self", 1)
+
+	topology, err := parseXPUTopology(output)
+	if err != nil {
+		t.Fatalf("parse NIC columns with mlx5 rows and no legend: %v", err)
+	}
+	for index := 0; index < 5; index++ {
+		nic := fmt.Sprintf("NIC%d", index)
+		want := fmt.Sprintf("mlx5_%d", index)
+		if got := topology.NICDevices[nic]; got != want {
+			t.Fatalf("%s mapping = %q, want %q", nic, got, want)
+		}
+	}
+}
+
 func TestParseAndAssignXPUOffsetsByTopology(t *testing.T) {
 	topology, err := parseXPUTopology(sampleXPUTopology)
 	if err != nil {

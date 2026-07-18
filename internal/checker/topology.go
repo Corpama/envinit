@@ -70,18 +70,31 @@ func resolveXDRTopologyGroups(opts Options, targets []Target, groupsByTarget res
 func parseXPUTopology(output string) (xpuTopology, error) {
 	topology := xpuTopology{NICDevices: map[string]string{}, Links: map[int]map[string]string{}}
 	var headers []string
+	var nicHeaders []string
+	var directDeviceRows []string
+	directDeviceRowSeen := map[string]bool{}
 	for _, rawLine := range strings.Split(output, "\n") {
 		line := strings.TrimSpace(rawLine)
-		fields := strings.Fields(line)
+		rawFields := strings.Fields(line)
+		fields := make([]string, len(rawFields))
+		for idx, field := range rawFields {
+			fields[idx] = sanitizeTopologyToken(field)
+		}
 		if len(fields) == 0 {
 			continue
 		}
 		if len(headers) == 0 && strings.HasPrefix(fields[0], "XPU") && len(fields) > 1 {
 			for _, field := range fields {
-				if !strings.HasPrefix(field, "XPU") && !strings.HasPrefix(field, "NIC") {
+				if strings.EqualFold(field, "CPU") || strings.EqualFold(field, "NUMA") {
 					break
 				}
 				headers = append(headers, field)
+				if _, ok := parseIndexedName(field, "NIC"); ok {
+					nicHeaders = append(nicHeaders, field)
+				}
+				if isDirectIBDeviceHeader(field) {
+					topology.NICDevices[field] = field
+				}
 			}
 			continue
 		}
@@ -92,27 +105,79 @@ func parseXPUTopology(output string) (xpuTopology, error) {
 			}
 			links := map[string]string{}
 			for column, header := range headers {
-				if strings.HasPrefix(header, "NIC") {
-					links[header] = strings.ToUpper(fields[column+1])
+				if strings.HasPrefix(header, "NIC") || isDirectIBDeviceHeader(header) {
+					links[header] = strings.ToUpper(sanitizeTopologyToken(fields[column+1]))
 				}
 			}
 			topology.Links[xpuIndex] = links
 			continue
 		}
-		if len(fields) >= 2 && strings.HasPrefix(fields[0], "NIC") && strings.HasSuffix(fields[0], ":") {
+		if isDirectIBDeviceHeader(fields[0]) && !directDeviceRowSeen[fields[0]] {
+			directDeviceRowSeen[fields[0]] = true
+			directDeviceRows = append(directDeviceRows, fields[0])
+		}
+		if len(fields) >= 2 && strings.HasPrefix(fields[0], "NIC") {
 			nic := strings.TrimSuffix(fields[0], ":")
 			if _, ok := parseIndexedName(nic, "NIC"); ok {
-				topology.NICDevices[nic] = fields[1]
+				device := sanitizeTopologyToken(fields[1])
+				if isDirectIBDeviceHeader(device) {
+					topology.NICDevices[nic] = device
+				}
 			}
+		}
+	}
+	if len(topology.NICDevices) == 0 && len(nicHeaders) > 0 && len(nicHeaders) == len(directDeviceRows) {
+		for idx, nic := range nicHeaders {
+			topology.NICDevices[nic] = directDeviceRows[idx]
 		}
 	}
 	if len(headers) == 0 || len(topology.Links) == 0 {
 		return xpuTopology{}, fmt.Errorf("cannot find XPU/NIC topology matrix in xpu-smi output")
 	}
 	if len(topology.NICDevices) == 0 {
-		return xpuTopology{}, fmt.Errorf("cannot find NIC legend in xpu-smi output")
+		return xpuTopology{}, fmt.Errorf("cannot find NIC columns or NIC legend in xpu-smi output; matrix_headers=%s direct_device_rows=%s", strings.Join(headers, ","), strings.Join(directDeviceRows, ","))
 	}
 	return topology, nil
+}
+
+func sanitizeTopologyToken(value string) string {
+	var cleaned strings.Builder
+	for idx := 0; idx < len(value); {
+		if value[idx] != 0x1b {
+			cleaned.WriteByte(value[idx])
+			idx++
+			continue
+		}
+		idx++
+		if idx < len(value) && value[idx] == '[' {
+			idx++
+			for idx < len(value) {
+				char := value[idx]
+				idx++
+				if char >= 0x40 && char <= 0x7e {
+					break
+				}
+			}
+		}
+	}
+	return strings.Trim(strings.TrimSpace(cleaned.String()), "|,:;")
+}
+
+func isDirectIBDeviceHeader(value string) bool {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "mlx5_") || len(value) <= len("mlx5_") {
+		return false
+	}
+	hasDigit := false
+	for _, char := range strings.TrimPrefix(value, "mlx5_") {
+		if (char < '0' || char > '9') && char != '_' {
+			return false
+		}
+		if char >= '0' && char <= '9' {
+			hasDigit = true
+		}
+	}
+	return hasDigit
 }
 
 func assignXPUOffsetsByTopology(groups []spec.CheckRDMAGroup, topology xpuTopology) ([]spec.CheckRDMAGroup, map[int][]int, error) {
@@ -125,7 +190,7 @@ func assignXPUOffsetsByTopology(groups []spec.CheckRDMAGroup, topology xpuTopolo
 		device := strings.TrimSpace(group.IBDevice)
 		nic, ok := deviceToNIC[device]
 		if !ok {
-			return nil, nil, fmt.Errorf("ib device %s is absent from xpu-smi NIC legend", device)
+			return nil, nil, fmt.Errorf("ib device %s is absent from xpu-smi topology NIC columns/mapping", device)
 		}
 		groupNICs[idx] = nic
 		groups[idx].XPUOffsets = nil

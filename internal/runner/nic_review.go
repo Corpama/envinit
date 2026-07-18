@@ -195,21 +195,21 @@ func (model nicBindingModel) deviceLimit() int {
 
 func renderNICBindingReviewWide(tty io.Writer, review *nicBindingReview, width int, deviceLimit int) {
 	fmt.Fprintln(tty, sectionHeader("Planned Bindings", width))
-	fmt.Fprintln(tty, "    Slot    Target Name        Planned IP          After Apply                 Current NIC        MAC")
-	fmt.Fprintln(tty, "    ------  -----------------  ------------------  --------------------------  -----------------  -----------------")
+	fmt.Fprintln(tty, "    Slot    Target Name        Planned IP          Current NIC        MAC                Why")
+	fmt.Fprintln(tty, "    ------  -----------------  ------------------  -----------------  -----------------  ------------------")
 	for idx, binding := range review.Bindings {
 		prefix := "  "
 		if idx == review.Selected {
 			prefix = "> "
 		}
-		fmt.Fprintf(tty, "%s  %-6s  %-17s  %-18s  %-26s  %-17s  %-17s\n",
+		fmt.Fprintf(tty, "%s  %-6s  %-17s  %-18s  %-17s  %-17s  %-18s\n",
 			prefix,
 			fitText(bindingSlotLabel(review.Bindings, idx), 6),
 			fitText(binding.Name, 17),
 			fitText(valueOrDash(binding.Address), 18),
-			fitText(afterApplyLabel(binding), 26),
 			fitText(valueOrDash(binding.CurrentName), 17),
 			fitText(valueOrDash(binding.MAC), 17),
+			fitText(bindingReasonLabel(binding), 18),
 		)
 		if idx == review.Selected && review.DropdownOpen {
 			renderReviewDropdown(tty, review, width)
@@ -217,26 +217,26 @@ func renderNICBindingReviewWide(tty io.Writer, review *nicBindingReview, width i
 	}
 	fmt.Fprintln(tty)
 	fmt.Fprintln(tty, sectionHeader("Detected NICs", width))
-	fmt.Fprintln(tty, "    ID  Current Name       MAC                Speed   Link   Driver      Model        PCI            Port")
-	fmt.Fprintln(tty, "    --  -----------------  -----------------  ------  -----  ----------  -----------  -------------  ----")
+	fmt.Fprintln(tty, "    ID  Current Name       MAC                Max/Now      MTU    Link   Driver      Model        PCI")
+	fmt.Fprintln(tty, "    --  -----------------  -----------------  -----------  -----  -----  ----------  -----------  -------------")
 	for idx, device := range visibleDevices(review.Devices, deviceLimit) {
 		prefix := "  "
 		blink := " "
 		if review.blinkIface == device.Name {
 			blink = "*"
 		}
-		fmt.Fprintf(tty, "%s%s%-2d  %-17s  %-17s  %-6s  %-5s  %-10s  %-11s  %-13s  %s\n",
+		fmt.Fprintf(tty, "%s%s%-2d  %-17s  %-17s  %-11s  %-5s  %-5s  %-10s  %-11s  %-13s\n",
 			prefix,
 			blink,
 			idx+1,
 			fitText(device.Name, 17),
 			fitText(valueOrDash(device.MAC), 17),
-			fitText(deviceSpeedLabel(device), 6),
+			fitText(deviceCapacityLabel(device), 11),
+			fitText(deviceMTULabel(device), 5),
 			fitText(deviceLinkLabel(device), 5),
 			fitText(device.Driver, 10),
 			fitText(deviceModelLabel(device), 11),
 			fitText(shortPCI(device.PCI), 13),
-			fitText(devicePortLabel(device), 4),
 		)
 	}
 	renderMoreDevicesLine(tty, len(review.Devices), deviceLimit)
@@ -270,6 +270,7 @@ func renderNICBindingReviewCompact(tty io.Writer, review *nicBindingReview, widt
 			if apply != "-" {
 				fmt.Fprintf(tty, "    apply: %s\n", fitText(apply, maxInt(10, width-11)))
 			}
+			fmt.Fprintf(tty, "    why:   %s\n", fitText(bindingReasonLabel(binding), maxInt(10, width-11)))
 		}
 		if idx == review.Selected && review.DropdownOpen {
 			renderReviewDropdown(tty, review, width)
@@ -310,16 +311,18 @@ func renderReviewDetails(tty io.Writer, review *nicBindingReview, width int) {
 			fitText(valueOrDash(binding.Address), 18),
 			fitText(afterApplyLabel(binding), maxInt(12, width-62)),
 		)
+		fmt.Fprintf(tty, "    Why: %s\n", fitText(bindingReasonLabel(binding), maxInt(10, width-10)))
 	}
 	device := activeReviewDevice(review)
 	if device == nil {
 		fmt.Fprintln(tty, "    NIC:  -")
 		return
 	}
-	detail := fmt.Sprintf("NIC: %s  mac=%s  speed=%s  link=%s  driver=%s  model=%s  pci=%s  port=%s",
+	detail := fmt.Sprintf("NIC: %s  mac=%s  max/current=%s  mtu=%s  link=%s  driver=%s  model=%s  pci=%s  port=%s",
 		device.Name,
 		valueOrDash(device.MAC),
-		deviceSpeedLabel(*device),
+		deviceCapacityLabel(*device),
+		deviceMTULabel(*device),
 		deviceLinkLabel(*device),
 		valueOrDash(device.Driver),
 		deviceModelLabel(*device),
@@ -676,9 +679,11 @@ func (review *nicBindingReview) applyTargetDropdown() {
 		otherCurrent := physicalBindingFields(review.Bindings[otherIdx])
 		review.Bindings[otherIdx] = copyPlanFields(review.Bindings[otherIdx], review.Bindings[review.Selected])
 		applyPhysicalBindingFields(&review.Bindings[otherIdx], otherCurrent)
+		markBindingUserSelected(&review.Bindings[otherIdx])
 	}
 	review.Bindings[review.Selected] = copyPlanFields(review.Bindings[review.Selected], selectedPlan)
 	applyPhysicalBindingFields(&review.Bindings[review.Selected], selectedCurrent)
+	markBindingUserSelected(&review.Bindings[review.Selected])
 	review.DropdownOpen = false
 	review.DropdownMode = ""
 	review.Message = fmt.Sprintf("selected target %s for %s", selectedPlan.Name, valueOrDash(review.Bindings[review.Selected].CurrentName))
@@ -701,9 +706,11 @@ func (review *nicBindingReview) applyNICDropdown() {
 		if otherCurrent.MAC == "" && otherCurrent.CurrentName == "" {
 			review.Bindings[otherIdx].NeedsReview = true
 		}
+		markBindingUserSelected(&review.Bindings[otherIdx])
 	}
 	applyPhysicalBindingFields(&review.Bindings[review.Selected], physicalBinding{MAC: selected.MAC, CurrentName: selected.Name})
 	review.Bindings[review.Selected].NeedsReview = false
+	markBindingUserSelected(&review.Bindings[review.Selected])
 	review.DropdownOpen = false
 	review.DropdownMode = ""
 	review.Message = fmt.Sprintf("selected NIC %s for %s", selected.Name, review.Bindings[review.Selected].Name)
@@ -775,6 +782,11 @@ func physicalBindingFields(binding interfaceBinding) physicalBinding {
 func applyPhysicalBindingFields(binding *interfaceBinding, fields physicalBinding) {
 	binding.MAC = fields.MAC
 	binding.CurrentName = fields.CurrentName
+}
+
+func markBindingUserSelected(binding *interfaceBinding) {
+	binding.Reason = "user selected"
+	binding.Confidence = "manual"
 }
 
 func copyPlanFields(binding interfaceBinding, plan interfaceBinding) interfaceBinding {
@@ -921,6 +933,48 @@ func deviceSpeedLabel(device netDevice) string {
 		return fmt.Sprintf("%dG", device.SpeedMbps/1000)
 	}
 	return fmt.Sprintf("%dM", device.SpeedMbps)
+}
+
+func deviceCapacityLabel(device netDevice) string {
+	maxSpeed := device.MaxSpeedMbps
+	if maxSpeed <= 0 {
+		maxSpeed = device.SpeedMbps
+	}
+	maxLabel := speedMbpsLabel(maxSpeed)
+	currentLabel := speedMbpsLabel(device.SpeedMbps)
+	if maxLabel == currentLabel {
+		return maxLabel
+	}
+	return maxLabel + "/" + currentLabel
+}
+
+func speedMbpsLabel(speed int) string {
+	if speed <= 0 {
+		return "-"
+	}
+	if speed >= 1000 && speed%1000 == 0 {
+		return fmt.Sprintf("%dG", speed/1000)
+	}
+	return fmt.Sprintf("%dM", speed)
+}
+
+func deviceMTULabel(device netDevice) string {
+	if device.MTU <= 0 {
+		return "-"
+	}
+	return strconv.Itoa(device.MTU)
+}
+
+func bindingReasonLabel(binding interfaceBinding) string {
+	reason := strings.TrimSpace(binding.Reason)
+	confidence := strings.TrimSpace(binding.Confidence)
+	if reason == "" {
+		reason = "existing binding"
+	}
+	if confidence == "" {
+		return reason
+	}
+	return reason + " [" + confidence + "]"
 }
 
 func deviceLinkLabel(device netDevice) string {

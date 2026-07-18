@@ -17,7 +17,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -40,12 +42,13 @@ type releaseManifest struct {
 }
 
 type manifestProfile struct {
-	ID          string          `json:"id"`
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	Assets      []manifestAsset `json:"assets"`
-	Bundle      manifestAsset   `json:"bundle"`
-	Inventory   manifestAsset   `json:"inventory"`
+	ID           string          `json:"id"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description"`
+	MaterialRoot string          `json:"material_root"`
+	Assets       []manifestAsset `json:"assets"`
+	Bundle       manifestAsset   `json:"bundle"`
+	Inventory    manifestAsset   `json:"inventory"`
 }
 
 type manifestAsset struct {
@@ -59,6 +62,7 @@ func main() {
 	outputDir := flag.String("output-dir", ".", "Output directory for manifest/profile downloads")
 	profile := flag.String("profile", "", "Delivery profile ID to download, for example kylin10sp3-x86_64")
 	listProfiles := flag.Bool("list-profiles", false, "List delivery profiles in the embedded manifest")
+	jobs := flag.Int("jobs", 6, "Concurrent material file downloads")
 	flag.Parse()
 
 	opts := runOptions{
@@ -66,6 +70,7 @@ func main() {
 		OutputDir:    *outputDir,
 		Profile:      *profile,
 		ListProfiles: *listProfiles,
+		Jobs:         *jobs,
 		Stdin:        os.Stdin,
 		Stdout:       os.Stdout,
 	}
@@ -80,6 +85,7 @@ type runOptions struct {
 	OutputDir    string
 	Profile      string
 	ListProfiles bool
+	Jobs         int
 	Stdin        io.Reader
 	Stdout       io.Writer
 }
@@ -153,6 +159,14 @@ func resolveDownloadURL() (string, error) {
 }
 
 func resolveDownloadURLForPath(filePath string) (string, error) {
+	token, err := loginAList()
+	if err != nil {
+		return "", err
+	}
+	return resolveDownloadURLForPathWithToken(filePath, token)
+}
+
+func loginAList() (string, error) {
 	username, err := decodeCredential(alistUserB64)
 	if err != nil {
 		return "", fmt.Errorf("decode AList username: %w", err)
@@ -178,7 +192,14 @@ func resolveDownloadURLForPath(filePath string) (string, error) {
 	if loginResponse.Code != 200 || loginResponse.Data.Token == "" {
 		return "", fmt.Errorf("AList login failed: code=%d message=%s", loginResponse.Code, loginResponse.Message)
 	}
+	return loginResponse.Data.Token, nil
+}
 
+func resolveDownloadURLForPathWithToken(filePath, token string) (string, error) {
+	return resolveDownloadURLForPathWithTokenAndRefresh(filePath, token, true)
+}
+
+func resolveDownloadURLForPathWithTokenAndRefresh(filePath, token string, refresh bool) (string, error) {
 	var fileResponse struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
@@ -186,10 +207,10 @@ func resolveDownloadURLForPath(filePath string) (string, error) {
 			RawURL string `json:"raw_url"`
 		} `json:"data"`
 	}
-	if err := postJSON("/api/fs/get", loginResponse.Data.Token, map[string]any{
+	if err := postJSON("/api/fs/get", token, map[string]any{
 		"path":     filePath,
 		"password": "",
-		"refresh":  true,
+		"refresh":  refresh,
 	}, &fileResponse); err != nil {
 		return "", err
 	}
@@ -220,9 +241,18 @@ func runManifestMode(opts runOptions, rawManifest string) error {
 		outputDir = "."
 	}
 	fmt.Fprintf(opts.Stdout, "Downloading env_tool %s profile %s\n", valueOrDefault(manifest.Version, releaseVersion), profile.ID)
+	token, err := loginAList()
+	if err != nil {
+		return err
+	}
 	assets := profileDownloadAssets(manifest, profile)
 	for _, asset := range assets {
-		if err := downloadManifestAsset(outputDir, asset); err != nil {
+		if err := downloadManifestAsset(outputDir, asset, token); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(profile.MaterialRoot) != "" {
+		if err := downloadProfileMaterials(outputDir, profile, token, opts.Jobs, opts.Stdout); err != nil {
 			return err
 		}
 	}
@@ -321,7 +351,316 @@ func profileDownloadAssets(manifest releaseManifest, profile manifestProfile) []
 	return assets
 }
 
-func downloadManifestAsset(outputDir string, asset manifestAsset) error {
+type alistMaterialEntry struct {
+	Name           string            `json:"name"`
+	Size           int64             `json:"size"`
+	IsDir          bool              `json:"is_dir"`
+	Modified       string            `json:"modified"`
+	HashInfo       map[string]string `json:"hash_info"`
+	LegacyHashInfo map[string]string `json:"hashinfo"`
+}
+
+type materialFile struct {
+	RemotePath   string
+	RelativePath string
+	Size         int64
+	Modified     string
+	SHA256       string
+}
+
+func downloadProfileMaterials(outputDir string, profile manifestProfile, token string, jobs int, stdout io.Writer) error {
+	root := path.Clean(strings.ReplaceAll(strings.TrimSpace(profile.MaterialRoot), "\\", "/"))
+	if !path.IsAbs(root) || root == "/" {
+		return fmt.Errorf("profile %s material_root must be an absolute AList directory below /, got %q", profile.ID, profile.MaterialRoot)
+	}
+	files, err := collectMaterialFiles(token, root)
+	if err != nil {
+		return fmt.Errorf("list material profile %s: %w", profile.ID, err)
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("material profile %s is empty at %s", profile.ID, root)
+	}
+	if jobs <= 0 {
+		jobs = 6
+	}
+	if jobs > 32 {
+		jobs = 32
+	}
+	if jobs > len(files) {
+		jobs = len(files)
+	}
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	fmt.Fprintf(stdout, "Material profile %s: %d files from %s using %d workers\n", profile.ID, len(files), root, jobs)
+
+	queue := make(chan materialFile, len(files))
+	for _, file := range files {
+		queue <- file
+	}
+	close(queue)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	completed := 0
+	for worker := 0; worker < jobs; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for file := range queue {
+				mu.Lock()
+				stopped := firstErr != nil
+				mu.Unlock()
+				if stopped {
+					continue
+				}
+				if err := downloadMaterialFile(outputDir, profile.ID, token, file); err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+					continue
+				}
+				mu.Lock()
+				completed++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	fmt.Fprintf(stdout, "Material profile %s assembled: %d/%d files under %s\n", profile.ID, completed, len(files), filepath.Join(outputDir, "data"))
+	return nil
+}
+
+func collectMaterialFiles(token, root string) ([]materialFile, error) {
+	var files []materialFile
+	var walk func(string, string) error
+	walk = func(remoteDir, relativeDir string) error {
+		entries, err := listAListDirectory(remoteDir, token)
+		if err != nil {
+			return err
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].IsDir != entries[j].IsDir {
+				return entries[i].IsDir
+			}
+			return entries[i].Name < entries[j].Name
+		})
+		for _, entry := range entries {
+			name := strings.TrimSpace(entry.Name)
+			if shouldSkipMaterialEntry(name) {
+				continue
+			}
+			if err := validateMaterialEntryName(name); err != nil {
+				return fmt.Errorf("invalid entry below %s: %w", remoteDir, err)
+			}
+			remotePath := path.Join(remoteDir, name)
+			relativePath := path.Join(relativeDir, name)
+			if entry.IsDir {
+				if err := walk(remotePath, relativePath); err != nil {
+					return err
+				}
+				continue
+			}
+			files = append(files, materialFile{
+				RemotePath:   remotePath,
+				RelativePath: relativePath,
+				Size:         entry.Size,
+				Modified:     entry.Modified,
+				SHA256:       materialSHA256(entry),
+			})
+		}
+		return nil
+	}
+	if err := walk(root, ""); err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+func listAListDirectory(directory, token string) ([]alistMaterialEntry, error) {
+	const perPage = 500
+	var entries []alistMaterialEntry
+	for pageNumber := 1; ; pageNumber++ {
+		var response struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Data    struct {
+				Content []alistMaterialEntry `json:"content"`
+				Total   int                  `json:"total"`
+			} `json:"data"`
+		}
+		if err := postJSON("/api/fs/list", token, map[string]any{
+			"path": directory, "password": "", "page": pageNumber, "per_page": perPage, "refresh": pageNumber == 1,
+		}, &response); err != nil {
+			return nil, err
+		}
+		if response.Code != 200 {
+			return nil, fmt.Errorf("AList directory lookup %s failed: code=%d message=%s", directory, response.Code, response.Message)
+		}
+		entries = append(entries, response.Data.Content...)
+		if len(response.Data.Content) == 0 || (response.Data.Total > 0 && response.Data.Total <= len(entries)) || len(response.Data.Content) < perPage {
+			break
+		}
+	}
+	return entries, nil
+}
+
+func validateMaterialEntryName(name string) error {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") {
+		return fmt.Errorf("material entry name %q is not a single path component", name)
+	}
+	return nil
+}
+
+func shouldSkipMaterialEntry(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	return lower == ".ds_store" || lower == "thumbs.db" || strings.HasPrefix(lower, "._")
+}
+
+func materialSHA256(entry alistMaterialEntry) string {
+	for _, values := range []map[string]string{entry.HashInfo, entry.LegacyHashInfo} {
+		for name, value := range values {
+			if strings.EqualFold(strings.TrimSpace(name), "sha256") {
+				return strings.ToLower(strings.TrimSpace(value))
+			}
+		}
+	}
+	return ""
+}
+
+func downloadMaterialFile(outputDir, profileID, token string, file materialFile) error {
+	dataRoot := filepath.Join(outputDir, "data")
+	output, err := assetOutputPath(dataRoot, filepath.FromSlash(file.RelativePath))
+	if err != nil {
+		return err
+	}
+	complete, err := materialFileAlreadyComplete(outputDir, profileID, output, file)
+	if err != nil {
+		return err
+	}
+	if complete {
+		return nil
+	}
+	// Directory enumeration already refreshed the material tree. Avoid forcing
+	// another storage refresh for every file in a large offline repository.
+	downloadURL, err := resolveDownloadURLForPathWithTokenAndRefresh(file.RemotePath, token, false)
+	if err != nil {
+		return fmt.Errorf("resolve material %s: %w", file.RemotePath, err)
+	}
+	partialOutput := output + ".part"
+	if err := downloadFile(partialOutput, downloadURL, false); err != nil {
+		return fmt.Errorf("download material %s: %w", file.RemotePath, err)
+	}
+	if err := verifyMaterialFile(partialOutput, file); err != nil {
+		return fmt.Errorf("verify material %s: %w", file.RemotePath, err)
+	}
+	if err := os.Remove(output); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove previous material %s: %w", file.RelativePath, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
+		return fmt.Errorf("create material directory for %s: %w", file.RelativePath, err)
+	}
+	if err := os.Rename(partialOutput, output); err != nil {
+		return fmt.Errorf("install material %s: %w", file.RelativePath, err)
+	}
+	if err := applyArchiveMode(output, materialFileMode(file.RelativePath)); err != nil {
+		return err
+	}
+	if err := writeMaterialMarker(outputDir, profileID, file); err != nil {
+		return err
+	}
+	return nil
+}
+
+func materialFileAlreadyComplete(outputDir, profileID, output string, file materialFile) (bool, error) {
+	info, err := os.Stat(output)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect material %s: %w", file.RelativePath, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() != file.Size {
+		return false, nil
+	}
+	if file.SHA256 != "" {
+		if err := verifySHA256(output, file.SHA256); err != nil {
+			return false, nil
+		}
+		if err := applyArchiveMode(output, materialFileMode(file.RelativePath)); err != nil {
+			return false, err
+		}
+		if err := writeMaterialMarker(outputDir, profileID, file); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	marker, err := os.ReadFile(materialMarkerPath(outputDir, file.RemotePath))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read material marker: %w", err)
+	}
+	if string(marker) != materialFingerprint(profileID, file) {
+		return false, nil
+	}
+	if err := applyArchiveMode(output, materialFileMode(file.RelativePath)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func verifyMaterialFile(localPath string, file materialFile) error {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return err
+	}
+	if info.Size() != file.Size {
+		return fmt.Errorf("size mismatch: expected %d, got %d", file.Size, info.Size())
+	}
+	if file.SHA256 != "" {
+		return verifySHA256(localPath, file.SHA256)
+	}
+	return nil
+}
+
+func materialMarkerPath(outputDir, remotePath string) string {
+	sum := sha256.Sum256([]byte(remotePath))
+	return filepath.Join(outputDir, ".envinit-downloads", "materials", hex.EncodeToString(sum[:])+".complete")
+}
+
+func materialFingerprint(profileID string, file materialFile) string {
+	return fmt.Sprintf("profile=%s\npath=%s\nsize=%d\nmodified=%s\nsha256=%s\n", profileID, file.RemotePath, file.Size, file.Modified, file.SHA256)
+}
+
+func writeMaterialMarker(outputDir, profileID string, file materialFile) error {
+	marker := materialMarkerPath(outputDir, file.RemotePath)
+	if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+		return fmt.Errorf("create material marker directory: %w", err)
+	}
+	if err := os.WriteFile(marker, []byte(materialFingerprint(profileID, file)), 0o644); err != nil {
+		return fmt.Errorf("write material marker: %w", err)
+	}
+	return nil
+}
+
+func materialFileMode(relativePath string) os.FileMode {
+	lower := strings.ToLower(filepath.ToSlash(relativePath))
+	base := path.Base(lower)
+	if strings.HasSuffix(lower, ".sh") || strings.HasSuffix(lower, ".run") || base == "xpu_exporter" {
+		return 0o755
+	}
+	return 0o644
+}
+
+func downloadManifestAsset(outputDir string, asset manifestAsset, token string) error {
 	if strings.TrimSpace(asset.Path) == "" {
 		return errors.New("manifest asset path is required")
 	}
@@ -351,7 +690,7 @@ func downloadManifestAsset(outputDir string, asset manifestAsset) error {
 		fmt.Println("  existing file already matches SHA256")
 		return assembleManifestArchive(outputDir, output, asset.SHA256)
 	}
-	downloadURL, err := resolveDownloadURLForPath(asset.Path)
+	downloadURL, err := resolveDownloadURLForPathWithToken(asset.Path, token)
 	if err != nil {
 		return err
 	}
@@ -614,6 +953,10 @@ func postJSON(path, token string, body any, output any) error {
 }
 
 func download(output, url string) error {
+	return downloadFile(output, url, true)
+}
+
+func downloadFile(output, url string, reportProgress bool) error {
 	var offset int64
 	if info, err := os.Stat(output); err == nil {
 		offset = info.Size()
@@ -628,7 +971,9 @@ func download(output, url string) error {
 	}
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
-		fmt.Printf("Resuming at byte %d\n", offset)
+		if reportProgress {
+			fmt.Printf("Resuming at byte %d\n", offset)
+		}
 	}
 
 	resp, err := client.Do(req)
@@ -673,7 +1018,9 @@ func download(output, url string) error {
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close output: %w", err)
 	}
-	fmt.Printf("Downloaded %d bytes in %s\n", written, time.Since(start).Round(time.Second))
+	if reportProgress {
+		fmt.Printf("Downloaded %d bytes in %s\n", written, time.Since(start).Round(time.Second))
+	}
 	return nil
 }
 

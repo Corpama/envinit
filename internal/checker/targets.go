@@ -27,7 +27,7 @@ func resolveTargets(records []spec.MachineRecord, hostInputs []string, requireIn
 			if err != nil {
 				return nil, err
 			}
-			key := strings.ToLower(target.Address)
+			key := strings.ToLower(targetControlAddress(target))
 			if seen[key] {
 				continue
 			}
@@ -54,31 +54,80 @@ func splitHosts(raw string) []string {
 
 func resolveTarget(records []spec.MachineRecord, input string, requireInventoryMgmtIP bool) (Target, error) {
 	input = strings.TrimSpace(input)
+	identity, endpoint, explicit, err := parseTargetInput(input)
+	if err != nil {
+		return Target{}, err
+	}
 	for _, record := range records {
-		if matchesRecord(record, input) {
+		if matchesRecord(record, identity) {
 			address := strings.TrimSpace(record.MgmtIP)
-			if address == "" && requireInventoryMgmtIP {
-				return Target{}, fmt.Errorf("inventory record %q has no mgmt_ip", input)
+			controlAddress := address
+			if explicit {
+				controlAddress = endpoint
+			}
+			if controlAddress == "" && requireInventoryMgmtIP {
+				return Target{}, fmt.Errorf("inventory record %q has no mgmt_ip; provide a reachable endpoint only with discover as %s=<ssh-address>", identity, identity)
+			}
+			if controlAddress == "" {
+				controlAddress = endpoint
 			}
 			if address == "" {
-				address = input
+				address = controlAddress
 			}
 			return Target{
-				Input:            input,
-				Name:             firstNonEmpty(record.Hostname, record.HostID, record.MgmtIP),
-				ExpectedHostname: firstNonEmpty(record.Hostname, record.HostID),
-				Address:          address,
-				RDMA:             append([]spec.RDMARecord{}, record.RDMA...),
+				Input:             identity,
+				Name:              firstNonEmpty(record.Hostname, record.HostID, record.MgmtIP),
+				ExpectedHostname:  firstNonEmpty(record.Hostname, record.HostID),
+				InventoryIdentity: firstNonEmpty(record.HostID, record.Hostname, record.MgmtIP),
+				InventoryMatched:  true,
+				ExplicitIdentity:  explicit,
+				ControlAddress:    controlAddress,
+				Address:           address,
+				RDMA:              append([]spec.RDMARecord{}, record.RDMA...),
 			}, nil
 		}
 	}
-	if input == "" {
+	if identity == "" {
 		return Target{}, errors.New("empty host in --hosts")
 	}
-	if net.ParseIP(input) != nil {
-		return Target{Input: input, Name: input, Address: input}, nil
+	if explicit {
+		return Target{
+			Input:             identity,
+			Name:              identity,
+			InventoryIdentity: identity,
+			ExplicitIdentity:  true,
+			ControlAddress:    endpoint,
+			Address:           endpoint,
+		}, nil
 	}
-	return Target{Input: input, Name: input, Address: input}, nil
+	if net.ParseIP(endpoint) != nil {
+		return Target{Input: endpoint, Name: endpoint, ControlAddress: endpoint, Address: endpoint}, nil
+	}
+	return Target{Input: endpoint, Name: endpoint, ControlAddress: endpoint, Address: endpoint}, nil
+}
+
+func parseTargetInput(input string) (identity, endpoint string, explicit bool, err error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", false, errors.New("empty host in --hosts")
+	}
+	if !strings.Contains(input, "=") {
+		return input, input, false, nil
+	}
+	parts := strings.Split(input, "=")
+	if len(parts) != 2 {
+		return "", "", false, fmt.Errorf("invalid --hosts target %q; expected inventory-id=ssh-address", input)
+	}
+	identity = strings.TrimSpace(parts[0])
+	endpoint = strings.TrimSpace(parts[1])
+	if identity == "" || endpoint == "" {
+		return "", "", false, fmt.Errorf("invalid --hosts target %q; both inventory identity and SSH address are required", input)
+	}
+	return identity, endpoint, true, nil
+}
+
+func targetControlAddress(target Target) string {
+	return firstNonEmpty(target.ControlAddress, target.Address)
 }
 
 func matchesRecord(record spec.MachineRecord, input string) bool {
@@ -95,13 +144,13 @@ func markLocalTargets(targets []Target) []Target {
 	localIPs := localIPSet()
 	localNames := localHostnameSet()
 	for idx := range targets {
-		address := strings.TrimSpace(targets[idx].Address)
+		address := strings.TrimSpace(targetControlAddress(targets[idx]))
 		ip := net.ParseIP(address)
 		if ip != nil && (ip.IsLoopback() || localIPs[ip.String()]) {
 			targets[idx].Local = true
 			continue
 		}
-		for _, name := range []string{targets[idx].Input, targets[idx].Name, targets[idx].ExpectedHostname, targets[idx].Address} {
+		for _, name := range []string{targets[idx].Input, targets[idx].Name, targets[idx].ExpectedHostname, targetControlAddress(targets[idx])} {
 			if localNames[strings.ToLower(strings.TrimSpace(name))] {
 				targets[idx].Local = true
 				break
@@ -162,7 +211,7 @@ func warnHostnameMismatches(opts Options, targets []Target) {
 		}
 		actual, err := runCommand(opts.Bundle.Check, target, "hostnamectl --static 2>/dev/null || hostname")
 		if err != nil {
-			fmt.Fprintf(opts.Output, "WARN hostname check failed for %s (%s): %v; continuing\n", target.Name, target.Address, err)
+			fmt.Fprintf(opts.Output, "WARN hostname check failed for %s (%s): %v; continuing\n", target.Name, targetControlAddress(target), err)
 			continue
 		}
 		actual = strings.TrimSpace(actual)
@@ -173,6 +222,6 @@ func warnHostnameMismatches(opts Options, targets []Target) {
 		if target.Local {
 			location = "local"
 		}
-		fmt.Fprintf(opts.Output, "WARN hostname mismatch: inventory %s expects hostname=%s, %s target %s reports %s; continuing because target is selected by mgmt_ip=%s\n", target.Name, expected, location, target.Name, actual, target.Address)
+		fmt.Fprintf(opts.Output, "WARN hostname mismatch: inventory %s expects hostname=%s, %s target %s reports %s; continuing because target is selected by control_address=%s\n", target.Name, expected, location, target.Name, actual, targetControlAddress(target))
 	}
 }

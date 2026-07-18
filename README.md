@@ -22,8 +22,10 @@
 | --- | --- | --- |
 | `plan` | 解析规划文件，通过按 stage 浏览的 TUI 预览目标机器、写入文件和执行动作；非交互终端或 `--plain` 时输出纯文本 | 否 |
 | `apply` | 按 stage 执行初始化 | 是，需要 `root` |
-| `discover` | 通过 SSH 自动发现管理网和 RDMA 网络信息，并写回规划表 | 是，修改规划表文件，不修改目标机系统配置 |
-| `check` | 在两台或更多机器之间执行 RDMA 带宽和大包 ping 检查 | 否，但需要 SSH 和 RDMA 环境 |
+| `discover` | 在本机或通过 SSH 自动发现管理网和 RDMA 网络信息，并写回规划表 | 是，修改规划表文件，不修改目标机系统配置 |
+| `check` | 执行 RDMA 带宽、大包 ping，以及可选的单机/多机 XCCL 集合通信检查 | 标准 bandwidth/ping 只产生测试流量；XCCL 会创建并在结束时清理临时运行时、临时 SSH key 和本轮授权行 |
+
+推荐阅读顺序：第一次交付先看第 2～4 节完成下载和规划，再看第 5～7 节理解 apply 和配置字段，最后按第 8 节执行 discover/check；遇到报错先查第 9 节。所有命令都可以使用 `--help` 查看当前二进制实际支持的参数。
 
 ## 2. 文件放置
 
@@ -55,7 +57,7 @@ U 盘挂载到 `/mnt/usb` 后，推荐保留以下结构。`data/` 必须和执�
 二进制选择：
 
 - `env_init`：x86-64 机器。
-- `env_init_arch`：ARM64 / aarch64 机器。
+- `env_init_arch`：ARM64 / aarch64 兼容构建。当前 release 没有 ARM64 系统物料 profile，不能把 x86-64 OFED/XRE/XDR 包直接用于 ARM 服务器；只有另行准备匹配物料和 bundle 后才能使用该二进制。
 
 首次执行前确认二进制可执行：
 
@@ -97,7 +99,9 @@ data/profiles/
     └── single_rpm/
 ```
 
-发布脚本会按 profile 拉取对应目录，打包为 `env_tool-data-<profile>-<release>.tar`。下载器校验归档 SHA256 后会自动解包 base 和所选 profile，把两者组装到同一个 `env_tool` 输出目录，再将 profile 对应的 bundle 模板写入 `planning/bundle.json`。成功组装后的临时 tar 会删除，避免在 U 盘上重复占用空间。
+`data/profiles/` 是长期维护的物料区，不属于每个 GitHub release 的版本包。发版脚本不会读取、下载或重新打包这些大文件，只发布轻量的 base、各 profile 的 bundle、inventory 样例、manifest 和跨平台 downloader。manifest 为每个 profile 记录稳定物料目录，例如 `/data/profiles/ubuntu22.04-x86_64`。
+
+downloader 执行时才登录 AList，递归读取所选 profile 的物料目录，并把该目录下面的内容直接组装到输出目录的 `data/`。因此发布新版本不会为了几 GB 的离线源和驱动包触发一次完整物料读取，交付人员也不需要手工解包或搬运 profile 归档。
 
 ## 3. 下载器和 profile 选择
 
@@ -110,11 +114,34 @@ data/profiles/
 请输入序号或 profile ID:
 ```
 
+先根据执行 downloader 的电脑选择发布资产。这里选择的是下载和组装物料所用电脑的系统，不是最终服务器系统；最终服务器系统由 `--profile` 决定：
+
+| 执行电脑 | 发布资产 |
+| --- | --- |
+| Linux x86-64 | `env_tool_downloader-linux-amd64` |
+| Linux ARM64 | `env_tool_downloader-linux-arm64` |
+| Intel Mac | `env_tool_downloader-darwin-amd64` |
+| Apple Silicon Mac | `env_tool_downloader-darwin-arm64` |
+| Windows x86-64 | `env_tool_downloader-windows-amd64.exe` |
+| Windows ARM64 | `env_tool_downloader-windows-arm64.exe` |
+
+Linux/macOS 可以保留发布文件名，也可以重命名为 `downloader`。首次运行前增加执行权限：
+
+```bash
+chmod +x env_tool_downloader-linux-amd64
+./env_tool_downloader-linux-amd64 --list-profiles
+```
+
+运行前应把文件摘要与 release 中的 `SHA256SUMS` 对照。Linux 使用 `sha256sum <文件>`，macOS 使用 `shasum -a 256 <文件>`，Windows PowerShell 使用 `Get-FileHash <文件> -Algorithm SHA256`。macOS 若在摘要确认无误后仍因下载隔离属性拒绝运行，可执行 `xattr -d com.apple.quarantine <文件>`，再重新运行；这会修改本地下载文件属性，不影响目标服务器。
+
 也可以用命令行直接指定：
 
 ```bash
 ./downloader --profile ubuntu22.04-x86_64 --output-dir /mnt/usb/env_tool
 ./downloader --profile kylin10sp3-x86_64 --output-dir /mnt/usb/env_tool
+
+# 网络或存储端承载较低时可降低并发数
+./downloader --profile kylin10sp3-x86_64 --output-dir /mnt/usb/env_tool --jobs 3
 ```
 
 常用参数：
@@ -124,10 +151,18 @@ data/profiles/
 | `--list-profiles` | 只列出内置 manifest 中支持的 profile，不下载 |
 | `--profile <id>` | 指定 profile，适合非交互环境 |
 | `--output-dir <dir>` | 下载和解包输出目录，通常为 U 盘上的 `env_tool` |
+| `--jobs <n>` | profile 物料并发下载数，默认 6，最大 32 |
+| `--output <path>` | 仅兼容旧版“单归档 downloader”；当前内置 manifest/profile 的 release 不使用该参数，请使用 `--output-dir` |
 
-下载完成后，`planning/bundle.json` 会使用所选系统的模板，`data/` 只包含该系统需要的物料。这样 Ubuntu 和 Kylin 不再互相携带对方的软件源和包。
+下载完成后，`planning/bundle.json` 会使用所选系统的模板，`data/` 来自该 profile 根目录，不会再携带另一个 profile 的目录。downloader 的筛选粒度到 profile 为止：除 `.DS_Store`、AppleDouble、`Thumbs.db` 外，它会递归拉取该根目录下的全部文件，不会再根据 bundle 路径自动过滤历史版本、源码展开目录或备用包。因此 AList 的 `/data/profiles/<profile>` 本身必须整理成可直接交付的最终物料集合。
 
-下载器不依赖目标电脑预装 `tar`：Linux 和 macOS 会保留归档中的 Unix 执行权限；Windows 使用单独的文件属性处理逻辑。已成功组装的归档会在 `.envinit-downloads/` 下记录 SHA256 完成标记，使用相同输出目录重复运行时不会再次下载和解包同一归档。
+`--output-dir` 建议指向一个新的空目录，或者此前由同一 profile 组装的目录。同一 profile 重复运行是安全的，下载器会续传或跳过已完成文件；不要直接在 Ubuntu 已完成目录上改选 Kylin，下载器不会删除新 profile 中不存在的旧文件，否则两个系统的物料会混在一起。需要切换 profile 时请使用另一个输出目录，或先人工确认并清空旧交付目录。
+
+下载器会先校验并自动解包轻量 base，再写入所选 profile 的 bundle 和 inventory 样例，最后递归组装 profile 物料。它不依赖目标电脑预装 `tar`；Linux、macOS 和 Windows 分别使用对应的权限或文件属性处理逻辑，脚本和 `.run` 文件会恢复为可执行文件。目录遍历会忽略 `.DS_Store`、AppleDouble 和 `Thumbs.db` 等系统杂项文件。
+
+base、bundle 和 inventory 使用 manifest 中的 SHA256 校验。profile 物料如果 AList 提供 SHA256，也逐文件校验；否则使用远端路径、大小和修改时间形成完成标记。记录保存在 `.envinit-downloads/`，中断下载会保留 `.part` 文件供续传，使用同一输出目录重复运行时会跳过未变化且已完成的文件。
+
+版本边界需要特别区分：base、bundle 和 inventory 固定属于 downloader 对应的 release；`material_root` 指向长期维护的 profile 目录，物料本身不随 GitHub release tag 再复制一份。因此以后再次运行旧 downloader 时，会读取该 profile 目录当时可见的物料。需要完整复现某次历史交付时，应保留当时已经组装好的 `env_tool` 目录，不能只保留 downloader。
 
 ## 4. 推荐工作流
 
@@ -161,8 +196,10 @@ cd /mnt/usb/env_tool
 
 将 `node1` 替换为当前机器在规划表中的 `host_id`、`hostname` 或 `mgmt_ip`。`plan` 默认打开交互式预览界面：
 
-- `Up/Down`：切换 stage
-- `PgUp/PgDn`：滚动当前 stage 的动作列表
+- `Up/Down` 或 `j/k`：切换 stage
+- `PgUp` 或 `b`：向上滚动当前 stage 的动作列表
+- `PgDn`、`f` 或空格：向下滚动当前 stage 的动作列表
+- `Home/End`：跳到当前 stage 动作列表开头或结尾
 - `q` 或 `Esc`：退出预览
 
 需要一次性打印文本时加 `--plain`：
@@ -174,9 +211,19 @@ cd /mnt/usb/env_tool
   --host node1 \
   --plain
 ```
-- `Detailed actions`
 
-不传 `--host` 时工具会尝试根据当前 hostname、IP 或本机 MAC 自动匹配。现场首次操作建议显式传入 `--host`，这样也会按规划表修正系统 hostname。
+`plan` 参数：
+
+| 参数 | 必需/默认 | 说明 |
+| --- | --- | --- |
+| `--inventory <path>` | 必需 | CSV/TSV/TXT/XLSX 规划表 |
+| `--bundle <path>` | 必需 | bundle JSON |
+| `--host <id>` | 自动匹配本机 | 可写 `host_id`、`hostname` 或 `mgmt_ip`；现场建议显式指定 |
+| `--sheet <name>` | 第一张表 | XLSX 工作表名 |
+| `--stages <list>` | `all` | 只预览指定 stage，支持逗号或空格分隔 |
+| `--plain` | `false` | 输出纯文本，不打开 Plan Preview TUI |
+
+不传 `--host` 时工具会尝试根据当前 hostname、IP 或本机 MAC 自动匹配。现场首次操作建议显式传入 `--host`。`plan` 本身不会修改 hostname，只会显示 apply 将执行的 `hostnamectl set-hostname` 动作；真正修改发生在 `apply`。
 
 ### 4.3 执行初始化
 
@@ -225,10 +272,10 @@ sudo ./env_init apply \
 sudo ./env_init discover \
   --inventory /mnt/usb/env_tool/planning/inventory.csv \
   --bundle /mnt/usb/env_tool/planning/bundle.json \
-  --hosts node1
+  --hosts node1=192.168.32.11
 ```
 
-无人值守自动接受候选时追加 `--yes`；只验证发现结果、不写文件时追加 `--dry-run`。完整的候选来源、排序规则、review 操作、写回范围和参数说明见 8.1 节。
+左侧 `node1` 是要更新的 inventory 身份，右侧是本次可达的 SSH 地址。只有临时 IP 时也可直接写 `--hosts 192.168.32.11`，工具会读取远端 hostname：存在对应行就更新，没有对应行就以 hostname 自动新增。无人值守自动接受候选时追加 `--yes`；只验证发现结果、不写文件时追加 `--dry-run`。完整的目标绑定、候选来源、排序规则、review 操作和写回范围见 8.1 节。
 
 多台机器示例：
 
@@ -236,7 +283,7 @@ sudo ./env_init discover \
 sudo ./env_init discover \
   --inventory /mnt/usb/env_tool/planning/inventory.csv \
   --bundle /mnt/usb/env_tool/planning/bundle.json \
-  --hosts node1,node2 \
+  --hosts node1=192.168.32.11,node2=192.168.32.12 \
   --yes
 ```
 
@@ -292,7 +339,19 @@ sudo ./env_init apply \
 
 `apply` 必须使用 `root` 权限。正式执行前建议先将 `apply` 替换为 `plan`，在预览界面中逐个 stage 检查将要执行的动作。
 
-#### 5.1.1 失败断点续跑
+#### 5.1.1 apply 参数
+
+| 参数 | 必需/默认 | 说明 |
+| --- | --- | --- |
+| `--inventory <path>` | 必需 | CSV/TSV/TXT/XLSX 规划表 |
+| `--bundle <path>` | 必需 | bundle JSON |
+| `--host <id>` | 自动匹配本机 | 可写 `host_id`、`hostname` 或 `mgmt_ip`；现场建议显式指定，避免选错行 |
+| `--sheet <name>` | 第一张表 | XLSX 工作表名 |
+| `--stages <list>` | `all` | 执行全部或指定 stage，支持逗号或空格分隔；`udev` 是单独修复持久化网卡命名规则的 stage |
+| `--restart` | `false` | 仅可和 `--stages all` 使用；删除当前全流程 checkpoint 后从 `software` 重跑 |
+| `--root <path>` | `/` | 测试用的文件系统根前缀；正式交付不要设置，否则写入位置不是真实宿主机根目录 |
+
+#### 5.1.2 失败断点续跑
 
 默认执行或使用 `--stages all` 时，`apply` 会把全流程进度原子写入：
 
@@ -417,13 +476,33 @@ Kylin 路径下，工具会使用 `offline_repo` 生成 yum repo 文件，执行
 
 1. **确定规划槽位。** 管理口目标名来自 inventory 的 `mgmt_iface1/2` 或 bundle defaults；RDMA 目标名和数量来自 inventory 的 `rdma1..rdmaN` 或 defaults。`rdma_mode=off` 时不生成 RDMA 槽位；`configure_management_network=false` 时不生成管理网配置和管理网命名动作。
 2. **优先按 MAC 精确匹配。** inventory 已填写 MAC 时，通过本机 MAC 索引找到当前接口名。MAC 格式非法、重复选择同一物理网卡或确认后仍有槽位未选择都会直接失败。
-3. **扫描候选设备。** 从 `/sys/class/net` 读取接口名、MAC、PCI 地址、驱动、速率、`vendor/device`、`phys_port_name`、`dev_port`、carrier、operstate，以及 PCI 设备下是否存在 Infiniband 设备。忽略 `lo`、bond/team、容器 veth、Calico/CNI、bridge、隧道、OVS、虚拟 overlay 等明显不应参与物理绑定的接口。
-4. **管理网候选过滤。** 排除已知 RDMA 目标名和 RDMA MAC。存在规划管理口但目标名尚未出现时，优先选择能够满足端口数量且链路已连接的同速率/同型号网卡组；无法用链路状态区分时倾向较低速率组。完全没有配置管理口目标名时，只有发现到 1 或 2 个非 RDMA 候选才允许自动形成单口或双口管理配置；候选超过 2 个会报歧义，要求补充接口名或 MAC。
-5. **RDMA 候选过滤。** 排除已知管理口目标名和管理口 MAC。优先选择满足数量的高速同速率网卡组；RDMA 候选通常要求速率至少 200G，或者驱动为 `mlx5_core`，或者 PCI 设备暴露 Infiniband。速率信息不足时再按 PCI vendor/device 或驱动型号分组，最后才使用 `mlx5_core`/Infiniband 兼容回退。
-6. **处理数量和歧义。** 某个候选组数量正好等于规划槽位数时可以形成自动推荐；候选多于槽位时，只有 link-up 端口足以唯一选出所需数量才自动推荐，否则不擅自截取，进入人工选择。候选少于槽位同样进入人工选择，并要求补齐全部槽位后才能继续。
-7. **稳定排列逻辑槽位。** link/carrier 只用于选择候选组或从多余端口中选出当前连接的端口。候选确定后，绑定到 `mgmt1..N`、`rdma1..N` 的顺序固定按 PCI 地址、`dev_port`、`phys_port_name`、当前接口名排列，不再受某个端口临时 up/down 影响。这样同型号机器在不同插线状态下仍能得到一致的默认顺序。
-8. **TUI 最终确认。** TUI 同时展示规划目标、当前接口名、MAC、PCI、驱动、速率、链路状态和 IB 能力。自动发现歧义时不会预填不可靠选择；用户必须为每个槽位选择唯一物理网卡。确认结果会同步到本轮运行内存，并写入 `/var/lib/envinit/selected_interfaces` 和分离的 management/RDMA udev 规则，但不会反向修改 inventory。为兼容现有 RDMA 服务脚本，`/etc/rdma/rdma_conf/selected_interfaces` 会保留为指向新路径的软链接。
+3. **采集统一网卡事实。** 从 `/sys/class/net`、PCI 和 `ethtool` 读取接口名、MAC、PCI 地址、驱动、PCI `vendor/device` 型号、当前速率、最大支持速率、MTU、`phys_port_name`、`dev_port`、carrier、operstate 和 RDMA 能力。忽略 `lo`、bond/team、容器 veth、Calico/CNI、bridge、隧道、OVS、虚拟 overlay 等不应参与物理绑定的接口。
+4. **先分组再判断角色。** apply 和 discover 共用同一个纯判断模块。它先按 PCI 型号、最大支持速率和 RDMA 能力形成硬件组，再用规划数量选择完整组；当前速率、MTU、链路和已有地址只作为附加依据。断链导致当前速率未知时，仍使用最大支持速率，所以一张未接线的 400G 卡不会被排除出其余 400G 同型号卡组成的组。
+5. **精确绑定优先。** 已有 MAC、当前接口名或规划 IP 能精确匹配时直接形成确定性绑定；其他分组依据不能覆盖精确绑定。全新安装且没有任何 IP、默认路由或控制连接证据时不会扣分，仍可根据硬件组和规划数量判断。
+6. **处理数量和歧义。** 例如规划一个管理口和四个 RDMA 口、机器呈现 `1 x 100G + 4 x 400G` 时，完整的四卡高速组推荐为 RDMA，剩余单卡推荐为管理口。如果五张卡的型号、最大速率和能力完全相同，又没有 MAC/IP 可以区分“一管理 + 四 RDMA”，结果标记为 `ambiguous`，不能任选四张。
+7. **稳定排列逻辑槽位。** 候选组确定后，绑定到 `mgmt1..N`、`rdma1..N` 的顺序固定按 PCI 地址、`dev_port`、`phys_port_name`、当前接口名排列。link/carrier 是辅助依据，不改变已选完整硬件组的稳定顺序。
+8. **TUI 最终确认。** TUI 展示规划目标、当前接口名、MAC、PCI、驱动、最大/当前速率、MTU、链路状态，以及简短的 `Why [confidence]`。用户选择的绑定拥有最高优先级，可以覆盖自动推荐；同一物理网卡不能重复使用。确认结果会同步到本轮运行内存，并写入 `/var/lib/envinit/selected_interfaces` 和分离的 management/RDMA udev 规则，但不会反向修改 inventory。为兼容现有 RDMA 服务脚本，`/etc/rdma/rdma_conf/selected_interfaces` 会保留为指向新路径的软链接。
 9. **当前启动周期与重启。** RDMA 接口需要供后续 stage 使用，因此确认后会通过临时名中转，安全处理接口名称互换，再改成规划名。管理接口只有在 `apply_network_immediately=true` 时才会在本轮临时改名；为 `false` 时不会 down/rename 当前管理口，只写配置和持久化规则，等重启后生效。
+
+#### 5.4.2 NIC Binding Review 操作
+
+`Why` 后面的置信度帮助判断自动推荐的依据：`exact` 表示 MAC、已有接口名或规划 IP 精确命中；`strong` 表示硬件分组和规划数量能够形成唯一完整组；`weak` 表示只有不足以独立确认的辅助依据；`ambiguous` 表示存在多个等价选择；`conflict` 表示精确线索彼此冲突。人工改选后显示为 `manual`，其优先级最高。
+
+| 按键 | 作用 |
+| --- | --- |
+| 上下方向键或 `j/k` | 在逻辑槽位、候选网卡或下拉项之间移动 |
+| 空格或 `n` | 打开当前槽位的网卡候选；下拉打开时确认当前候选 |
+| `1`～`9` | 把画面中对应编号的候选网卡直接绑定到当前槽位 |
+| `t` | 打开目标槽位选择，用于把当前绑定切换到另一个 mgmt/RDMA 逻辑槽位 |
+| `p` | 对当前选中物理口执行/停止端口闪灯，便于现场定位插槽 |
+| `r` | 恢复本机的自动推荐结果 |
+| Enter | 校验所有槽位互不重复且完整后接受 |
+| Esc | 关闭当前下拉选择，不退出整个 review |
+| `q` / Ctrl-C | 放弃本次 apply |
+
+人工确认可以覆盖自动判断，但不会扩大 inventory 槽位数。TUI 中没有“自动把四卡规划扩成八卡”的操作；需要扩容规划时使用 discover 的 `+` 操作并写回 inventory，或者先人工增加 `rdma5..rdma8` 列。
+
+apply 只消费 inventory 中已经规划的槽位，不扩展 inventory。例如机器有八张高速卡但只规划 `rdma1..rdma4` 时，本轮只能绑定四个已有 IP，其余卡保留为未使用候选；需要八卡规划时先补充 inventory，或者在网卡已有地址后使用 discover 确认并扩容。
 
 现场安全约束：
 
@@ -623,6 +702,28 @@ ipmitool power soft
 
 默认会先要求人工确认。详细配置示例见 [7.9 post_packages、post_tasks 和 post_power_action](#79-post_packagespost_tasks-和-post_power_action)。
 
+### 5.9 宿主机上的持久化和临时内容
+
+完整 apply 后，宿主机可能留下以下内容。实际写入项由所选 stage、系统 profile、`rdma_mode` 和是否配置管理网决定：
+
+| 位置 | 来源 | 生命周期和用途 |
+| --- | --- | --- |
+| `/var/lib/envinit/apply-progress.json` | 默认全流程 apply | 失败续跑 checkpoint，配置或目标变化时自动失效；`--restart` 删除后重建 |
+| `/var/lib/envinit/selected_interfaces` | `network` / `udev` | 人工确认后的管理网和 RDMA 物理口绑定，供后续运行和启动时复用 |
+| `/etc/rdma/rdma_conf/selected_interfaces` | `network` / `udev` | 指向 `/var/lib/envinit/selected_interfaces` 的兼容软链接，不再单独维护第二份选择数据 |
+| `/var/lib/envinit/mst-devices.json` | `mlxconfig` | 已确认的 `/dev/mst/*_pciconf*` 设备列表；后续运行优先复用，设备状态不一致时重新确认 |
+| `/opt/kunlun-apt-repo`、`/opt/kunlun-rpm-repo` 或 bundle 的 `copy_to` | `software` | 从交付目录复制到本机的离线软件源 |
+| `/etc/apt/sources.list.d/kunlun-offline.list` 或 `/etc/yum.repos.d/kunlun-offline.repo` | `software` | envinit 管理的本地软件源配置；是否禁用其他源由 `platform_options` 控制 |
+| `/opt/kunlun` 或 `artifacts.work_dir` | `ofed`、`xre`、`xdr`、`firmware` | 安装包解压和执行工作目录，不是 apply checkpoint |
+| `/etc/netplan/` 或 `/etc/sysconfig/network-scripts/` 中 envinit 管理的文件 | `network` | 管理网/RDMA 地址、路由和 policy rule；关闭对应网络配置时不会写该侧文件 |
+| `/etc/udev/rules.d/70-kunlun-management-net.rules`、`71-kunlun-rdma-net.rules` | `network` / `udev` | 重启后保持确认过的接口名；管理网和 RDMA 分开维护 |
+| NetworkManager dispatcher 或 networkd-dispatcher 脚本 | `network` | 接口重新 up 后重放 RDMA 路由和 rule，具体路径随系统后端变化 |
+| `/etc/sysctl.conf`、`/etc/default/grub` | `sysctl` / `kernel` | 持久化内核网络参数和启动参数；工具只追加缺少项或更新所管理的参数 |
+| `/usr/local/sbin/kunlun-post-boot.sh`、`/etc/systemd/system/kunlun-post-boot.service` | `post` | 每次开机恢复 ACS、MaxReadReq、ring buffer、adaptive routing 和 CNP DSCP 调优 |
+| `post_packages`、`post_tasks` 指定的目标 | `post` | 属于用户在 bundle 中明确要求安装、复制、移动、创建或执行的内容 |
+
+`check` 不使用 apply checkpoint。bandwidth 和 rdma-ping 只产生测试流量与输出；XCCL 会在 `check.xccl.work_root/<run-id>` 创建本轮运行时，并可能临时创建 `/var/lib/envinit/check-runtime/mpich-5.0.1` 软链接和带本轮标记的 `authorized_keys` 行。正常结束或中途失败都会进入清理，只删除本轮拥有的目录、软链接和授权行；已有系统 MPICH、其他 SSH key 和 SSH 配置不会被删除。
+
 ## 6. planning.csv 结构
 
 ### 6.1 推荐表头
@@ -630,13 +731,13 @@ ipmitool power soft
 | 类型 | 推荐 CSV 列 |
 | --- | --- |
 | 机器信息 | `host_id`, `hostname` |
-| 管理网 | `mgmt_ip`, `mgmt_prefix`, `mgmt_gateway` |
+| 管理网 | `mgmt_ip`, `mgmt_prefix`, `mgmt_gateway`, `mgmt_bond_name`, `mgmt_nameservers` |
 | 管理口 1 | `mgmt_iface1`, `mgmt_mac1` |
 | 管理口 2 | `mgmt_iface2`, `mgmt_mac2` |
-| RDMA 口 1 | `rdma1_name`, `rdma1_ip`, `rdma1_mac` |
-| RDMA 口 2 | `rdma2_name`, `rdma2_ip`, `rdma2_mac` |
-| RDMA 口 3 | `rdma3_name`, `rdma3_ip`, `rdma3_mac` |
-| RDMA 口 4 | `rdma4_name`, `rdma4_ip`, `rdma4_mac` |
+| RDMA 口 1 | `rdma1_name`, `rdma1_ip`, `rdma1_mac`, `rdma1_prefix`, `rdma1_gateway`, `rdma1_table`, `rdma1_route_cidr` |
+| RDMA 口 2 | `rdma2_name`, `rdma2_ip`, `rdma2_mac`, `rdma2_prefix`, `rdma2_gateway`, `rdma2_table`, `rdma2_route_cidr` |
+| RDMA 口 3 | `rdma3_name`, `rdma3_ip`, `rdma3_mac`, `rdma3_prefix`, `rdma3_gateway`, `rdma3_table`, `rdma3_route_cidr` |
+| RDMA 口 4 | `rdma4_name`, `rdma4_ip`, `rdma4_mac`, `rdma4_prefix`, `rdma4_gateway`, `rdma4_table`, `rdma4_route_cidr` |
 | 更多 RDMA 口 | `rdma5_name`, `rdma5_ip` ... |
 
 工具也支持 `.tsv`、`.txt` 和 `.xlsx`。使用 `.xlsx` 时默认读取第一张表，也可以增加 `--sheet Sheet1`。
@@ -645,7 +746,7 @@ ipmitool power soft
 
 | 字段 | 必填条件 | 说明 |
 | --- | --- | --- |
-| `host_id` | 建议填写 | 机器标识，可用于 `--host` 和 `--hosts` |
+| `host_id` | 建议填写 | 机器标识，可用于 `--host`；discover 中可作为 `--hosts host_id=SSH地址` 的左侧写回身份 |
 | `hostname` | 建议填写 | 目标 hostname；显式传入 `--host` 执行 `apply` 时会自动修正 |
 | `mgmt_ip` | 可选 | 管理网 IPv4 地址；为空表示该机器不由工具配置管理网；执行 `discover` 时可自动写回 |
 | `mgmt_prefix` | 配置管理网时可选 | 管理网前缀，例如 `23`；为空时使用 bundle 默认值 |
@@ -659,7 +760,8 @@ ipmitool power soft
 | `rdmaN_mac` | 强烈建议填写 | 第 N 个 RDMA 口 MAC |
 | `rdmaN_prefix` | 可选 | 第 N 个 RDMA 前缀；为空时使用 bundle 默认值 |
 | `rdmaN_gateway` | 可选 | 第 N 个 RDMA 网关；为空时按 RDMA IP 推导 `.1` |
-| `rdmaN_table` | 可选 | 第 N 个 RDMA 路由表号；为空时使用 bundle 默认值 |
+| `rdmaN_table` | 可选 | 第 N 个 RDMA 路由表号；为空时使用 bundle 对应项，仍未配置时按顺序使用 `101、102、103...` |
+| `rdmaN_route_cidr` | 可选 | 第 N 个 RDMA 直连网段；通常按 `rdmaN_ip/prefix` 自动推导，仅特殊路由规划时覆盖 |
 
 其中 `N` 从 `1` 开始，可按机器实际 RDMA 口数量扩展，例如 8 卡机器可填写到 `rdma8_name` / `rdma8_ip`。
 
@@ -760,7 +862,7 @@ bundle 使用严格 JSON 字段校验：字段名拼写错误、已经删除的�
 | `configure_management_network` | 是否配置管理网；默认 `true`。关闭后只配置 RDMA 网络 |
 | `apply_network_immediately` | 是否立即应用网络配置；默认 `true`。关闭后只落文件，不执行 `netplan apply`、`nmcli up` 或 `ifup`。示例配置默认关闭；对已经通过带内网络接入的机器，强烈建议保持为 `false`，避免工具运行过程中重载当前网络导致失联 |
 | `rdma_mode` | RDMA 工作模式：`full`、`names_only` 或 `off`，默认 `full` |
-| `rdma_mtu`、`route_priority` | RDMA 三层网络默认值；RDMA prefix 通常从规划表的 `rdmaN_prefix` 读取，未填写时使用内部默认 `/24` |
+| `rdma_prefix`、`rdma_mtu`、`route_priority` | RDMA 三层网络默认值；`rdma_prefix` 未填写时默认为 `/24`，单机可由规划表的 `rdmaN_prefix` 覆盖 |
 | `rdma_interfaces` | RDMA 默认目标名、路由表号和可选网关；通常可省略，由规划表和自动发现/TUI 绑定生成 |
 
 平台专属的备份、禁用源策略建议放到 `platform_options`。旧配置里放在 `defaults` 下的 `backup_existing_netplan`、`backup_existing_network`、`disable_existing_apt_sources`、`disable_existing_repos` 仍然兼容。
@@ -891,25 +993,25 @@ Kylin yum 路径建议使用 `offline_repo`：
 ```json
 "artifacts": {
   "work_dir": "/opt/kunlun",
-  "ofed_archive": "data/hca/mellanox/MLNX_OFED_LINUX-*.tgz",
-  "xre_installer": "data/xpu_driver/xre-Linux-x86_64.run",
+  "ofed_archive": "data/hca/mellanox/MLNX_OFED_LINUX-24.01-0.3.3.1-ubuntu22.04-x86_64.tgz",
+  "xre_installer": "data/xpu_driver/xre-Linux-x86_64-5.19.0.0.run",
   "xre_args": ["-q"],
-  "xdr_archive": "data/xpu_driver/xdr_copy-x86_64.tar.gz",
-  "firmware_archive": "data/xpu_firmware/p800/update_fw.tar.gz",
+  "xdr_archive": "data/xpu_driver/xdr_copy-x86_64_1.1.0.6.tar.gz",
+  "firmware_archive": "data/xpu_firmware/p800/update_fw_p800_2.15_1.48.tar.gz",
   "container_packages": [
-    "data/xpu_container_toolkit/libxpu-container-tools_amd64.deb",
-    "data/xpu_container_toolkit/libxpu-container1_amd64.deb",
-    "data/xpu_container_toolkit/xpu-container-toolkit_amd64.deb"
+    "data/xpu_container_toolkit/libxpu-container-tools_1.0.5-1_amd64.deb",
+    "data/xpu_container_toolkit/libxpu-container1_1.0.5-1_amd64.deb",
+    "data/xpu_container_toolkit/xpu-container-toolkit_1.0.13-1_amd64.deb"
   ]
 },
 "xre": {
-  "card_model": "P900"
+  "card_model": "P800"
 }
 ```
 
 注意：
 
-- 示例中的 `*` 仅表示需要按现场版本选择文件。JSON 中必须填写真实完整路径，不能直接使用通配符。
+- JSON 中必须填写真实完整路径，不能使用通配符。上例是 Ubuntu profile，Kylin 应使用其 bundle 样例中的 `.tar` OFED 和 `.rpm` 容器包路径。
 - 这些路径同样按当前工作目录解析。使用 `data/...` 时必须先 `cd /mnt/usb/env_tool`。
 - 配置 `xre_installer` 时，必须填写 `xre.card_model`，可选值为 `P800`、`P900`。
 - `P800` 安装建议在 `packages` 中增加 `lsof`。
@@ -924,6 +1026,8 @@ Kylin yum 路径建议使用 `offline_repo`：
 ```
 
 工具会运行 `mst start`，自动扫描 `/dev/mst/*_pciconf*`，让用户确认要配置的 MST 设备，并把选择持久化到 `/var/lib/envinit/mst-devices.json`。后续运行会优先复用该持久化选择。`device_glob` 仍作为兼容旧配置的强制覆盖项保留，通常不需要填写。
+
+MST Device Review 中使用上下方向键或 `j/k` 移动，空格切换当前设备是否选中，`r` 恢复推荐/默认选择，Enter 接受，`q` 或 Ctrl-C 放弃。至少要选择一个设备。TUI 会展示 MST 路径、PCI 地址、设备类型和当前 NET/PCI 状态；不要把与本项目 RDMA 数据面无关的 Mellanox 设备仅因为路径相似就一起选中。
 
 `CNP_DSCP` 不再需要放在 `mlxconfig.settings` 中；工具会在 post boot 脚本中按项目要求固定写入 `48`，确保当前运行和重启后都生效。
 
@@ -963,7 +1067,7 @@ Kylin yum 路径建议使用 `offline_repo`：
   },
   "xccl": {
     "enabled": true,
-    "mpich_archive": "data/misc/mpich-5.0.1-<profile>.tar.gz",
+    "mpich_archive": "data/misc/mpich-5.0.1-ubuntu22.04-x86_64.tar.gz",
     "xccl_archive": "data/misc/xccl_Linux_x86_64-3.2.2.0.tar.gz"
   }
 }
@@ -1004,7 +1108,7 @@ Kylin yum 路径建议使用 `offline_repo`：
 
 `check.xccl` 的完整参数、拓扑生成、环境变量、单机/多机启动和清理机制见 8.6 节。
 
-新 bundle 应使用上述嵌套结构。旧 bundle 中扁平放在 `check` 下的 bandwidth、RDMA ping、SSH 字段仍可读取；新旧结构同时存在时以嵌套结构为准。
+新 bundle 应使用上述嵌套结构。旧 bundle 中扁平放在 `check` 下的 bandwidth、RDMA ping、SSH 字段仍可读取；新旧结构同时存在时以嵌套结构为准。旧 SSH 字段为 `ssh_user`、`ssh_options`，旧 ping 字段为 `rdma_ping_count`、`rdma_ping_payload_size`、`rdma_ping_timeout`；它们只用于兼容已有 bundle，新配置不要继续新增这些扁平字段。
 
 ### 7.9 post_packages、post_tasks 和 post_power_action
 
@@ -1042,6 +1146,18 @@ Kylin yum 路径建议使用 `offline_repo`：
 ]
 ```
 
+各任务类型使用的字段：
+
+| `type` | 必填字段 | 可选字段 | 行为 |
+| --- | --- | --- | --- |
+| `copy` | `source`、`target` | `name`、`mode` | 把交付物料复制到目标路径；`mode` 使用 `0644`、`0755` 这类八进制字符串 |
+| `cmd` | `command` | `name` | 以 root 运行 `bash -lc <command>`；可执行任意命令，交付前必须先在 plan 中核对展开结果 |
+| `mv` | `source`、`target` | `name` | 移动宿主机路径 |
+| `rm` | `path` | `name` | 删除指定宿主机路径 |
+| `mkdir` | `path` | `name`、`mode` | 创建目录，默认权限 `0755` |
+
+`copy.source` 和 bundle 里的其他物料路径一样，`data/...` 相对当前执行目录解析。`mv/rm/mkdir` 操作的是宿主机目标路径，不会自动限制在 `artifacts.work_dir` 内；这些任务应视为 bundle 明确授权的 root 操作。
+
 最终电源动作：
 
 ```json
@@ -1059,6 +1175,8 @@ Kylin yum 路径建议使用 `offline_repo`：
 }
 ```
 
+`confirm=true` 时必须在交互终端输入完整的 `yes` 才执行；非交互输入会跳过。整个 `post_power_action` 省略时默认是 `soft + confirm=true`；如果显式配置了某个 action 但省略 `confirm`，则不会再次询问，因此新配置建议始终明确写出 `confirm`，避免误解。
+
 ## 8. discover 和 check：网络发现与验收
 
 ### 8.1 discover：发现并写回检查网络
@@ -1075,21 +1193,34 @@ Kylin yum 路径建议使用 `offline_repo`：
 sudo ./env_init discover \
   --inventory planning/inventory.csv \
   --bundle planning/bundle.json \
-  --hosts node-a,node-b
+  --hosts node-a=192.168.32.11,node-b=192.168.32.12
 ```
 
-`--hosts` 中的每一项可以是 inventory 中的 `host_id`、`hostname`、`mgmt_ip`，也可以是当前可以直接 SSH 的 IP/主机名。discover 不强制 inventory 预先存在 `mgmt_ip`：没有时先用 `--hosts` 输入值建立控制连接，发现完成后再写回真实管理 IP。
+discover 把“写 inventory 的目标身份”和“本次 SSH 控制地址”分开处理。`--hosts` 支持三种形式：
+
+| 输入 | 解析方式 | 适用场景 |
+| --- | --- | --- |
+| `192.168.32.11` | 先用该地址 SSH，读取远端 `hostname`，再匹配 inventory 的 `hostname`，其次匹配 `host_id`；没有匹配行时以远端 hostname 新增一行 | 装机后只知道临时接入 IP |
+| `node-a` | 兼容原有方式；先匹配 inventory 的 `host_id`/`hostname`/`mgmt_ip`，有 `mgmt_ip` 就用它 SSH，没有则尝试直接连接 `node-a` | inventory 已基本完整或现场 DNS 可解析 |
+| `node-a=192.168.32.11` | 强制把 SSH 地址绑定到指定 inventory 身份；身份可以是已有行，也可以是准备新增的 `host_id` | 最可靠的现场用法，尤其适合未配置正式管理网的机器 |
+
+通过 IP 直连时，如果远端 hostname 没有匹配 inventory，discover 会用该 hostname 同时作为新行的 `host_id` 和 `hostname`，再写入发现并确认的 `mgmt_ip`、`rdmaN_name`、`rdmaN_ip` 等字段。如果 hostname 同时匹配多行，工具会停止并提示改用 `inventory-id=SSH地址`，避免误写。显式映射具有最高优先级；远端 hostname 与已有行不一致时会输出警告，但仍只更新明确指定的行。
+
+SSH 控制地址在本次 discover 全程保持不变。即使发现阶段选出了新的 `mgmt_ip`，后续采集仍走最初可达的控制地址，避免尚未配置的新地址导致连接中断；最终只把确认后的管理地址写回 inventory。
 
 #### 8.1.2 发现流程和选择原理
 
 每台目标机依次经过以下流程：
 
-1. **解析目标**：按 `host_id -> hostname -> mgmt_ip` 匹配 inventory；去重后判断目标是否就是执行机。本机直接运行命令，远端使用 `check.ssh`。
-2. **发现管理网候选**：读取 `ip -o -4 route show default` 和所有 global IPv4。过滤 `lo`、`ib*`、`rdma*`、容器/veth/虚拟网络等明显非管理接口；默认路由所在接口优先，其次优先 bond，再按 IPv4 和接口名稳定排序。
-3. **发现 RDMA 候选**：执行 `show_gids`，只接受包含 IPv4 的记录；过滤 `lo`、bond、容器/虚拟网络。一个接口出现多条 GID 时优先 RoCE v1 记录，然后按 IPv4 数值和接口名排序。
-4. **管理/RDMA 互斥**：把已识别为 RDMA 的接口名和 IPv4 从管理网候选中移除，避免把 400G 地址误写成 `mgmt_ip`。
-5. **review 或自动接受**：默认打开 Network Discovery Review。已有 inventory 的 `rdmaN_name` 或 `rdmaN_ip` 会尽量保持在原逻辑槽位；其余候选按发现顺序填入。
-6. **写回**：更新 `mgmt_ip`、`rdmaN_name`、`rdmaN_ip`，bundle 保持不变。若重新发现的 RDMA 数量变少，会清空该机器多余尾部槽位的 `rdmaN_*` 字段，避免旧的四卡或八卡记录继续制造不存在的参测网卡；仍然存在的槽位会保留 prefix、gateway、table 等人工规划值。
+1. **建立控制连接**：解析普通目标或 `inventory身份=SSH地址`。对未直接命中 inventory 的地址，先通过 `hostnamectl --static`（失败时回退 `hostname`）取得远端身份；本机直接运行命令，远端使用 `check.ssh`。
+2. **锁定写回身份**：远端 hostname 唯一匹配已有行时更新该行，没有匹配时以 hostname 新增一行，匹配多行时拒绝继续；显式映射只认左侧 inventory 身份。控制地址与待写回 `mgmt_ip` 分离，整个发现过程不会中途切换 SSH 地址。
+3. **采集地址和 RDMA 能力**：读取默认路由及所有 global IPv4，并执行 `show_gids`。候选入口统一过滤 `169.254.0.0/16` link-local、loopback、unspecified、multicast 和广播地址，即使这些地址被标成 `scope global` 也不会进入 TUI。一个接口出现多条 GID 时优先 RoCE v1 记录。`show_gids` 只说明接口具备 RDMA 能力，不直接决定它属于数据面；因此像 `eth0/mlx5_0` 这样有正常业务地址且有 GID 的管理口仍会保留在管理候选中。
+4. **采集硬件事实**：读取每张接口的 MAC、PCI、驱动、PCI 型号、最大/当前速率、MTU、链路和物理端口信息。discover 与 apply 把这些信息转换成同一事实模型，区别只在于 discover 通过本地命令或 SSH 远端采集。
+5. **统一分组判断**：先应用 inventory 中已有 MAC、接口名和 IP 的精确匹配，再按“型号 + 最大速率 + RDMA 能力”分组，结合规划数量选择完整的管理/RDMA 硬件组。默认路由、当前地址、MTU 和链路只增强判断，不会让一个弱信号覆盖完整硬件组。
+6. **review 或自动接受**：默认打开 Network Discovery Review，展示每个槽位和候选的最大/当前速率、MTU、链路及简短 `Why [confidence]`。数字键选择是人工硬覆盖；同一网卡不能同时绑定管理网和 RDMA。`weak`、`ambiguous`、`conflict` 结果不能被 `--yes` 静默接受，必须交互确认。
+7. **按最终结果写回**：更新 `mgmt_ip` 和每个已确认 RDMA 槽位的 name、IP、prefix、MAC，bundle 保持不变。扩容依据是自动强推荐或 TUI 最终确认的数量，不是原始 `show_gids` 条目数。
+8. **动态扩展表头**：模板只有四个槽位而最终确认六卡或八卡时，追加到 `rdma6`/`rdma8`。新增槽位复用模板已有字段布局，例如 `name、ip、prefix、gateway、mac、table、route_cidr`；没有可靠采集值的 gateway/table/route CIDR 保持空白。多机器以最大确认数量作为公共表头，卡数较少的行留空。
+9. **安全写回和缩容**：写入使用同目录临时文件和原子替换，并保留原文件权限。数量减少时清空该机器多余尾部槽位，但不删除公共表头。日志和 dry-run 会显示例如 `inventory RDMA slots: 4 -> 8`。
 
 这里的 `rdma1`、`rdma2` 是项目逻辑顺序，不是 `mlx5_1`、`mlx5_2`。discover 会展示 `show_gids` 返回的 IB device 供人判断，但不会把固定 `mlx5_N` 写入 bundle。check 会在每台机器上根据最终确认的 `rdmaN_name` 从 sysfs 重新解析实际 IB device。inventory 已有 RDMA 条目时，apply 和 check 都以该机器的实际条目数量为准；只有完全没有 RDMA 条目时才回退到 bundle 的 `defaults.rdma_interfaces`。
 
@@ -1102,6 +1233,7 @@ Review 左侧是当前机器的 `mgmt`、`rdma1..rdmaN` 槽位，右侧是管理
 | `Tab` / `Shift+Tab`、左右方向键 | 切换目标机器 |
 | 上下方向键、`j` / `k` | 切换当前逻辑槽位 |
 | 数字键 | 把右侧对应候选绑定到当前槽位 |
+| `+` / `-` | 增加一个空 RDMA 槽位，或删除最后一个 RDMA 槽位 |
 | 空格、Backspace、Delete | 清空当前槽位 |
 | `r` | 恢复当前机器的自动选择 |
 | Enter | 校验全部机器并确认 |
@@ -1115,25 +1247,25 @@ Review 左侧是当前机器的 `mgmt`、`rdma1..rdmaN` 槽位，右侧是管理
 | --- | --- | --- |
 | `--inventory <path>` | 是 | 输入 inventory；支持读取 CSV/TSV/TXT/XLSX |
 | `--bundle <path>` | 是 | 主要读取 `check.ssh` 作为控制通道配置 |
-| `--hosts <list>` | 是 | 逗号、空格、分号或竖线分隔的目标列表；允许一台或多台 |
+| `--hosts <list>` | 是 | 逗号、空格、分号或竖线分隔；每项可写 inventory 身份、SSH 地址或 `inventory身份=SSH地址` |
 | `--sheet <name>` | 否 | XLSX 工作表名；缺省读取第一张表 |
-| `--yes` | 否 | 不打开 review，直接采用自动排序结果 |
+| `--yes` | 否 | 不打开 review；只接受 `exact/strong` 自动结论，歧义或冲突仍会失败 |
 | `--dry-run` | 否 | 完成发现和可选 review，但不写 inventory |
 
 常见模式：
 
 ```bash
-# 交互确认后写回
-./env_init discover --inventory planning/inventory.csv --bundle planning/bundle.json --hosts node-a
+# 只有装机后的临时 IP：SSH 后按远端 hostname 唯一匹配 inventory
+./env_init discover --inventory planning/inventory.csv --bundle planning/bundle.json --hosts 192.168.32.11
 
-# 批量自动接受并写回
-./env_init discover --inventory planning/inventory.csv --bundle planning/bundle.json --hosts node-a,node-b --yes
+# 显式指定 inventory 身份和 SSH 地址；推荐用于批量现场交付
+./env_init discover --inventory planning/inventory.csv --bundle planning/bundle.json --hosts node-a=192.168.32.11,node-b=192.168.32.12 --yes
 
 # 非交互环境只预览；--yes 用于跳过必须依赖 TTY 的 review
-./env_init discover --inventory planning/inventory.csv --bundle planning/bundle.json --hosts node-a,node-b --yes --dry-run
+./env_init discover --inventory planning/inventory.csv --bundle planning/bundle.json --hosts node-a=192.168.32.11,node-b=192.168.32.12 --yes --dry-run
 ```
 
-写回仅支持 `.csv`、`.tsv`、`.txt`。工具会保留原分隔符，缺少 `mgmt_ip`、`rdmaN_name`、`rdmaN_ip` 列时自动追加；目标不在现有行中时追加新行；同一目标匹配多行时拒绝写入。XLSX 当前只支持读取，不支持 discover 写回。
+写回仅支持 `.csv`、`.tsv`、`.txt`。工具会保留原分隔符和文件权限，缺少 `mgmt_ip` 或 RDMA 槽位列时自动追加；裸 SSH 地址取得的远端 hostname 没有匹配行时自动新增一行，显式 `新身份=SSH地址` 也可以指定新行的 `host_id`；同一 hostname 或目标匹配多行时拒绝写入。XLSX 当前只支持读取，不支持 discover 写回。
 
 如果某台机器没有任何 IPv4 `show_gids` 候选，discover 直接失败。如果没有合法管理网候选，默认 review 无法确认该机器；工具不会退回使用 RDMA IP 冒充管理 IP。
 
@@ -1153,7 +1285,7 @@ Review 左侧是当前机器的 `mgmt`、`rdma1..rdmaN` 槽位，右侧是管理
 
 一次非 dry-run 的总体顺序是：
 
-1. 从 inventory 解析 `--hosts`，要求 check 目标已有 `mgmt_ip`，并识别本地目标。
+1. 从 inventory 解析 `--hosts` 并识别本地目标。通常使用 inventory 的 `mgmt_ip`；也可以用 `inventory身份=SSH地址` 只覆盖本次控制地址。
 2. 对目标机实际 hostname 与 inventory 不一致的情况打印警告，但仍按选定的管理 IP 继续。
 3. bandwidth/XCCL 按每个 `rdmaN_name` 从 `/sys/class/net/<iface>/device/infiniband/` 解析本机真实 `mlx5_N`；XDR bandwidth 在起流前读取 `xpu-smi topo -m`，XCCL 在自身 stage 内读取 topo。
 4. 采集所有参测 RDMA 网卡的 NIC 计数器 before 快照。
@@ -1168,7 +1300,7 @@ Review 左侧是当前机器的 `mgmt`、`rdma1..rdmaN` 槽位，右侧是管理
 | --- | --- | --- |
 | `--inventory <path>` | 必需 | 读取目标管理 IP、RDMA 逻辑顺序、接口名和地址 |
 | `--bundle <path>` | 必需 | 读取 `check.ssh/bandwidth/rdma_ping/xccl` |
-| `--hosts <list>` | 必需 | `host_id`、`hostname` 或 `mgmt_ip`；支持逗号、空格、分号、竖线分隔 |
+| `--hosts <list>` | 必需 | `host_id`、`hostname`、`mgmt_ip`，或 `inventory身份=SSH地址`；支持逗号、空格、分号、竖线分隔 |
 | `--sheet <name>` | 第一张表 | XLSX inventory 工作表 |
 | `--check-stage <list>` | `all` | `bandwidth`、`rdma-ping`、`xccl` 或组合；`--checks` 是弃用别名 |
 | `--dry-run` | `false` | 不启动测试流量；不同子检查的只读发现边界见下文 |
@@ -1195,6 +1327,8 @@ sudo ./env_init check \
 - XCCL dry-run 同样执行 sysfs、管理接口和 topo 的只读发现，但不分发文件、不生成临时密钥、不修改 `authorized_keys`、不启动流量。
 - dry-run 不采集 before/after 计数器，也不产生真实吞吐结果。
 
+check 的显式映射只覆盖控制通道，不会像 discover 一样按远端 hostname 新增或补齐 inventory。例如 `--hosts node-a=192.168.32.11` 要求左侧 `node-a` 已能唯一匹配 inventory，这样工具才能取得该机器的 `rdmaN_name`、`rdmaN_ip` 和逻辑顺序。不要只给一个未匹配 inventory 的裸 IP 直接执行 check；应先 discover 写回，或使用已有 inventory 身份进行显式映射。
+
 #### 8.2.3 SSH 控制通道
 
 `check.ssh.user` 和 `check.ssh.options` 同时服务于 discover、远端命令、SCP 分发和 XCCL 的外层控制连接。例如：
@@ -1217,13 +1351,13 @@ sudo ./env_init check \
 
 | 功能 | 执行机需要 | 目标机需要 | inventory 需要 |
 | --- | --- | --- | --- |
-| `discover` | `ssh`；本机目标无需 SSH | `ip`、`show_gids` | 能用 `--hosts` 匹配或直连；允许暂时没有 `mgmt_ip` |
-| `bandwidth` | 能控制所有目标 | `ib_write_bw`、`ethtool`、可读取 RDMA sysfs | 至少 `rdmaN_name`；建议同时有 `rdmaN_ip` |
+| `discover` | `ssh`；本机目标无需 SSH | `hostnamectl` 或 `hostname`、`ip`、`show_gids` | 可按远端 hostname 匹配或新增；匹配多行时使用 `inventory身份=SSH地址`；允许暂时没有 `mgmt_ip` |
+| `bandwidth` | 能控制所有目标 | `ib_write_bw`、`ethtool`、可读取 RDMA sysfs | 必须有 `rdmaN_name`；正式 RDMA 验收应同时有 `rdmaN_ip` |
 | `rdma-ping` | 能控制所有目标 | IPv4 `ping`、`ethtool` | 每个参测槽位必须同时有 `rdmaN_name`、`rdmaN_ip` |
-| XDR bandwidth | 同 bandwidth | 支持 mmap 的 `ib_write_bw`、`xpu-smi`、`/dev/xdrdrv` | `rdmaN_name`，topo NIC legend 必须包含对应 IB device |
+| XDR bandwidth | 同 bandwidth | 支持 mmap 的 `ib_write_bw`、`xpu-smi`、`/dev/xdrdrv` | `rdmaN_name`，topo 的直接 `mlx5_N` 列或 NIC legend 必须包含对应 IB device |
 | `xccl` | 多机模式需要 `ssh-keygen`；物料路径从当前工作目录读取 | `xpu-smi`、XRE/XPU 动态库、tar；可运行临时 MPICH/XCCL | 所有机器的 XPU 数和按 XPU 排列的 RDMA 接口顺序必须一致 |
 
-`check` 使用 inventory 中的管理 IP 建立控制连接；如果现场 inventory 尚未补齐，先运行 discover。bundle 中使用 `data/...` 的 MPICH/XCCL 路径时，仍必须从 `env_tool/` 目录启动命令。
+`check` 默认使用 inventory 中的管理 IP 建立控制连接；管理 IP 不可达或尚未写入时，可以用 `inventory身份=SSH地址` 临时覆盖，但 inventory 仍必须存在该机器的 RDMA 规划。标准 bandwidth 在某个目标缺少 `rdmaN_ip` 时会回退到该目标的控制地址作为 peer address，这只是一项兼容行为，通常不能代表规划的 RDMA 数据面；正式验收应先通过 discover 或人工方式补齐 RDMA IP。bundle 中使用 `data/...` 的 MPICH/XCCL 路径时，仍必须从 `env_tool/` 目录启动命令。
 
 ### 8.3 bandwidth：标准 RDMA 带宽检查
 
@@ -1408,12 +1542,12 @@ sudo ./env_init check \
 每台机器独立完成以下映射：
 
 1. 只在 inventory 参测的 `rdmaN_name` 中选择网卡，并从 sysfs 解析其真实 `mlx5_N`。
-2. 解析 `xpu-smi topo -m` 的 XPU/NIC 矩阵和 `NIC Legend`。
+2. 解析 `xpu-smi topo -m` 的 XPU/NIC 矩阵；同时兼容 `NIC0... + NIC Legend` 和直接以 `mlx5_0...` 作为矩阵列名的输出。
 3. 对每个 XPU 按 `PIX -> PXB -> PHB -> NODE -> SYS` 选择最近等级；同一等级存在多个等距网卡时，bandwidth 会保留所有等距映射，用于覆盖全部合理路径。
 4. 根据 XPU 编号生成 offset：`(xpu_index << 60) + 0x90001000`。
 5. 只对“本机 XPU + 本机最近网卡”的合法组合生成流，再对客户端合法组合与服务端合法组合做交叉测试。不会生成某个 XPU 强行使用本机远端 NIC 的无意义路径。
 
-机器间 `mlx5_N` 可以不同，因为两端分别解析；机器有 4 卡或 8 卡也不需要修改 bundle。参测 IB device 不在 NIC legend 中、或某张参测网卡没有任何最近 XPU 时直接失败，防止静默使用错误 offset。
+机器间 `mlx5_N` 可以不同，因为两端分别解析；机器有 4 卡或 8 卡也不需要修改 bundle。参测 IB device 不在 topo 的直接网卡列或 NIC legend 中、或某张参测网卡没有任何最近 XPU 时直接失败，防止静默使用错误 offset。
 
 #### 8.5.3 退化提示
 
@@ -1479,8 +1613,8 @@ bundle 配置示例：
   "work_root": "/tmp/envinit-xccl-check",
   "xpu_home": "/usr/local/xpu",
   "test": "all_reduce",
-  "min_bytes": "128m",
-  "max_bytes": "128m",
+  "min_bytes": "1024",
+  "max_bytes": "256m",
   "step_factor": 2,
   "warmup_iterations": 5,
   "iterations": 20,
@@ -1500,11 +1634,11 @@ bundle 配置示例：
 | --- | --- | --- |
 | `enabled` | `false` | 是否加入默认 `check --check-stage all`；显式指定 `--check-stage xccl` 时仍会执行 |
 | `mpich_archive` | 无 | 当前 profile 的预编译 MPICH 5.0.1 runtime，执行 XCCL 时必需 |
-| `xccl_archive` | 无 | 包含 `perf/<test>` 和 `so/` 的 XCCL 原始包，执行 XCCL 时必需 |
+| `xccl_archive` | 无 | 包含 `systest/xccl_perf` 和 `so/` 的 XCCL 原始包，执行 XCCL 时必需 |
 | `work_root` | `/tmp/envinit-xccl-check` | 每轮远端临时目录的父目录；必须是 `/tmp` 或 `/var/tmp` 下的专用绝对路径 |
 | `xpu_home` | `/usr/local/xpu` | XRE/XPU 用户态安装根目录，必须是绝对路径 |
 | `test` | `all_reduce` | 支持 `all_reduce`、`all_gather`、`all_to_all`、`broadcast`、`reduce`、`reduce_scatter`、`sendrecv` |
-| `min_bytes` / `max_bytes` | `128m` / `128m` | 传给 XCCL perf 的 `-b/-e` 消息范围 |
+| `min_bytes` / `max_bytes` | `1024` / `256m` | 传给 `systest/xccl_perf` 的 `-b/-e` 消息范围；默认覆盖交付测试用例的完整消息曲线 |
 | `step_factor` | `2` | 消息大小步进因子 `-f` |
 | `warmup_iterations` | `5` | 预热次数 `-w`，可为 0 |
 | `iterations` | `20` | 正式迭代次数 `-n`，必须为正数 |
@@ -1513,10 +1647,20 @@ bundle 配置示例：
 | `enable_xdr` | `true` | 是否注入 `BKCL_ENABLE_XDR=1` |
 | `supernode` | `false` | 是否额外设置 switch topology/RDMA verbs/tree threshold 变量 |
 | `socket_interface` | 自动 | `BKCL_SOCKET_IFNAME`；为空时按管理 IP 查找承载接口 |
-| `min_bus_bandwidth_gbs` | `0` | 最大消息结果的最低 `busbw`，单位 `GB/s`；0 只记录 |
+| `min_bus_bandwidth_gbs` | `0` | 倒数第二个消息档位的最低 in-place `busbw`，单位 `GB/s`；0 只记录，只有一个档位时使用该档位 |
 | `environment` | `{}` | 追加没有专用字段的环境变量；不能覆盖 envinit 管理的 PATH、XPU、BKCL 拓扑变量 |
 
-Ubuntu 和 Kylin 必须使用各自 profile 中的 MPICH 包，不能混用。XCCL 原包可以共用。`min_bus_bandwidth_gbs` 的单位是 `GB/s`；设置为 `0` 时只记录结果，设置为正数时使用最大测试消息对应的 `busbw(GB/s)` 判定 PASS/FAIL。
+Ubuntu 和 Kylin 必须使用各自 profile 中的 MPICH 包，不能混用。XCCL 原包可以共用。工具使用统一入口 `systest/xccl_perf`，将 bundle 的 `all_reduce`、`all_gather`、`reduce_scatter`、`all_to_all` 分别转换为程序要求的 `allReduce`、`allGather`、`reduceScatter`、`alltoall`，并固定传入 `-x 1`，即每个 MPI rank 使用一张 XPU。`min_bus_bandwidth_gbs` 的单位是 `GB/s`；设置为 `0` 时只记录结果，设置为正数时按照交付用例取倒数第二个消息档位的 in-place `busbw(GB/s)` 判定 PASS/FAIL；只有一个消息档位时使用该唯一档位。
+
+以单机 8 卡、默认参数为例，最终核心命令等价于：
+
+```bash
+mpirun -np 8 systest/xccl_perf \
+  -O allReduce -x 1 -b 1024 -e 256m -f 2 \
+  -w 5 -n 20 -c 0 -d float
+```
+
+envinit 实际使用随包交付的 `mpiexec.hydra`，单机增加本地 `fork` launcher，多机增加临时 hostfile 和 SSH launcher；测试程序及参数语义与上述交付用例一致。mpiexec 会显式使用 `-wdir <本轮临时目录>`，该目录已在所有目标机创建，避免 Hydra 把协调机当前目录传播到其他机器后因路径不存在而在创建远端 rank 前失败。XCCL 自带文档定义 `-c 0` 为性能模式、`-c 1` 为精度模式，因此 bandwidth 判定固定使用 `-c 0`，避免把精度校验开销计入通信耗时。精度检查后续应作为独立测试执行，不能用其带宽结果评价性能。
 
 当前交付物料为 MPICH `5.0.1` 和 XCCL `3.2.2.0`。MPICH 使用 `ch3:sock + Hydra`、共享库模式构建，安装前缀固定为 `/var/lib/envinit/check-runtime/mpich-5.0.1`，并随包提供 XCCL 原版 perf 所需的 `libmpi.so.0` 兼容链接。两个 profile 的构建入口分别是：
 
@@ -1529,7 +1673,7 @@ Ubuntu 和 Kylin 必须使用各自 profile 中的 MPICH 包，不能混用。XC
 
 #### 8.6.3 拓扑、进程数量和一致性校验
 
-工具会在每台机器执行只读的 `xpu-smi topo -m`，并从 inventory 的 `rdmaN_name` 解析该机真实 `mlx5_N`。每个 XPU 只选择 inventory 参测网卡中距离最近的一张，优先级为 `PIX -> PXB -> PHB -> NODE -> SYS`。由此自动生成：
+工具会在每台机器执行只读的 `xpu-smi topo -m`，并从 inventory 的 `rdmaN_name` 解析该机真实 `mlx5_N`。拓扑解析同时支持 `NIC0... + NIC Legend` 和现场常见的直接 `mlx5_0...` 列名格式。每个 XPU 只选择 inventory 参测网卡中距离最近的一张，优先级为 `PIX -> PXB -> PHB -> NODE -> SYS`。由此自动生成：
 
 - 每台机器的 XPU 数量，也就是该机 MPI slot 数；两台 8 卡机器最终使用 16 个 rank。
 - `BKCL_FORCE_RDMA_NICS_ORDER`：严格按 XPU0、XPU1……排列，四张网卡对应八张 XPU 时网卡名会按拓扑重复。
@@ -1576,11 +1720,20 @@ Ubuntu 和 Kylin 必须使用各自 profile 中的 MPICH 包，不能混用。XC
 
 ```text
 XCCL result summary:
-STATUS  TEST        HOSTS          RANKS  TOPOLOGY  SIZE(B)    TIME(us)  ALGBW(GB/s)  BUSBW(GB/s)
-PASS    all_reduce  node-a,node-b  16     PIX       134217728  2100.25   63.91         59.92
+STATUS  TEST        HOSTS          RANKS  TOPOLOGY  MODE      SIZE(B)    TIME(us)  ALGBW(GB/s)  BUSBW(GB/s)
+PASS    all_reduce  node-a,node-b  16     PIX       in-place  134217728  2081.00   64.47         112.82
+XCCL size result details (* = SOP evaluation row):
+EVAL  SIZE(B)    COUNT     TYPE   OP   MODE          TIME(us)  ALGBW(GB/s)  BUSBW(GB/s)
+----  ---------  --------  -----  ---  ------------  --------  -----------  -----------
+      1024       256       float  sum  out-of-place  47.00     0.02         0.04
+      1024       256       float  sum  in-place      46.00     0.02         0.04
+      134217728  33554432  float  sum  out-of-place  2073.00   64.73        113.29
+*     134217728  33554432  float  sum  in-place      2081.00   64.47        112.82
+      268435456  67108864  float  sum  out-of-place  4186.00   64.11        112.20
+      268435456  67108864  float  sum  in-place      4205.00   63.83        111.70
 ```
 
-如果任一 XPU 只能使用非 PIX 网卡，汇总行会显示 `STATUS=WARN`、`TOPOLOGY=DEGRADED`，并额外打印 PCIe/NUMA 限速提示；如果同时低于配置的带宽门槛则仍显示 `FAIL`。
+`systest/xccl_perf` 同时输出 out-of-place 和 in-place 两组数据；envinit 会保留原始输出，并把每个 size 的两组 time、algbw、busbw 再整理到 `XCCL size result details`，方便比较完整性能曲线。`EVAL=*` 是最终门槛采用的行。交付判定按照 SOP 读取倒数第二个消息档位的 in-place 数据，并在汇总中明确显示 `MODE=in-place`。默认 `1024 -> 256m`、步进 2 时判定档位是 `128m`；只有一个消息档位时使用该唯一档位。如果任一 XPU 只能使用非 PIX 网卡，汇总行会显示 `STATUS=WARN`、`TOPOLOGY=DEGRADED`，并额外打印 PCIe/NUMA 限速提示；如果同时低于配置的带宽门槛则仍显示 `FAIL`。性能阶段会明确输出 `validation: disabled (-c 0 performance mode)`，原始表格中的 `#wrong`/`Out of bounds` 不作为精度通过依据。
 
 ### 8.7 汇总结果、计数器和退出状态
 
@@ -1600,6 +1753,8 @@ PASS    all_reduce  node-a,node-b  16     PIX       134217728  2100.25   63.91  
 
 NIC 计数器来自各 `rdmaN_name` 的 `ethtool -S`，会在整个 check 前后各采集一次，因此即使只跑 rdma-ping 也会检查 NIC delta。bandwidth 或 XCCL 还会按动态解析出的 `mlx5_N` 读取 `/sys/class/infiniband/<device>/ports/*/{counters,hw_counters}`，在 RDMA 流量前后计算 device/port delta。
 
+mlx5 的 `rx_err_lane_N_phy` 名称虽然包含 `err`，Linux 驱动实际将它映射为每条物理 lane 的 FEC corrected bits。PAM4 链路上该值增长并不等价于未纠正包错误，因此汇总中保留为 `INFO`，不单独导致 check 失败。CRC、symbol error、uncorrectable FEC、drop、discard、timeout、retrans 等异常增量仍然显示 `FAIL` 并影响最终退出状态。
+
 状态含义：
 
 | 状态 | 含义 |
@@ -1618,7 +1773,7 @@ NIC 计数器来自各 `rdmaN_name` 的 `ethtool -S`，会在整个 check 前后
 - 目标解析、SSH、sysfs/topo 发现或测试命令失败；
 - rdma-ping 任一路径不是 `0% packet loss`；
 - bandwidth 任一完成流低于 `check.bandwidth.min_gbits`，或无法解析需要判定的吞吐；
-- XCCL 没有解析到性能行，或最大消息的 busbw 低于 `check.xccl.min_bus_bandwidth_gbs`；
+- XCCL 没有解析到性能行，或 SOP 判定档位的 in-place busbw 低于 `check.xccl.min_bus_bandwidth_gbs`；
 - NIC/RDMA device 风险计数器出现正 delta；
 - XCCL 运行时分发、依赖检查、临时 SSH 或清理失败。
 
@@ -1668,6 +1823,32 @@ sudo ./env_init apply ... --host node1 --stages xre xdr firmware container mlxco
 ```
 
 每一步完成后检查输出，再进入下一步。
+
+### 9.7 downloader 中断后是否需要重新开始
+
+不需要。保持相同的 `--profile` 和 `--output-dir`，重新执行原命令即可。已完成且远端信息未变化的文件会根据 SHA256 或完成标记跳过，未完成的 `.part` 文件会尝试断点续传。
+
+如果上一次选择的是另一个 profile，不要直接在原目录上继续。downloader 不会主动删除旧 profile 独有的文件，应改用新的输出目录，或先人工备份并清空旧目录，避免 Ubuntu/Kylin 物料混合。
+
+### 9.8 apply 重跑后全部 stage 都被跳过
+
+这是默认全流程 checkpoint 在生效，表示相同 host 和相同解析配置此前已经完成。需要从头重跑完整流程时使用 `--restart`：
+
+```bash
+sudo ./env_init apply --inventory planning/inventory.csv --bundle planning/bundle.json --host node1 --restart
+```
+
+只想强制重做某几个 stage 时显式使用 `--stages network sysctl`；部分 stage 模式不会读取或改写全流程 checkpoint。不要为了重跑单个 stage 手工编辑 `/var/lib/envinit/apply-progress.json`。
+
+### 9.9 XCCL 多机启动在 Hydra 阶段失败
+
+先保留以下完整输出，不要只截取其中一条 SSH 公钥或 warning：
+
+- `INFO xccl topology`：确认每台机器的 XPU 数、RDMA 网卡顺序和拓扑；
+- `INFO xccl mpirun`：确认 rank 数、launcher 和 `-wdir`；
+- Hydra stderr 及最后一行 `error:`。
+
+当前工具会先在所有目标机创建同一个本轮工作目录，并向 `mpiexec.hydra` 显式传入 `-wdir <check.xccl.work_root>/<run-id>`。如果仍出现 `launch_procs`、`pmip_cb.c` 或远端进程未创建，检查 `work_root` 是否位于允许的 `/tmp`/`/var/tmp`、所有目标是否可写、目标机是否使用了同一套 MPICH/XCCL 物料，以及 coordinator 能否使用日志中显示的临时 SSH wrapper 登录所有目标。失败后工具仍会尝试清理本轮目录和授权行；清理失败会合并到最终错误中。
 
 ## 10. 编译可执行文件
 

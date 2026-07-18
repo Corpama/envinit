@@ -24,6 +24,53 @@ func TestResolveTargetsUsesInventoryMgmtIP(t *testing.T) {
 	if targets[0].Address != "10.157.5.207" || targets[1].Address != "10.157.5.206" {
 		t.Fatalf("unexpected addresses: %#v", targets)
 	}
+	if targetControlAddress(targets[0]) != "10.157.5.207" || targetControlAddress(targets[1]) != "10.157.5.206" {
+		t.Fatalf("unexpected control addresses: %#v", targets)
+	}
+}
+
+func TestResolveDiscoveryTargetExplicitIdentityAndEndpoint(t *testing.T) {
+	targets, err := ResolveDiscoveryTargets([]spec.MachineRecord{
+		{HostID: "node1", Hostname: "instance-node1"},
+	}, []string{"node1=192.168.32.11"})
+	if err != nil {
+		t.Fatalf("resolve explicit discovery target: %v", err)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("unexpected targets: %#v", targets)
+	}
+	target := targets[0]
+	if !target.InventoryMatched || !target.ExplicitIdentity || target.InventoryIdentity != "node1" {
+		t.Fatalf("explicit inventory binding was not preserved: %#v", target)
+	}
+	if got := targetControlAddress(target); got != "192.168.32.11" {
+		t.Fatalf("control address = %q, want explicit SSH endpoint", got)
+	}
+	if target.Address != "192.168.32.11" {
+		t.Fatalf("initial management address = %q, want reachable endpoint until discovery selects management IP", target.Address)
+	}
+}
+
+func TestResolveDiscoveryTargetAllowsExplicitNewIdentity(t *testing.T) {
+	targets, err := ResolveDiscoveryTargets(nil, []string{"node9=192.168.32.19"})
+	if err != nil {
+		t.Fatalf("resolve explicit new target: %v", err)
+	}
+	target := targets[0]
+	if target.InventoryMatched || !target.ExplicitIdentity || target.InventoryIdentity != "node9" {
+		t.Fatalf("unexpected explicit new target: %#v", target)
+	}
+	if got := targetControlAddress(target); got != "192.168.32.19" {
+		t.Fatalf("control address = %q, want 192.168.32.19", got)
+	}
+}
+
+func TestResolveDiscoveryTargetRejectsInvalidExplicitSyntax(t *testing.T) {
+	for _, input := range []string{"=192.168.32.11", "node1=", "node1=192.168.32.11=extra"} {
+		if _, err := ResolveDiscoveryTargets(nil, []string{input}); err == nil {
+			t.Fatalf("expected invalid target %q to fail", input)
+		}
+	}
 }
 
 func TestInventoryRDMAInterfacesOverrideLongerBundleDefaults(t *testing.T) {
@@ -821,6 +868,7 @@ func TestCompareNICCounterSnapshotsFailsOnlyAbnormalDeltas(t *testing.T) {
 					"np_cnp_sent":             7,
 					"rx_discards_phy":         0,
 					"rx_prio3_buf_discard":    0,
+					"rx_err_lane_0_phy":       100,
 				},
 			},
 		},
@@ -833,6 +881,7 @@ func TestCompareNICCounterSnapshotsFailsOnlyAbnormalDeltas(t *testing.T) {
 					"np_cnp_sent":             8,
 					"rx_discards_phy":         1,
 					"rx_prio3_buf_discard":    4,
+					"rx_err_lane_0_phy":       473,
 				},
 			},
 		},
@@ -853,6 +902,8 @@ func TestCompareNICCounterSnapshotsFailsOnlyAbnormalDeltas(t *testing.T) {
 		"rx_prio5_pause_duration",
 		"+5",
 		"np_cnp_sent",
+		"rx_err_lane_0_phy",
+		"+373",
 		"\033[31mFAIL",
 		"rx_discards_phy",
 		"rx_prio3_buf_discard",
@@ -865,6 +916,19 @@ func TestCompareNICCounterSnapshotsFailsOnlyAbnormalDeltas(t *testing.T) {
 	}
 	if strings.Contains(got, "rx_no_buffer: 0") {
 		t.Fatalf("did not expect zero counters in output:\n%s", got)
+	}
+}
+
+func TestNICCounterClassificationTreatsFECcorrectedLanesAsInformational(t *testing.T) {
+	for _, name := range []string{"rx_err_lane_0_phy", "rx_err_lane_1_phy", "rx_err_lane_12_phy"} {
+		if isAbnormalNICCounter(name) {
+			t.Fatalf("%s is a FEC-corrected lane counter and must not be a hard failure", name)
+		}
+	}
+	for _, name := range []string{"rx_crc_errors_phy", "rx_pcs_symbol_err_phy", "rs_fec_uncorrectable_blocks"} {
+		if !isAbnormalNICCounter(name) {
+			t.Fatalf("%s must remain an abnormal counter", name)
+		}
 	}
 }
 

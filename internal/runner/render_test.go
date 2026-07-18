@@ -2825,7 +2825,7 @@ func TestRDMADiscoveryFallsBackToExactModelGroupWhenSpeedAmbiguous(t *testing.T)
 	}
 }
 
-func TestMgmtDiscoveryPrefersLinkedGroupBeforeLowestSpeed(t *testing.T) {
+func TestMgmtDiscoveryPrefersMaximumSpeedClassBeforeCurrentLink(t *testing.T) {
 	root := t.TempDir()
 	mustWriteNetDeviceWithSpeed(t, root, "mgmt25", "aa:bb:cc:dd:ee:25", "0000:20:00.0", "mlx5_core", 0, "p0", 25000)
 	mustWriteNetDeviceWithSpeed(t, root, "mgmt100", "aa:bb:cc:dd:ee:10", "0000:30:00.0", "mlx5_core", 0, "p0", 100000)
@@ -2844,8 +2844,8 @@ func TestMgmtDiscoveryPrefersLinkedGroupBeforeLowestSpeed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discover mgmt devices: %v", err)
 	}
-	if len(devices) != 1 || devices[0].Name != "mgmt100" {
-		t.Fatalf("expected linked 100G mgmt group, got %#v", devices)
+	if len(devices) != 1 || devices[0].Name != "mgmt25" {
+		t.Fatalf("expected lower maximum-speed management group despite link state, got %#v", devices)
 	}
 }
 
@@ -2871,7 +2871,7 @@ func TestMgmtDiscoveryUsesLowestSpeedWhenLinkStateDoesNotDistinguish(t *testing.
 	}
 }
 
-func TestRDMADiscoveryPrefersLinkedHighSpeedGroup(t *testing.T) {
+func TestRDMADiscoveryPrefersMaximumSpeedBeforeCurrentLink(t *testing.T) {
 	root := t.TempDir()
 	mustWriteNetDeviceWithSpeed(t, root, "rdma400", "aa:bb:cc:dd:ee:40", "0000:40:00.0", "mlx5_core", 0, "p0", 400000)
 	mustWriteNetDeviceWithSpeed(t, root, "rdma800", "aa:bb:cc:dd:ee:80", "0000:80:00.0", "mlx5_core", 0, "p0", 800000)
@@ -2891,8 +2891,8 @@ func TestRDMADiscoveryPrefersLinkedHighSpeedGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discover rdma devices: %v", err)
 	}
-	if len(devices) != 1 || devices[0].Name != "rdma400" {
-		t.Fatalf("expected linked 400G RDMA group, got %#v", devices)
+	if len(devices) != 1 || devices[0].Name != "rdma800" {
+		t.Fatalf("expected maximum-speed RDMA group despite current link state, got %#v", devices)
 	}
 }
 

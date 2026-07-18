@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -164,6 +165,7 @@ func runXCCLCheck(opts Options, targets []Target, groupsByTarget resolvedRDMAGro
 	if len(rows) == 0 {
 		return fmt.Errorf("XCCL %s completed but no performance rows were parsed", cfg.Test)
 	}
+	fmt.Fprintln(opts.Output, "INFO xccl validation: disabled (-c 0 performance mode); bandwidth results exclude accuracy-check overhead")
 	return printXCCLResult(opts, plans, totalRanks, rows)
 }
 
@@ -202,11 +204,7 @@ func validateXCCLConfig(cfg spec.CheckXCCLConfig) error {
 	if !filepath.IsAbs(strings.TrimSpace(cfg.XPUHome)) {
 		return fmt.Errorf("bundle check.xccl.xpu_home must be an absolute path, got %q", cfg.XPUHome)
 	}
-	allowedTests := map[string]bool{
-		"all_reduce": true, "all_gather": true, "all_to_all": true, "broadcast": true,
-		"reduce": true, "reduce_scatter": true, "sendrecv": true,
-	}
-	if !allowedTests[cfg.Test] {
+	if _, ok := xcclCollectiveName(cfg.Test); !ok {
 		return fmt.Errorf("bundle check.xccl.test %q is not supported", cfg.Test)
 	}
 	if cfg.StepFactor <= 0 || cfg.WarmupIterations < 0 || cfg.Iterations <= 0 || cfg.Timeout <= 0 || cfg.MinBusBandwidthGBs < 0 {
@@ -297,7 +295,7 @@ func xcclPlanFromTopology(bundle spec.Bundle, target Target, groups []spec.Check
 		device := strings.TrimSpace(group.IBDevice)
 		nic := deviceToNIC[device]
 		if iface == "" || device == "" || nic == "" {
-			return xcclTargetPlan{}, fmt.Errorf("resolve XCCL RDMA mapping for %s rdma%d: iface=%q ib_device=%q is incomplete or absent from xpu-smi NIC legend", target.Name, idx+1, iface, device)
+			return xcclTargetPlan{}, fmt.Errorf("resolve XCCL RDMA mapping for %s rdma%d: iface=%q ib_device=%q is incomplete or absent from xpu-smi topology NIC columns/mapping", target.Name, idx+1, iface, device)
 		}
 		candidates = append(candidates, candidate{iface: iface, device: device, nic: nic})
 	}
@@ -409,7 +407,7 @@ func xcclPrepareDirectoriesCommand(workDir string) string {
 func xcclInstallRuntimeCommand(cfg spec.CheckXCCLConfig, workDir string, withSSHAuthorization bool) string {
 	runtimeDir := filepath.Join(workDir, "runtime")
 	temporaryMPICH := filepath.Join(runtimeDir, "mpich-"+xcclMPICHVersion)
-	xcclBinary := filepath.Join(runtimeDir, "xccl_Linux_x86_64", "perf", cfg.Test)
+	xcclBinary := filepath.Join(runtimeDir, "xccl_Linux_x86_64", "systest", "xccl_perf")
 	ldPath := xcclLibraryPath(cfg, workDir)
 	commands := []string{
 		"set -eu",
@@ -485,7 +483,7 @@ func xcclRankScript(cfg spec.CheckXCCLConfig, plan xcclTargetPlan, workDir strin
 	for _, key := range keys {
 		lines = append(lines, fmt.Sprintf("export %s=%s", key, shellQuote(env[key])))
 	}
-	lines = append(lines, fmt.Sprintf("exec %s \"$@\"", shellQuote(filepath.Join(workDir, "runtime", "xccl_Linux_x86_64", "perf", cfg.Test))))
+	lines = append(lines, fmt.Sprintf("exec %s \"$@\"", shellQuote(filepath.Join(workDir, "runtime", "xccl_Linux_x86_64", "systest", "xccl_perf"))))
 	return strings.Join(lines, "\n") + "\n"
 }
 
@@ -506,7 +504,7 @@ func xcclLibraryPath(cfg spec.CheckXCCLConfig, workDir string) string {
 func xcclHostFile(plans []xcclTargetPlan) string {
 	var lines []string
 	for _, plan := range plans {
-		lines = append(lines, fmt.Sprintf("%s:%d", plan.Target.Address, plan.XPUCount))
+		lines = append(lines, fmt.Sprintf("%s:%d", targetControlAddress(plan.Target), plan.XPUCount))
 	}
 	return strings.Join(lines, "\n") + "\n"
 }
@@ -535,7 +533,7 @@ func xcclCoordinatorPermissionsCommand(workDir string) string {
 func xcclTemporarySSHProbeCommand(plans []xcclTargetPlan, workDir string) string {
 	addresses := make([]string, 0, len(plans))
 	for _, plan := range plans {
-		addresses = append(addresses, shellQuote(plan.Target.Address))
+		addresses = append(addresses, shellQuote(targetControlAddress(plan.Target)))
 	}
 	return fmt.Sprintf("set -eu; for host in %s; do %s \"$host\" true; done", strings.Join(addresses, " "), shellQuote(filepath.Join(workDir, "ssh-wrapper")))
 }
@@ -551,17 +549,35 @@ func xcclMPIRunArgs(cfg spec.CheckXCCLConfig, workDir string, totalRanks int, mu
 	} else {
 		args = append(args, "-launcher", "fork")
 	}
+	collective, _ := xcclCollectiveName(cfg.Test)
 	return append(args,
 		"-n", strconv.Itoa(totalRanks),
+		"-wdir", workDir,
 		filepath.Join(workDir, "run-rank.sh"),
+		"-O", collective,
+		"-x", "1",
 		"-b", cfg.MinBytes,
 		"-e", cfg.MaxBytes,
 		"-f", strconv.Itoa(cfg.StepFactor),
 		"-w", strconv.Itoa(cfg.WarmupIterations),
 		"-n", strconv.Itoa(cfg.Iterations),
-		"-c", "1",
+		"-c", "0",
 		"-d", cfg.DataType,
 	)
+}
+
+func xcclCollectiveName(test string) (string, bool) {
+	collectives := map[string]string{
+		"all_reduce":     "allReduce",
+		"all_gather":     "allGather",
+		"reduce_scatter": "reduceScatter",
+		"reduce":         "reduce",
+		"broadcast":      "broadcast",
+		"all_to_all":     "alltoall",
+		"sendrecv":       "sendrecv",
+	}
+	name, ok := collectives[strings.TrimSpace(test)]
+	return name, ok
 }
 
 func cleanupXCCLTargets(opts Options, plans []xcclTargetPlan, workDir, marker string, removeSSHAuthorization bool) error {
@@ -619,6 +635,37 @@ func parseXCCLPerformanceRows(output string) []xcclPerformanceRow {
 		}
 		sizeBytes, err1 := strconv.ParseInt(fields[0], 10, 64)
 		count, err2 := strconv.ParseInt(fields[1], 10, 64)
+		// systest/xccl_perf prints both out-of-place and in-place metrics:
+		// size count type redop root out_time out_alg out_bus out_wrong in_time in_alg in_bus in_wrong.
+		// Preserve both triplets so operators can inspect the complete curve. The
+		// delivery SOP evaluation later selects the in-place triplet explicitly.
+		if len(fields) >= 13 {
+			for _, metrics := range []struct {
+				mode                          string
+				timeIndex, algIndex, busIndex int
+			}{
+				{mode: "out-of-place", timeIndex: 5, algIndex: 6, busIndex: 7},
+				{mode: "in-place", timeIndex: 9, algIndex: 10, busIndex: 11},
+			} {
+				timeUS, err3 := strconv.ParseFloat(fields[metrics.timeIndex], 64)
+				algGBs, err4 := strconv.ParseFloat(fields[metrics.algIndex], 64)
+				busGBs, err5 := strconv.ParseFloat(fields[metrics.busIndex], 64)
+				if err1 != nil || err2 != nil || err3 != nil || err4 != nil || err5 != nil {
+					continue
+				}
+				rows = append(rows, xcclPerformanceRow{
+					SizeBytes: sizeBytes,
+					Count:     count,
+					DataType:  fields[2],
+					Operation: fields[3],
+					Mode:      metrics.mode,
+					TimeUS:    timeUS,
+					AlgGBs:    algGBs,
+					BusGBs:    busGBs,
+				})
+			}
+			continue
+		}
 		timeUS, err3 := strconv.ParseFloat(fields[len(fields)-3], 64)
 		algGBs, err4 := strconv.ParseFloat(fields[len(fields)-2], 64)
 		busGBs, err5 := strconv.ParseFloat(fields[len(fields)-1], 64)
@@ -630,6 +677,7 @@ func parseXCCLPerformanceRows(output string) []xcclPerformanceRow {
 			Count:     count,
 			DataType:  fields[2],
 			Operation: fields[3],
+			Mode:      "out-of-place",
 			TimeUS:    timeUS,
 			AlgGBs:    algGBs,
 			BusGBs:    busGBs,
@@ -639,12 +687,7 @@ func parseXCCLPerformanceRows(output string) []xcclPerformanceRow {
 }
 
 func printXCCLResult(opts Options, plans []xcclTargetPlan, totalRanks int, rows []xcclPerformanceRow) error {
-	selected := rows[0]
-	for _, row := range rows[1:] {
-		if row.SizeBytes > selected.SizeBytes || row.SizeBytes == selected.SizeBytes && row.BusGBs > selected.BusGBs {
-			selected = row
-		}
-	}
+	selected := selectXCCLPerformanceRow(rows)
 	status := "PASS"
 	if opts.Bundle.Check.XCCL.MinBusBandwidthGBs > 0 && selected.BusGBs < opts.Bundle.Check.XCCL.MinBusBandwidthGBs {
 		status = "FAIL"
@@ -661,8 +704,8 @@ func printXCCLResult(opts Options, plans []xcclTargetPlan, totalRanks int, rows 
 	if degraded {
 		topology = "DEGRADED"
 	}
-	headers := []string{"STATUS", "TEST", "HOSTS", "RANKS", "TOPOLOGY", "SIZE(B)", "TIME(us)", "ALGBW(GB/s)", "BUSBW(GB/s)"}
-	cells := []string{status, opts.Bundle.Check.XCCL.Test, strings.Join(hostNames, ","), strconv.Itoa(totalRanks), topology, strconv.FormatInt(selected.SizeBytes, 10), fmt.Sprintf("%.2f", selected.TimeUS), fmt.Sprintf("%.2f", selected.AlgGBs), fmt.Sprintf("%.2f", selected.BusGBs)}
+	headers := []string{"STATUS", "TEST", "HOSTS", "RANKS", "TOPOLOGY", "MODE", "SIZE(B)", "TIME(us)", "ALGBW(GB/s)", "BUSBW(GB/s)"}
+	cells := []string{status, opts.Bundle.Check.XCCL.Test, strings.Join(hostNames, ","), strconv.Itoa(totalRanks), topology, firstNonEmpty(selected.Mode, "out-of-place"), strconv.FormatInt(selected.SizeBytes, 10), fmt.Sprintf("%.2f", selected.TimeUS), fmt.Sprintf("%.2f", selected.AlgGBs), fmt.Sprintf("%.2f", selected.BusGBs)}
 	widths := make([]int, len(headers))
 	for idx := range headers {
 		widths[idx] = maxInt(len(headers[idx]), len(cells[idx]))
@@ -675,6 +718,7 @@ func printXCCLResult(opts Options, plans []xcclTargetPlan, totalRanks int, rows 
 		line = redText(line)
 	}
 	fmt.Fprintln(opts.Output, line)
+	printXCCLSizeResults(opts.Output, rows, selected)
 	if degraded {
 		fmt.Fprintln(opts.Output, "WARN xccl result topology: at least one XPU used a non-PIX RDMA mapping; collective bandwidth may be limited by the PCIe/NUMA path")
 	}
@@ -682,6 +726,95 @@ func printXCCLResult(opts Options, plans []xcclTargetPlan, totalRanks int, rows 
 		return fmt.Errorf("XCCL %s %.2f GB/s below %.2f GB/s at size %d", opts.Bundle.Check.XCCL.Test, selected.BusGBs, opts.Bundle.Check.XCCL.MinBusBandwidthGBs, selected.SizeBytes)
 	}
 	return nil
+}
+
+func printXCCLSizeResults(output io.Writer, rows []xcclPerformanceRow, selected xcclPerformanceRow) {
+	ordered := append([]xcclPerformanceRow(nil), rows...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].SizeBytes != ordered[j].SizeBytes {
+			return ordered[i].SizeBytes < ordered[j].SizeBytes
+		}
+		return xcclModeOrder(ordered[i].Mode) < xcclModeOrder(ordered[j].Mode)
+	})
+	headers := []string{"EVAL", "SIZE(B)", "COUNT", "TYPE", "OP", "MODE", "TIME(us)", "ALGBW(GB/s)", "BUSBW(GB/s)"}
+	data := make([][]string, 0, len(ordered))
+	for _, row := range ordered {
+		marker := ""
+		if row.SizeBytes == selected.SizeBytes && row.Mode == selected.Mode {
+			marker = "*"
+		}
+		data = append(data, []string{
+			marker,
+			strconv.FormatInt(row.SizeBytes, 10),
+			strconv.FormatInt(row.Count, 10),
+			row.DataType,
+			row.Operation,
+			firstNonEmpty(row.Mode, "out-of-place"),
+			fmt.Sprintf("%.2f", row.TimeUS),
+			fmt.Sprintf("%.2f", row.AlgGBs),
+			fmt.Sprintf("%.2f", row.BusGBs),
+		})
+	}
+	widths := make([]int, len(headers))
+	for idx, header := range headers {
+		widths[idx] = len(header)
+	}
+	for _, cells := range data {
+		for idx, cell := range cells {
+			widths[idx] = maxInt(widths[idx], len(cell))
+		}
+	}
+	fmt.Fprintln(output, "XCCL size result details (* = SOP evaluation row):")
+	fmt.Fprintln(output, formatTableLine(headers, widths))
+	fmt.Fprintln(output, formatTableSeparator(widths))
+	for _, cells := range data {
+		fmt.Fprintln(output, formatTableLine(cells, widths))
+	}
+}
+
+func xcclModeOrder(mode string) int {
+	if mode == "out-of-place" || mode == "" {
+		return 0
+	}
+	if mode == "in-place" {
+		return 1
+	}
+	return 2
+}
+
+func selectXCCLPerformanceRow(rows []xcclPerformanceRow) xcclPerformanceRow {
+	if len(rows) == 0 {
+		return xcclPerformanceRow{}
+	}
+	uniqueSizes := map[int64]bool{}
+	for _, row := range rows {
+		uniqueSizes[row.SizeBytes] = true
+	}
+	sizes := make([]int64, 0, len(uniqueSizes))
+	for size := range uniqueSizes {
+		sizes = append(sizes, size)
+	}
+	sort.Slice(sizes, func(i, j int) bool { return sizes[i] < sizes[j] })
+	selectedSize := sizes[len(sizes)-1]
+	if len(sizes) >= 2 {
+		selectedSize = sizes[len(sizes)-2]
+	}
+	var selected xcclPerformanceRow
+	found := false
+	for _, row := range rows {
+		if row.SizeBytes != selectedSize {
+			continue
+		}
+		if row.Mode == "in-place" {
+			selected = row
+			return selected
+		}
+		if !found || row.BusGBs > selected.BusGBs {
+			selected = row
+			found = true
+		}
+	}
+	return selected
 }
 
 func xcclPlansDegraded(plans []xcclTargetPlan) bool {

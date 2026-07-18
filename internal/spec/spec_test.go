@@ -113,7 +113,7 @@ func TestApplyDefaultsSetsXCCLRuntimeDefaults(t *testing.T) {
 	if b.Check.XCCL.WorkRoot != "/tmp/envinit-xccl-check" || b.Check.XCCL.XPUHome != "/usr/local/xpu" {
 		t.Fatalf("unexpected XCCL runtime defaults: %#v", b.Check.XCCL)
 	}
-	if b.Check.XCCL.Test != "all_reduce" || b.Check.XCCL.MinBytes != "128m" || b.Check.XCCL.MaxBytes != "128m" {
+	if b.Check.XCCL.Test != "all_reduce" || b.Check.XCCL.MinBytes != "1024" || b.Check.XCCL.MaxBytes != "256m" {
 		t.Fatalf("unexpected XCCL performance defaults: %#v", b.Check.XCCL)
 	}
 	if b.Check.XCCL.EnableXDR == nil || !*b.Check.XCCL.EnableXDR {

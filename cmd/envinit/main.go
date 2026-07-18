@@ -58,7 +58,7 @@ func runCheck(args []string) error {
 	fs := flag.NewFlagSet("envinit check", flag.ContinueOnError)
 	inventoryPath := fs.String("inventory", "", "Path to the inventory file (.csv/.tsv/.txt/.xlsx)")
 	bundlePath := fs.String("bundle", "", "Path to the offline installation bundle JSON")
-	hostsRaw := fs.String("hosts", "", "Host IDs, hostnames, or IPs separated by commas or spaces")
+	hostsRaw := fs.String("hosts", "", "Inventory identities or SSH endpoints; identity=endpoint overrides the control address")
 	sheet := fs.String("sheet", "", "Worksheet name for .xlsx inventories, defaults to the first sheet")
 	checkStageRaw := fs.String("check-stage", "all", "Check stages to run: bandwidth, rdma-ping, xccl, or all")
 	checksRaw := fs.String("checks", "", "Deprecated alias for --check-stage")
@@ -127,9 +127,9 @@ func runDiscover(args []string) error {
 	fs := flag.NewFlagSet("envinit discover", flag.ContinueOnError)
 	inventoryPath := fs.String("inventory", "", "Path to the inventory file (.csv/.tsv/.txt/.xlsx)")
 	bundlePath := fs.String("bundle", "", "Path to the offline installation bundle JSON")
-	hostsRaw := fs.String("hosts", "", "Host IDs, hostnames, or IPs separated by commas or spaces")
+	hostsRaw := fs.String("hosts", "", "Inventory identities, SSH endpoints, or identity=endpoint mappings separated by commas or spaces")
 	sheet := fs.String("sheet", "", "Worksheet name for .xlsx inventories, defaults to the first sheet")
-	yes := fs.Bool("yes", false, "Accept discovered network inventory without interactive confirmation")
+	yes := fs.Bool("yes", false, "Accept only exact/strong discovered network mappings without interactive confirmation")
 	dryRun := fs.Bool("dry-run", false, "Discover and print planned inventory updates without writing")
 	fs.SetOutput(os.Stderr)
 	if err := fs.Parse(args); err != nil {
@@ -808,7 +808,7 @@ func usage() {
 Usage:
   envinit plan  --inventory ./machines.xlsx --bundle ./bundle.json [--host xpu11] [--plain]
   envinit apply --inventory ./machines.xlsx --bundle ./bundle.json [--host xpu11] [--restart]
-  envinit discover --inventory ./machines.csv --bundle ./bundle.json --hosts xpu11 [--yes]
+  envinit discover --inventory ./machines.csv --bundle ./bundle.json --hosts xpu11=192.168.32.11 [--yes]
   envinit check --inventory ./machines.csv --bundle ./bundle.json --hosts xpu11,xpu12 [--check-stage bandwidth|rdma-ping|xccl|all]
 
 Notes:
@@ -818,6 +818,7 @@ Notes:
   check  Run RDMA/XPU bandwidth, jumbo RDMA ping, and optional XCCL collective checks across two or more hosts
 
 Discover options:
+  --hosts    inventory identity, SSH endpoint, or an explicit identity=endpoint mapping
   --yes      accept discovered network fields without interactive confirmation
   --dry-run  preview discovered fields without writing inventory
 `)

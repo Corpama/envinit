@@ -173,7 +173,7 @@ func nicCounterCommand(interfaces []string) string {
 	for _, name := range interfaces {
 		quoted = append(quoted, shellQuote(name))
 	}
-	pattern := "port_xmit_discards|port_rcv_errors|packet_seq_err|local_ack_timeout_err|out_of_sequence|port_xmit_wait|np_cnp_sent|rp_cnp_handled|rx_prio[0-9]+_buf_discard|rx_prio5_pause_duration|tx_prio5_pause_duration|roce_adp_retrans|timeout|drop|discard|crc|err"
+	pattern := "port_xmit_discards|port_rcv_errors|packet_seq_err|local_ack_timeout_err|out_of_sequence|port_xmit_wait|np_cnp_sent|rp_cnp_handled|rx_prio[0-9]+_buf_discard|rx_prio5_pause_duration|tx_prio5_pause_duration|roce_adp_retrans|timeout|drop|discard|crc|err|corrected|uncorrect|fec"
 	return fmt.Sprintf("for i in %s; do echo __envinit_iface=$i; ethtool -i \"$i\" 2>/dev/null | grep -E \"^(driver|bus-info):\" || true; ip -br link show \"$i\" 2>/dev/null || true; ethtool -S \"$i\" 2>/dev/null | grep -E %s || true; done", strings.Join(quoted, " "), shellQuote(pattern))
 }
 
@@ -625,12 +625,27 @@ func redText(value string) string {
 
 func isAbnormalNICCounter(name string) bool {
 	lower := strings.ToLower(name)
+	// mlx5 exposes per-lane FEC-corrected bits under the historical
+	// rx_err_lane_N_phy names. They are pre-FEC observations, not uncorrectable
+	// packet errors, so retain their deltas as INFO instead of failing a check.
+	if isFECcorrectedLaneCounter(lower) {
+		return false
+	}
 	for _, token := range roceAbnormalCounterTokens() {
 		if strings.Contains(lower, token) {
 			return true
 		}
 	}
 	return false
+}
+
+func isFECcorrectedLaneCounter(name string) bool {
+	if !strings.HasPrefix(name, "rx_err_lane_") || !strings.HasSuffix(name, "_phy") {
+		return false
+	}
+	lane := strings.TrimSuffix(strings.TrimPrefix(name, "rx_err_lane_"), "_phy")
+	_, err := strconv.Atoi(lane)
+	return err == nil
 }
 
 func roceAbnormalCounterTokens() []string {
@@ -655,6 +670,7 @@ func roceAbnormalCounterTokens() []string {
 		"drop",
 		"discard",
 		"crc",
+		"uncorrect",
 		"err",
 		"error",
 		"retrans",
