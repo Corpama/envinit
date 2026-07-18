@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -88,6 +89,36 @@ func TestMaterialSHA256AcceptsAListHashInfoShapes(t *testing.T) {
 				t.Fatalf("materialSHA256() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDownloadMaterialFileDoesNotSkipMissingNonEmptyFile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/fs/get":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"code":200,"message":"success","data":{"raw_url":"` + serverRawURL(r, "/raw") + `"}}`))
+		case "/raw":
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	oldBaseURL := alistBaseURL
+	t.Cleanup(func() { alistBaseURL = oldBaseURL })
+	alistBaseURL = server.URL
+	err := downloadMaterialFile(t.TempDir(), "test-profile", "token", materialFile{
+		RemotePath:   "/data/profiles/test/missing.rpm",
+		RelativePath: "missing.rpm",
+		Size:         1024,
+	})
+	if err == nil {
+		t.Fatal("downloadMaterialFile() succeeded for a missing non-empty file")
+	}
+	if errors.Is(err, errSkipStaleZeroSizeMaterial) {
+		t.Fatalf("downloadMaterialFile() skipped non-empty file: %v", err)
 	}
 }
 
@@ -314,6 +345,7 @@ func TestRunManifestModeDownloadsAndAssemblesMaterialDirectory(t *testing.T) {
 		"/data/profiles/kylin/rpm-repo/repodata/repomd.xml": []byte("kylin repo"),
 		"/data/profiles/kylin/misc/install.sh":              []byte("#!/bin/sh\necho install\n"),
 	}
+	const staleZeroSizePath = "/data/profiles/kylin/misc/stale-link"
 	manifest := releaseManifest{
 		Version: "v-test",
 		Base: manifestAsset{
@@ -363,7 +395,10 @@ func TestRunManifestModeDownloadsAndAssemblesMaterialDirectory(t *testing.T) {
 				content = []map[string]any{{"name": "repomd.xml", "size": len(file), "modified": "2026-07-18T01:02:03Z", "hash_info": map[string]string{"sha256": testSHA256(file)}}}
 			case "/data/profiles/kylin/misc":
 				file := contents["/data/profiles/kylin/misc/install.sh"]
-				content = []map[string]any{{"name": "install.sh", "size": len(file), "modified": "2026-07-18T01:02:04Z"}}
+				content = []map[string]any{
+					{"name": "install.sh", "size": len(file), "modified": "2026-07-18T01:02:04Z"},
+					{"name": "stale-link", "size": 0, "modified": "2026-07-18T01:02:05Z", "hashinfo": "null"},
+				}
 			default:
 				t.Fatalf("unexpected AList directory: %s", directory)
 			}
@@ -375,7 +410,7 @@ func TestRunManifestModeDownloadsAndAssemblesMaterialDirectory(t *testing.T) {
 				t.Fatal(err)
 			}
 			filePath, _ := body["path"].(string)
-			if _, ok := contents[filePath]; !ok {
+			if _, ok := contents[filePath]; !ok && filePath != staleZeroSizePath {
 				t.Fatalf("unexpected AList path lookup: %s", filePath)
 			}
 			if strings.HasPrefix(filePath, "/data/profiles/") {
@@ -437,7 +472,7 @@ func TestRunManifestModeDownloadsAndAssemblesMaterialDirectory(t *testing.T) {
 	if got := materialRawDownloads.Load(); got != 2 {
 		t.Fatalf("completed materials were downloaded again, raw downloads=%d", got)
 	}
-	for _, want := range []string{"2 files from /data/profiles/kylin", "assembled: 2/2 files"} {
+	for _, want := range []string{"3 files from /data/profiles/kylin", "WARNING material " + staleZeroSizePath, "assembled: 2 files", "skipped 1 stale zero-size entry"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("missing material output %q:\n%s", want, output.String())
 		}

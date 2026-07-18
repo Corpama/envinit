@@ -162,6 +162,8 @@ chmod +x env_tool_downloader-linux-amd64
 
 base、bundle 和 inventory 使用 manifest 中的 SHA256 校验。profile 物料如果 AList 提供 SHA256，也逐文件校验；否则使用远端路径、大小和修改时间形成完成标记。记录保存在 `.envinit-downloads/`，中断下载会保留 `.part` 文件供续传，使用同一输出目录重复运行时会跳过未变化且已完成的文件。
 
+如果 AList 目录缓存中残留一个“大小为 0、没有 SHA256、实际 COS 对象已经不存在”的悬空条目，downloader 会输出 `WARNING ... skipping stale entry` 并跳过；本地正式 profile 不应包含这类条目，仍建议从 COS/AList 清理。任何非零物料或带 SHA256 的物料返回 404 都会继续作为错误终止，避免静默生成缺包的交付目录。
+
 版本边界需要特别区分：base、bundle 和 inventory 固定属于 downloader 对应的 release；`material_root` 指向长期维护的 profile 目录，物料本身不随 GitHub release tag 再复制一份。因此以后再次运行旧 downloader 时，会读取该 profile 目录当时可见的物料。需要完整复现某次历史交付时，应保留当时已经组装好的 `env_tool` 目录，不能只保留 downloader。
 
 ## 4. 推荐工作流
@@ -1849,6 +1851,12 @@ sudo ./env_init apply --inventory planning/inventory.csv --bundle planning/bundl
 - Hydra stderr 及最后一行 `error:`。
 
 当前工具会先在所有目标机创建同一个本轮工作目录，并向 `mpiexec.hydra` 显式传入 `-wdir <check.xccl.work_root>/<run-id>`。如果仍出现 `launch_procs`、`pmip_cb.c` 或远端进程未创建，检查 `work_root` 是否位于允许的 `/tmp`/`/var/tmp`、所有目标是否可写、目标机是否使用了同一套 MPICH/XCCL 物料，以及 coordinator 能否使用日志中显示的临时 SSH wrapper 登录所有目标。失败后工具仍会尝试清理本轮目录和授权行；清理失败会合并到最终错误中。
+
+### 9.10 downloader 列出了物料但 COS 下载返回 404
+
+先看报错对象在 AList 目录列表中的大小。若它是零字节、无 SHA256，而且本地正式 profile 中不存在，通常是历史软链接、目录占位或已删除对象留下的 AList/COS 残留。新版 downloader 会打印 WARNING 并跳过这种不可下载的空条目；仍应在存储侧删除残留并刷新 AList 缓存。
+
+如果对象大小非零或带有 SHA256，downloader 会保持失败，因为这表示正式物料缺失，不能通过跳过来掩盖。此时应恢复 COS 对象或修正 AList profile 内容，再使用原输出目录重跑；已经校验成功的文件不会重复下载。
 
 ## 10. 编译可执行文件
 

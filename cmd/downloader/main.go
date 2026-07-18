@@ -368,6 +368,21 @@ type materialFile struct {
 	SHA256       string
 }
 
+var errSkipStaleZeroSizeMaterial = errors.New("skip stale zero-size material")
+
+type downloadHTTPStatusError struct {
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *downloadHTTPStatusError) Error() string {
+	if strings.TrimSpace(e.Body) != "" {
+		return fmt.Sprintf("download package: HTTP %s: %s", e.Status, strings.TrimSpace(e.Body))
+	}
+	return fmt.Sprintf("download package: HTTP %s", e.Status)
+}
+
 func downloadProfileMaterials(outputDir string, profile manifestProfile, token string, jobs int, stdout io.Writer) error {
 	root := path.Clean(strings.ReplaceAll(strings.TrimSpace(profile.MaterialRoot), "\\", "/"))
 	if !path.IsAbs(root) || root == "/" {
@@ -404,6 +419,7 @@ func downloadProfileMaterials(outputDir string, profile manifestProfile, token s
 	var mu sync.Mutex
 	var firstErr error
 	completed := 0
+	skipped := 0
 	for worker := 0; worker < jobs; worker++ {
 		wg.Add(1)
 		go func() {
@@ -417,7 +433,10 @@ func downloadProfileMaterials(outputDir string, profile manifestProfile, token s
 				}
 				if err := downloadMaterialFile(outputDir, profile.ID, token, file); err != nil {
 					mu.Lock()
-					if firstErr == nil {
+					if errors.Is(err, errSkipStaleZeroSizeMaterial) {
+						skipped++
+						fmt.Fprintf(stdout, "WARNING material %s is listed as an empty file but its storage object is missing; skipping stale entry\n", file.RemotePath)
+					} else if firstErr == nil {
 						firstErr = err
 					}
 					mu.Unlock()
@@ -433,7 +452,15 @@ func downloadProfileMaterials(outputDir string, profile manifestProfile, token s
 	if firstErr != nil {
 		return firstErr
 	}
-	fmt.Fprintf(stdout, "Material profile %s assembled: %d/%d files under %s\n", profile.ID, completed, len(files), filepath.Join(outputDir, "data"))
+	if skipped > 0 {
+		noun := "entries"
+		if skipped == 1 {
+			noun = "entry"
+		}
+		fmt.Fprintf(stdout, "Material profile %s assembled: %d files under %s; skipped %d stale zero-size %s\n", profile.ID, completed, filepath.Join(outputDir, "data"), skipped, noun)
+	} else {
+		fmt.Fprintf(stdout, "Material profile %s assembled: %d/%d files under %s\n", profile.ID, completed, len(files), filepath.Join(outputDir, "data"))
+	}
 	return nil
 }
 
@@ -600,6 +627,11 @@ func downloadMaterialFile(outputDir, profileID, token string, file materialFile)
 	}
 	partialOutput := output + ".part"
 	if err := downloadFile(partialOutput, downloadURL, false); err != nil {
+		var statusErr *downloadHTTPStatusError
+		if file.Size == 0 && file.SHA256 == "" && errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
+			_ = os.Remove(partialOutput)
+			return fmt.Errorf("%w: %s", errSkipStaleZeroSizeMaterial, file.RemotePath)
+		}
 		return fmt.Errorf("download material %s: %w", file.RemotePath, err)
 	}
 	if err := verifyMaterialFile(partialOutput, file); err != nil {
@@ -1028,6 +1060,13 @@ func downloadFile(output, url string, reportProgress bool) error {
 	defer resp.Body.Close()
 
 	body := bufio.NewReader(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message, readErr := io.ReadAll(io.LimitReader(body, 64<<10))
+		if readErr != nil {
+			return fmt.Errorf("read HTTP error response: %w", readErr)
+		}
+		return &downloadHTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(message)}
+	}
 	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json") {
 		message, err := io.ReadAll(io.LimitReader(body, 64<<10))
 		if err != nil {
@@ -1043,7 +1082,7 @@ func downloadFile(output, url string, reportProgress bool) error {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		flags |= os.O_TRUNC
 	default:
-		return fmt.Errorf("download package: HTTP %s", resp.Status)
+		return &downloadHTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 
 	if err := os.MkdirAll(filepath.Dir(filepath.Clean(output)), 0o755); err != nil {
