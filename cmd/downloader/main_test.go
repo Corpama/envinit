@@ -63,6 +63,34 @@ func TestResolveDownloadURL(t *testing.T) {
 	}
 }
 
+func TestMaterialSHA256AcceptsAListHashInfoShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "new object field", raw: `{"hash_info":{"sha256":"ABCDEF"}}`, want: "abcdef"},
+		{name: "legacy object field", raw: `{"hashinfo":{"SHA256":"ABCDEF"}}`, want: "abcdef"},
+		{name: "legacy JSON string", raw: `{"hashinfo":"{\"sha256\":\"ABCDEF\"}"}`, want: "abcdef"},
+		{name: "legacy key value string", raw: `{"hashinfo":"sha256:ABCDEF"}`, want: "abcdef"},
+		{name: "legacy null string", raw: `{"hashinfo":"null"}`},
+		{name: "null", raw: `{"hashinfo":null}`},
+		{name: "unsupported value is ignored", raw: `{"hashinfo":[]}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var entry alistMaterialEntry
+			if err := json.Unmarshal([]byte(tt.raw), &entry); err != nil {
+				t.Fatal(err)
+			}
+			if got := materialSHA256(entry); got != tt.want {
+				t.Fatalf("materialSHA256() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDownloadAndVerify(t *testing.T) {
 	content := []byte("complete env_tool package")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -324,7 +352,7 @@ func TestRunManifestModeDownloadsAndAssemblesMaterialDirectory(t *testing.T) {
 			switch directory {
 			case "/data/profiles/kylin":
 				content = []map[string]any{
-					{"name": "rpm-repo", "is_dir": true},
+					{"name": "rpm-repo", "is_dir": true, "hashinfo": "null"},
 					{"name": "misc", "is_dir": true},
 					{"name": ".DS_Store", "size": 9, "is_dir": false},
 				}

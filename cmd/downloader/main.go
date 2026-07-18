@@ -352,12 +352,12 @@ func profileDownloadAssets(manifest releaseManifest, profile manifestProfile) []
 }
 
 type alistMaterialEntry struct {
-	Name           string            `json:"name"`
-	Size           int64             `json:"size"`
-	IsDir          bool              `json:"is_dir"`
-	Modified       string            `json:"modified"`
-	HashInfo       map[string]string `json:"hash_info"`
-	LegacyHashInfo map[string]string `json:"hashinfo"`
+	Name           string          `json:"name"`
+	Size           int64           `json:"size"`
+	IsDir          bool            `json:"is_dir"`
+	Modified       string          `json:"modified"`
+	HashInfo       json.RawMessage `json:"hash_info"`
+	LegacyHashInfo json.RawMessage `json:"hashinfo"`
 }
 
 type materialFile struct {
@@ -524,11 +524,56 @@ func shouldSkipMaterialEntry(name string) bool {
 }
 
 func materialSHA256(entry alistMaterialEntry) string {
-	for _, values := range []map[string]string{entry.HashInfo, entry.LegacyHashInfo} {
-		for name, value := range values {
-			if strings.EqualFold(strings.TrimSpace(name), "sha256") {
-				return strings.ToLower(strings.TrimSpace(value))
+	for _, raw := range []json.RawMessage{entry.HashInfo, entry.LegacyHashInfo} {
+		if value := hashInfoValue(raw, "sha256"); value != "" {
+			return strings.ToLower(value)
+		}
+	}
+	return ""
+}
+
+func hashInfoValue(raw json.RawMessage, algorithm string) string {
+	value := strings.TrimSpace(string(raw))
+	if value == "" || strings.EqualFold(value, "null") {
+		return ""
+	}
+
+	if strings.HasPrefix(value, "\"") {
+		var encoded string
+		if err := json.Unmarshal(raw, &encoded); err != nil {
+			return ""
+		}
+		encoded = strings.TrimSpace(encoded)
+		if encoded == "" || strings.EqualFold(encoded, "null") {
+			return ""
+		}
+		if strings.HasPrefix(encoded, "{") {
+			return hashInfoValue(json.RawMessage(encoded), algorithm)
+		}
+		for _, field := range strings.FieldsFunc(encoded, func(r rune) bool {
+			return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
+		}) {
+			name, digest, ok := strings.Cut(field, ":")
+			if !ok {
+				name, digest, ok = strings.Cut(field, "=")
 			}
+			if ok && strings.EqualFold(strings.TrimSpace(name), algorithm) {
+				return strings.TrimSpace(digest)
+			}
+		}
+		return ""
+	}
+
+	var values map[string]any
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return ""
+	}
+	for name, candidate := range values {
+		if !strings.EqualFold(strings.TrimSpace(name), algorithm) {
+			continue
+		}
+		if digest, ok := candidate.(string); ok {
+			return strings.TrimSpace(digest)
 		}
 	}
 	return ""
