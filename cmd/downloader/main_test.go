@@ -147,12 +147,41 @@ func TestDownloadReportsJSONErrorWithoutWritingOutput(t *testing.T) {
 	defer server.Close()
 
 	output := filepath.Join(t.TempDir(), "env_tool.tar.part")
-	err := download(output, server.URL)
+	var downloaded int64
+	err := downloadFileWithProgress(output, server.URL, true, nil, func(delta int64) { downloaded += delta })
 	if err == nil || !strings.Contains(err.Error(), "sign invalid") {
 		t.Fatalf("download error = %v, want sign invalid", err)
 	}
+	if downloaded != 0 {
+		t.Fatalf("JSON error response counted as downloaded bytes: %d", downloaded)
+	}
 	if _, err := os.Stat(output); !os.IsNotExist(err) {
 		t.Fatalf("output should not be created, stat error = %v", err)
+	}
+}
+
+func TestDownloadAcceptsLegitimateJSONAsset(t *testing.T) {
+	content := []byte(`{"defaults":{"configure_management_network":true},"check":{"xccl":{"enabled":true}}}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Write(content)
+	}))
+	defer server.Close()
+
+	output := filepath.Join(t.TempDir(), "planning", "bundle.json.part")
+	var downloaded int64
+	if err := downloadFileWithProgress(output, server.URL, true, nil, func(delta int64) { downloaded += delta }); err != nil {
+		t.Fatal(err)
+	}
+	if downloaded != int64(len(content)) {
+		t.Fatalf("downloaded byte progress = %d, want %d", downloaded, len(content))
+	}
+	got, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("downloaded JSON = %q, want %q", got, content)
 	}
 }
 

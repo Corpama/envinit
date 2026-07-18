@@ -1081,12 +1081,9 @@ func downloadFileWithProgress(output, url string, reportProgress bool, onExistin
 		}
 		return &downloadHTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(message)}
 	}
-	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json") {
-		message, err := io.ReadAll(io.LimitReader(body, 64<<10))
-		if err != nil {
-			return fmt.Errorf("read JSON error response: %w", err)
-		}
-		return fmt.Errorf("download package: %s", strings.TrimSpace(string(message)))
+	downloadBody, err := inspectJSONDownloadResponse(resp.Header.Get("Content-Type"), body, onDownloaded)
+	if err != nil {
+		return err
 	}
 
 	flags := os.O_CREATE | os.O_WRONLY
@@ -1112,10 +1109,7 @@ func downloadFileWithProgress(output, url string, reportProgress bool, onExistin
 	defer file.Close()
 
 	start := time.Now()
-	reader := io.Reader(body)
-	if onDownloaded != nil {
-		reader = io.TeeReader(body, byteProgressWriter{add: onDownloaded})
-	}
+	reader := downloadBody
 	written, err := io.Copy(file, reader)
 	if err != nil {
 		return fmt.Errorf("write output: %w", err)
@@ -1127,6 +1121,49 @@ func downloadFileWithProgress(output, url string, reportProgress bool, onExistin
 		fmt.Printf("Downloaded %d bytes in %s\n", written, time.Since(start).Round(time.Second))
 	}
 	return nil
+}
+
+func inspectJSONDownloadResponse(contentType string, body io.Reader, onDownloaded func(int64)) (io.Reader, error) {
+	if !strings.Contains(strings.ToLower(contentType), "json") {
+		if onDownloaded != nil {
+			return io.TeeReader(body, byteProgressWriter{add: onDownloaded}), nil
+		}
+		return body, nil
+	}
+
+	const maxErrorEnvelopeSize = 64 << 10
+	prefix, err := io.ReadAll(io.LimitReader(body, maxErrorEnvelopeSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("inspect JSON download response: %w", err)
+	}
+	if len(prefix) > maxErrorEnvelopeSize {
+		return acceptedJSONDownloadBody(prefix, body, onDownloaded), nil
+	}
+
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(prefix, &envelope); err != nil {
+		return acceptedJSONDownloadBody(prefix, body, onDownloaded), nil
+	}
+	codeRaw, hasCode := envelope["code"]
+	messageRaw, hasMessage := envelope["message"]
+	_, hasData := envelope["data"]
+	if !hasCode || !hasMessage || !hasData {
+		return acceptedJSONDownloadBody(prefix, body, onDownloaded), nil
+	}
+	var code int
+	var message string
+	if json.Unmarshal(codeRaw, &code) != nil || json.Unmarshal(messageRaw, &message) != nil || code == http.StatusOK {
+		return acceptedJSONDownloadBody(prefix, body, onDownloaded), nil
+	}
+	return nil, fmt.Errorf("download package: AList code=%d message=%s", code, strings.TrimSpace(message))
+}
+
+func acceptedJSONDownloadBody(prefix []byte, remaining io.Reader, onDownloaded func(int64)) io.Reader {
+	if onDownloaded != nil {
+		onDownloaded(int64(len(prefix)))
+		remaining = io.TeeReader(remaining, byteProgressWriter{add: onDownloaded})
+	}
+	return io.MultiReader(bytes.NewReader(prefix), remaining)
 }
 
 func verifySHA256(path, expected string) error {

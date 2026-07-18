@@ -160,7 +160,7 @@ chmod +x env_tool_downloader-linux-amd64
 
 下载器会先校验并自动解包轻量 base，再写入所选 profile 的 bundle 和 inventory 样例，最后递归组装 profile 物料。它不依赖目标电脑预装 `tar`；Linux、macOS 和 Windows 分别使用对应的权限或文件属性处理逻辑，脚本和 `.run` 文件会恢复为可执行文件。目录遍历会忽略 `.DS_Store`、AppleDouble 和 `Thumbs.db` 等系统杂项文件。
 
-base、bundle 和 inventory 使用 manifest 中的 SHA256 校验。profile 物料如果 AList 提供 SHA256，也逐文件校验；否则使用远端路径、大小和修改时间形成完成标记。记录保存在 `.envinit-downloads/`，中断下载会保留 `.part` 文件供续传，使用同一输出目录重复运行时会跳过未变化且已完成的文件。
+base、bundle 和 inventory 使用 manifest 中的 SHA256 校验。bundle 本身是 JSON 文件，即使 COS 返回 `Content-Type: application/json` 也会作为正常资产下载；只有响应同时具有 AList 的 `code/message/data` 错误信封且 `code != 200` 时才按接口错误终止。profile 物料如果 AList 提供 SHA256，也逐文件校验；否则使用远端路径、大小和修改时间形成完成标记。记录保存在 `.envinit-downloads/`，中断下载会保留 `.part` 文件供续传，使用同一输出目录重复运行时会跳过未变化且已完成的文件。
 
 profile 物料开始组装后会显示聚合进度，而不是为 1000 多个文件分别刷屏：
 
