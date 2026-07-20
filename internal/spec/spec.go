@@ -124,17 +124,95 @@ type CheckConfig struct {
 }
 
 type CheckBandwidthConfig struct {
-	Duration     int              `json:"duration"`
-	GIDIndex     int              `json:"gid_index"`
-	Iterations   int              `json:"iterations"`
-	BandwidthQPs int              `json:"bandwidth_qps"`
-	MessageSize  int              `json:"message_size"`
-	ReportGBits  bool             `json:"report_gbits"`
-	MmapDevice   string           `json:"mmap_device"`
-	MinGBits     float64          `json:"min_gbits"`
-	Parallel     bool             `json:"parallel"`
-	BasePort     int              `json:"base_port"`
-	RDMAGroups   []CheckRDMAGroup `json:"rdma_groups,omitempty"`
+	Duration      int              `json:"duration"`
+	RunByDuration bool             `json:"run_by_duration,omitempty"`
+	GIDIndex      int              `json:"gid_index"`
+	Iterations    int              `json:"iterations"`
+	BandwidthQPs  int              `json:"bandwidth_qps"`
+	MessageSize   int              `json:"message_size"`
+	ReportGBits   bool             `json:"report_gbits"`
+	MmapDevice    string           `json:"mmap_device"`
+	MinGBits      float64          `json:"min_gbits"`
+	MinGBitsAuto  bool             `json:"-"`
+	MinGBitsSet   bool             `json:"-"`
+	Parallel      bool             `json:"parallel"`
+	BasePort      int              `json:"base_port"`
+	RDMAGroups    []CheckRDMAGroup `json:"rdma_groups,omitempty"`
+}
+
+func (c *CheckBandwidthConfig) UnmarshalJSON(data []byte) error {
+	type bandwidthAlias CheckBandwidthConfig
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	allowed := map[string]bool{
+		"duration": true, "run_by_duration": true, "gid_index": true, "iterations": true, "bandwidth_qps": true,
+		"message_size": true, "report_gbits": true, "mmap_device": true, "min_gbits": true,
+		"parallel": true, "base_port": true, "rdma_groups": true,
+	}
+	for key := range raw {
+		if !allowed[key] {
+			return fmt.Errorf("json: unknown field %q", key)
+		}
+	}
+	minimum, hasMinimum := raw["min_gbits"]
+	auto := false
+	if hasMinimum && strings.TrimSpace(string(minimum)) == "null" {
+		return errors.New("check.bandwidth.min_gbits must be \"auto\", 0, or a positive number")
+	}
+	if hasMinimum && len(minimum) > 0 && minimum[0] == '"' {
+		var mode string
+		if err := json.Unmarshal(minimum, &mode); err != nil {
+			return fmt.Errorf("check.bandwidth.min_gbits: %w", err)
+		}
+		if !strings.EqualFold(strings.TrimSpace(mode), "auto") {
+			return fmt.Errorf("check.bandwidth.min_gbits must be \"auto\", 0, or a positive number, got %q", mode)
+		}
+		auto = true
+		raw["min_gbits"] = json.RawMessage("0")
+	}
+	normalized, err := json.Marshal(raw)
+	if err != nil {
+		return err
+	}
+	var decoded bandwidthAlias
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		return err
+	}
+	if decoded.MinGBits < 0 {
+		return errors.New("check.bandwidth.min_gbits must be \"auto\", 0, or a positive number")
+	}
+	*c = CheckBandwidthConfig(decoded)
+	c.MinGBitsAuto = auto
+	c.MinGBitsSet = hasMinimum
+	return nil
+}
+
+func (c CheckBandwidthConfig) MarshalJSON() ([]byte, error) {
+	type bandwidthAlias CheckBandwidthConfig
+	raw, err := json.Marshal(bandwidthAlias(c))
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	if c.MinGBitsAuto {
+		fields["min_gbits"] = json.RawMessage(`"auto"`)
+	}
+	return json.Marshal(fields)
+}
+
+func (c CheckBandwidthConfig) MinGBitsMode() string {
+	if c.MinGBitsAuto {
+		return "auto"
+	}
+	if c.MinGBits > 0 {
+		return "manual"
+	}
+	return "disabled"
 }
 
 type CheckRDMAPingConfig struct {
@@ -160,7 +238,7 @@ func (c *CheckConfig) UnmarshalJSON(data []byte) error {
 	}
 	allowed := map[string]bool{
 		"bandwidth": true, "rdma_ping": true, "ssh": true, "xccl": true,
-		"duration": true, "gid_index": true, "iterations": true, "bandwidth_qps": true,
+		"duration": true, "run_by_duration": true, "gid_index": true, "iterations": true, "bandwidth_qps": true,
 		"message_size": true, "report_gbits": true, "mmap_device": true, "min_gbits": true,
 		"parallel": true, "base_port": true, "rdma_groups": true,
 		"rdma_ping_count": true, "rdma_ping_payload_size": true, "rdma_ping_timeout": true,
@@ -186,8 +264,18 @@ func (c *CheckConfig) UnmarshalJSON(data []byte) error {
 		}
 	}
 	if _, nested := raw["bandwidth"]; !nested {
+		legacyFields := map[string]json.RawMessage{}
+		for _, key := range []string{"duration", "gid_index", "iterations", "bandwidth_qps", "message_size", "report_gbits", "mmap_device", "min_gbits", "parallel", "base_port", "rdma_groups"} {
+			if value, ok := raw[key]; ok {
+				legacyFields[key] = value
+			}
+		}
+		legacyData, err := json.Marshal(legacyFields)
+		if err != nil {
+			return err
+		}
 		var legacy CheckBandwidthConfig
-		if err := json.Unmarshal(data, &legacy); err != nil {
+		if err := json.Unmarshal(legacyData, &legacy); err != nil {
 			return err
 		}
 		decoded.Bandwidth = legacy
@@ -391,6 +479,9 @@ func (b *Bundle) ApplyDefaults() {
 	}
 	if b.Check.Bandwidth.Iterations == 0 {
 		b.Check.Bandwidth.Iterations = 100
+	}
+	if !b.Check.Bandwidth.MinGBitsSet && b.Check.Bandwidth.MinGBits == 0 {
+		b.Check.Bandwidth.MinGBitsAuto = true
 	}
 	b.Check.Bandwidth.ReportGBits = true
 	if b.Check.Bandwidth.BasePort == 0 {

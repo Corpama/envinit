@@ -17,47 +17,11 @@ func printBandwidthResultTable(output io.Writer, results []Result) {
 	rows := make([]bandwidthResultRow, 0, len(results))
 	degradedCount := 0
 	for _, result := range results {
-		status := "PASS"
-		if !result.Passed {
-			status = "FAIL"
-		} else if result.Degraded {
-			status = "WARN"
-		}
+		status := bandwidthResultStatus(result)
 		if result.Degraded {
 			degradedCount++
 		}
-		row := bandwidthResultRow{
-			Status:     status,
-			Client:     result.Client.Name,
-			Server:     result.Server.Name,
-			ClientNIC:  rdmaNICLabel(result.Client, result.ClientRDMAIndex),
-			ServerNIC:  rdmaNICLabel(result.Server, result.ServerRDMAIndex),
-			ClientIP:   rdmaIPLabel(result.Client, result.ClientRDMAIndex),
-			ServerIP:   bandwidthPeerAddress(result.Server, checkStream{ServerRDMAIndex: result.ServerRDMAIndex}),
-			ClientDev:  result.ClientGroup.IBDevice,
-			ServerDev:  result.ServerGroup.IBDevice,
-			Port:       "-",
-			ClientXP:   "-",
-			ServerXP:   "-",
-			ClientTopo: topologyResultLabel(result.ClientTopology),
-			ServerTopo: topologyResultLabel(result.ServerTopology),
-			Bandwidth:  "unknown",
-			Failure:    !result.Passed,
-			Degraded:   result.Degraded,
-		}
-		if result.Port > 0 {
-			row.Port = strconv.Itoa(result.Port)
-		}
-		if strings.TrimSpace(result.ClientXP) != "" {
-			row.ClientXP = strings.TrimSpace(result.ClientXP)
-		}
-		if strings.TrimSpace(result.ServerXP) != "" {
-			row.ServerXP = strings.TrimSpace(result.ServerXP)
-		}
-		if !math.IsNaN(result.GBits) {
-			row.Bandwidth = fmt.Sprintf("%.2f Gbps", result.GBits)
-		}
-		rows = append(rows, row)
+		rows = append(rows, bandwidthResultRowFromResult(result, status))
 	}
 	sort.SliceStable(rows, func(i, j int) bool {
 		left := rows[i]
@@ -87,30 +51,14 @@ func printBandwidthResultTable(output io.Writer, results []Result) {
 		return false
 	})
 
-	headers := []string{"STATUS", "CLIENT", "SERVER", "CLIENT_NIC", "SERVER_NIC", "CLIENT_IP", "SERVER_IP", "CLIENT_DEV", "SERVER_DEV", "PORT", "CLIENT_XPU", "SERVER_XPU", "CLIENT_TOPO", "SERVER_TOPO", "BANDWIDTH"}
+	headers := bandwidthResultHeaders()
 	widths := make([]int, len(headers))
 	for idx, header := range headers {
 		widths[idx] = len(header)
 	}
 	tableRows := make([][]string, 0, len(rows))
 	for _, row := range rows {
-		cells := []string{
-			row.Status,
-			row.Client,
-			row.Server,
-			row.ClientNIC,
-			row.ServerNIC,
-			row.ClientIP,
-			row.ServerIP,
-			row.ClientDev,
-			row.ServerDev,
-			row.Port,
-			row.ClientXP,
-			row.ServerXP,
-			row.ClientTopo,
-			row.ServerTopo,
-			row.Bandwidth,
-		}
+		cells := bandwidthRowCells(row)
 		for idx, cell := range cells {
 			if len(cell) > widths[idx] {
 				widths[idx] = len(cell)
@@ -132,6 +80,89 @@ func printBandwidthResultTable(output io.Writer, results []Result) {
 	if degradedCount > 0 {
 		fmt.Fprintf(output, "WARN bandwidth topology: %d completed stream(s) used non-PIX XPU/NIC mappings; bandwidth may be limited by the PCIe/NUMA path\n", degradedCount)
 	}
+}
+
+func printBandwidthFailureDetails(output io.Writer, results []Result) {
+	printedHeader := false
+	for _, result := range results {
+		if result.ClientError == "" && result.ServerError == "" {
+			continue
+		}
+		if !printedHeader {
+			fmt.Fprintln(output, "Bandwidth failure details:")
+			printedHeader = true
+		}
+		fmt.Fprintf(output, "FAIL %s -> %s %s port=%d\n", result.Client.Name, result.Server.Name, resultLabel(result), result.Port)
+		printBandwidthSideDetails(output, "CLIENT", result.Client.Name, result.ClientError, result.ClientOutput)
+		printBandwidthSideDetails(output, "SERVER", result.Server.Name, result.ServerError, result.ServerOutput)
+	}
+}
+
+func printBandwidthSideDetails(output io.Writer, side, host, errorText, rawOutput string) {
+	errorText = strings.TrimSpace(errorText)
+	rawOutput = strings.TrimSpace(rawOutput)
+	if errorText == "" {
+		errorText = "no command error reported"
+	}
+	if rawOutput == "" {
+		rawOutput = "(no output captured)"
+	}
+	fmt.Fprintf(output, "  %s %s error: %s\n", side, host, compactTableCell(errorText))
+	fmt.Fprintf(output, "  %s %s output:\n", side, host)
+	for _, line := range strings.Split(rawOutput, "\n") {
+		fmt.Fprintf(output, "    %s\n", line)
+	}
+}
+
+func bandwidthResultStatus(result Result) string {
+	if !result.Passed || result.ClientError != "" || result.ServerError != "" {
+		return "FAIL"
+	}
+	if result.Degraded {
+		return "WARN"
+	}
+	return "PASS"
+}
+
+func bandwidthResultRowFromResult(result Result, status string) bandwidthResultRow {
+	row := bandwidthResultRow{
+		Status: status, Client: result.Client.Name, Server: result.Server.Name,
+		ClientNIC: rdmaNICLabel(result.Client, result.ClientRDMAIndex), ServerNIC: rdmaNICLabel(result.Server, result.ServerRDMAIndex),
+		ClientIP: rdmaIPLabel(result.Client, result.ClientRDMAIndex), ServerIP: bandwidthPeerAddress(result.Server, checkStream{ServerRDMAIndex: result.ServerRDMAIndex}),
+		ClientDev: result.ClientGroup.IBDevice, ServerDev: result.ServerGroup.IBDevice,
+		Port: "-", ClientXP: "-", ServerXP: "-",
+		ClientTopo: topologyResultLabel(result.ClientTopology), ServerTopo: topologyResultLabel(result.ServerTopology),
+		Bandwidth: "unknown", Failure: status == "FAIL", Degraded: result.Degraded,
+	}
+	if result.Port > 0 {
+		row.Port = strconv.Itoa(result.Port)
+	}
+	if strings.TrimSpace(result.ClientXP) != "" {
+		row.ClientXP = strings.TrimSpace(result.ClientXP)
+	}
+	if strings.TrimSpace(result.ServerXP) != "" {
+		row.ServerXP = strings.TrimSpace(result.ServerXP)
+	}
+	if !math.IsNaN(result.GBits) {
+		row.Bandwidth = fmt.Sprintf("%.2f Gbps", result.GBits)
+	}
+	if status == "FAIL" && (result.ClientError != "" || result.ServerError != "") {
+		row.Bandwidth = "error (details below)"
+	}
+	return row
+}
+
+func bandwidthResultHeaders() []string {
+	return []string{"STATUS", "CLIENT", "SERVER", "CLIENT_NIC", "SERVER_NIC", "CLIENT_IP", "SERVER_IP", "CLIENT_DEV", "SERVER_DEV", "PORT", "CLIENT_XPU", "SERVER_XPU", "CLIENT_TOPO", "SERVER_TOPO", "BANDWIDTH"}
+}
+
+func bandwidthResultCells(result Result, status string, _ bool) []string {
+	row := bandwidthResultRowFromResult(result, status)
+	return bandwidthRowCells(row)
+}
+
+func bandwidthRowCells(row bandwidthResultRow) []string {
+	return []string{row.Status, row.Client, row.Server, row.ClientNIC, row.ServerNIC, row.ClientIP, row.ServerIP, row.ClientDev, row.ServerDev, row.Port, row.ClientXP, row.ServerXP, row.ClientTopo, row.ServerTopo, row.Bandwidth}
 }
 
 func topologyResultLabel(link string) string {

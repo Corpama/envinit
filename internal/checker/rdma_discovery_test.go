@@ -340,13 +340,30 @@ default via 10.61.10.1 dev bond0 proto static metric 100
 3: bond0         inet 10.61.10.41/24 brd 10.61.10.255 scope global bond0
 4: vxlan.calico  inet 10.96.76.64/32 scope global vxlan.calico
 5: nodelocaldns   inet 169.254.25.10/32 scope global nodelocaldns
+6: ovn0           inet 100.64.0.2/16 brd 100.64.255.255 scope global ovn0
 `
 	if got, want := parseManagementIPDiscovery(output), "10.61.10.41"; got != want {
 		t.Fatalf("unexpected management IP: got=%s want=%s", got, want)
 	}
 	for _, item := range parseManagementIPCandidates(output) {
-		if item.IP == "169.254.25.10" || item.Iface == "nodelocaldns" {
-			t.Fatalf("IPv4 link-local address leaked into management candidates: %#v", item)
+		if item.IP == "169.254.25.10" || item.Iface == "nodelocaldns" || item.Iface == "ovn0" {
+			t.Fatalf("non-management interface leaked into management candidates: %#v", item)
+		}
+	}
+}
+
+func TestDiscoveryInterfaceFiltersRejectOVNAndOVS(t *testing.T) {
+	for _, name := range []string{"ovn0", "OVN-K8S-MP0", "ovs-system"} {
+		if !shouldIgnoreManagementIface(name) {
+			t.Fatalf("%s must not be a management candidate", name)
+		}
+		if !shouldIgnoreDiscoveredIface(name) {
+			t.Fatalf("%s must not be an RDMA candidate", name)
+		}
+	}
+	for _, name := range []string{"eth0", "enp6s0f0np0", "bond0"} {
+		if shouldIgnoreManagementIface(name) {
+			t.Fatalf("%s should remain eligible as a management candidate", name)
 		}
 	}
 }

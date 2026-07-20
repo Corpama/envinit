@@ -289,6 +289,50 @@ func TestIBWriteBWArgsIncludesConfiguredQPs(t *testing.T) {
 	}
 }
 
+func TestIBWriteBWArgsVerbsUsesDurationGIDAndNoRDMACM(t *testing.T) {
+	args := ibWriteBWArgsForMode(spec.CheckBandwidthConfig{
+		Duration:      10,
+		RunByDuration: true,
+		GIDIndex:      3,
+		BandwidthQPs:  4,
+		MessageSize:   1048576,
+		ReportGBits:   true,
+	}, spec.CheckRDMAGroup{IBDevice: "mlx5_2"}, "", "192.168.32.11", 18520, BandwidthModeVerbs)
+	got := shellJoin(args)
+	for _, want := range []string{"'-D' '10'", "'-f' '2'", "'-N'", "'-d' 'mlx5_2'", "'-i' '1'", "'-x' '3'", "'-q' '4'", "'-s' '1048576'", "'192.168.32.11'"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %s in Verbs command:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "'-R'") || strings.Contains(got, "'-n'") {
+		t.Fatalf("Verbs duration command must not use RDMA-CM or iteration mode:\n%s", got)
+	}
+}
+
+func TestBandwidthAddressUsesControlForVerbsAndRDMAIPForCM(t *testing.T) {
+	server := Target{ControlAddress: "192.168.32.11", Address: "192.168.32.11", RDMA: []spec.RDMARecord{{IP: "25.16.2.2"}}}
+	stream := checkStream{ServerRDMAIndex: 0}
+	verbs := Options{bandwidthMode: BandwidthModeVerbs}
+	if got := bandwidthAddressForMode(verbs, server, stream); got != "192.168.32.11" {
+		t.Fatalf("expected Verbs control address, got %q", got)
+	}
+	cm := Options{bandwidthMode: BandwidthModeRDMACM}
+	if got := bandwidthAddressForMode(cm, server, stream); got != "25.16.2.2" {
+		t.Fatalf("expected RDMA-CM peer RDMA IP, got %q", got)
+	}
+}
+
+func TestNormalizedBandwidthModesPreservesLegacyRDMACMDefault(t *testing.T) {
+	legacy := normalizedBandwidthModes(nil)
+	if len(legacy) != 1 || legacy[0] != BandwidthModeRDMACM {
+		t.Fatalf("unexpected legacy modes: %v", legacy)
+	}
+	both := normalizedBandwidthModes([]string{"verbs", "rdma-cm", "verbs"})
+	if len(both) != 2 || both[0] != BandwidthModeVerbs || both[1] != BandwidthModeRDMACM {
+		t.Fatalf("unexpected normalized modes: %v", both)
+	}
+}
+
 func TestRunRejectsNegativeBundleBandwidthQPs(t *testing.T) {
 	bundle := spec.Bundle{Check: spec.CheckConfig{Bandwidth: spec.CheckBandwidthConfig{
 		BandwidthQPs: -1,

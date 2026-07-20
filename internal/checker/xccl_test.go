@@ -433,6 +433,7 @@ func TestGeneratedXCCLShellIsPortableSyntax(t *testing.T) {
 		"authorize":      xcclAuthorizeKeyCommand(workDir, "envinit-xccl-run"),
 		"cleanup-multi":  xcclCleanupCommand(workDir, "envinit-xccl-run", true),
 		"cleanup-single": xcclCleanupCommand(workDir, "envinit-xccl-run", false),
+		"tracked-mpirun": xcclTrackedMPIRunCommand(workDir, []string{"mpirun", "-n", "2"}),
 	}
 	for name, script := range scripts {
 		t.Run(name, func(t *testing.T) {
@@ -452,6 +453,8 @@ func TestXCCLCleanupOnlyRemovesMarkedAuthorization(t *testing.T) {
 		"index($0, marker) == 0",
 		"authorized-keys-created",
 		"mpich-link-created",
+		"mpirun.pid",
+		"/proc/$p/cmdline",
 		"rm -rf -- '/tmp/envinit-xccl-check/run'",
 	} {
 		if !strings.Contains(command, want) {

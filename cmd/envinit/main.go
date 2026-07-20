@@ -69,6 +69,7 @@ func runCheck(args []string) error {
 	rdmaPingMTU := fs.Int("rdma-ping-mtu", 0, "Override RDMA ping MTU; payload is calculated as MTU-28 for IPv4")
 	rdmaPingTimeout := fs.Int("rdma-ping-timeout", 0, "Override RDMA ping timeout in seconds")
 	dryRun := fs.Bool("dry-run", false, "Preview check commands without running traffic; XDR mmap performs read-only IB/topology discovery")
+	noTUI := fs.Bool("no-tui", false, "Disable the interactive check TUI and print plain text results")
 	fs.SetOutput(os.Stderr)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -78,9 +79,6 @@ func runCheck(args []string) error {
 	}
 	if strings.TrimSpace(*bundlePath) == "" {
 		return fmt.Errorf("--bundle is required")
-	}
-	if strings.TrimSpace(*hostsRaw) == "" {
-		return fmt.Errorf("--hosts is required")
 	}
 	rawCheckStage := *checkStageRaw
 	if strings.TrimSpace(*checksRaw) != "" {
@@ -111,15 +109,37 @@ func runCheck(args []string) error {
 	if err != nil {
 		return err
 	}
+	hosts := []string{*hostsRaw}
+	var bandwidthModes []string
+	if strings.TrimSpace(*hostsRaw) == "" {
+		if *noTUI || *dryRun || !stdinIsTerminal() || !stdoutIsTerminal() {
+			return fmt.Errorf("--hosts is required in non-interactive mode; omit it in an interactive terminal to select hosts in the check setup TUI")
+		}
+		selection, err := checker.RunCheckWizard(records, b, runRDMAPing, runBandwidth, runXCCL)
+		if err != nil {
+			return err
+		}
+		if selection.Canceled {
+			return nil
+		}
+		b = selection.Bundle
+		hosts = selection.Hosts
+		runRDMAPing = selection.RunPing
+		runBandwidth = selection.RunBandwidth
+		runXCCL = selection.RunXCCL
+		bandwidthModes = selection.BandwidthModes
+	}
 	return checker.Run(checker.Options{
-		Bundle:       b,
-		Records:      records,
-		Hosts:        []string{*hostsRaw},
-		RunBandwidth: runBandwidth,
-		RunRDMAPing:  runRDMAPing,
-		RunXCCL:      runXCCL,
-		DryRun:       *dryRun,
-		Output:       os.Stdout,
+		Bundle:         b,
+		Records:        records,
+		Hosts:          hosts,
+		RunBandwidth:   runBandwidth,
+		RunRDMAPing:    runRDMAPing,
+		RunXCCL:        runXCCL,
+		BandwidthModes: bandwidthModes,
+		DryRun:         *dryRun,
+		LiveOutput:     stdoutIsTerminal() && !*noTUI,
+		Output:         os.Stdout,
 	})
 }
 
@@ -809,13 +829,13 @@ Usage:
   envinit plan  --inventory ./machines.xlsx --bundle ./bundle.json [--host xpu11] [--plain]
   envinit apply --inventory ./machines.xlsx --bundle ./bundle.json [--host xpu11] [--restart]
   envinit discover --inventory ./machines.csv --bundle ./bundle.json --hosts xpu11=192.168.32.11 [--yes]
-  envinit check --inventory ./machines.csv --bundle ./bundle.json --hosts xpu11,xpu12 [--check-stage bandwidth|rdma-ping|xccl|all]
+  envinit check --inventory ./machines.csv --bundle ./bundle.json [--hosts xpu11,xpu12] [--check-stage bandwidth|rdma-ping|xccl|all]
 
 Notes:
   plan   Parse the inventory and preview planned actions in a stage-by-stage TUI; use --plain for text output
   apply  Write files and execute commands; root privileges are required; default all-stage runs resume from saved progress
   discover  Discover mgmt_ip plus rdmaN_name/rdmaN_ip for one or more hosts and write them back to CSV/TSV/TXT inventory
-  check  Run RDMA/XPU bandwidth, jumbo RDMA ping, and optional XCCL collective checks across two or more hosts
+  check  Open an interactive host/check/parameter setup TUI when --hosts is omitted; retain flags for automation and --no-tui
 
 Discover options:
   --hosts    inventory identity, SSH endpoint, or an explicit identity=endpoint mapping

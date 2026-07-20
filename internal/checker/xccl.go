@@ -25,13 +25,16 @@ const (
 func runXCCLCheck(opts Options, targets []Target, groupsByTarget resolvedRDMAGroups) (runErr error) {
 	cfg := opts.Bundle.Check.XCCL
 	if err := validateXCCLConfig(cfg); err != nil {
+		showXCCLTUIInitialFailure(opts, cfg, nil, targets, err)
 		return err
 	}
 	plans, err := resolveXCCLTargetPlans(opts, targets, groupsByTarget)
 	if err != nil {
+		showXCCLTUIInitialFailure(opts, cfg, nil, targets, err)
 		return err
 	}
 	if err := validateXCCLPlanConsistency(plans); err != nil {
+		showXCCLTUIInitialFailure(opts, cfg, plans, targets, err)
 		return err
 	}
 	printXCCLPlan(opts, plans)
@@ -55,6 +58,14 @@ func runXCCLCheck(opts Options, targets []Target, groupsByTarget resolvedRDMAGro
 	if opts.DryRun {
 		printXCCLDryRun(opts, plans, coordinator, workDir, marker, totalRanks, multiHost)
 		return nil
+	}
+	live := newXCCLLiveTracker(opts.Output, opts.LiveOutput, cfg, plans, totalRanks)
+	if live != nil {
+		defer func() {
+			if runErr != nil {
+				live.Fail(runErr)
+			}
+		}()
 	}
 
 	localTemp, err := os.MkdirTemp("", "envinit-xccl-")
@@ -95,7 +106,7 @@ func runXCCLCheck(opts Options, targets []Target, groupsByTarget resolvedRDMAGro
 
 	remoteTouched = true
 	for idx, plan := range plans {
-		if _, err := runCommand(opts.Bundle.Check, plan.Target, xcclPrepareDirectoriesCommand(workDir)); err != nil {
+		if _, err := runCheckCommand(opts, plan.Target, xcclPrepareDirectoriesCommand(workDir)); err != nil {
 			return fmt.Errorf("prepare XCCL runtime on %s: %w", plan.Target.Name, err)
 		}
 		rankScript := filepath.Join(localTemp, fmt.Sprintf("rank-%d.sh", idx))
@@ -115,11 +126,11 @@ func runXCCLCheck(opts Options, targets []Target, groupsByTarget resolvedRDMAGro
 				return fmt.Errorf("distribute XCCL runtime to %s: %w", plan.Target.Name, err)
 			}
 		}
-		if _, err := runCommand(opts.Bundle.Check, plan.Target, xcclInstallRuntimeCommand(cfg, workDir, multiHost)); err != nil {
+		if _, err := runCheckCommand(opts, plan.Target, xcclInstallRuntimeCommand(cfg, workDir, multiHost)); err != nil {
 			return fmt.Errorf("install temporary XCCL runtime on %s: %w", plan.Target.Name, err)
 		}
 		if multiHost {
-			if _, err := runCommand(opts.Bundle.Check, plan.Target, xcclAuthorizeKeyCommand(workDir, marker)); err != nil {
+			if _, err := runCheckCommand(opts, plan.Target, xcclAuthorizeKeyCommand(workDir, marker)); err != nil {
 				return fmt.Errorf("authorize temporary XCCL SSH key on %s: %w", plan.Target.Name, err)
 			}
 		}
@@ -143,22 +154,38 @@ func runXCCLCheck(opts Options, targets []Target, groupsByTarget resolvedRDMAGro
 				return fmt.Errorf("stage XCCL coordinator file %s: %w", filepath.Base(item[1]), err)
 			}
 		}
-		if _, err := runCommand(opts.Bundle.Check, coordinator, xcclCoordinatorPermissionsCommand(workDir)); err != nil {
+		if _, err := runCheckCommand(opts, coordinator, xcclCoordinatorPermissionsCommand(workDir)); err != nil {
 			return fmt.Errorf("secure XCCL coordinator files: %w", err)
 		}
-		if _, err := runCommand(opts.Bundle.Check, coordinator, xcclTemporarySSHProbeCommand(plans, workDir)); err != nil {
+		if _, err := runCheckCommand(opts, coordinator, xcclTemporarySSHProbeCommand(plans, workDir)); err != nil {
 			return fmt.Errorf("verify temporary XCCL SSH mesh from %s: %w", coordinator.Name, err)
 		}
 	}
 
 	mpirunArgs := xcclMPIRunArgs(cfg, workDir, totalRanks, multiHost)
-	fmt.Fprintf(opts.Output, "INFO xccl mpirun coordinator=%s ranks=%d: %s\n", coordinator.Name, totalRanks, shellJoin(mpirunArgs))
-	output, err := runCommand(opts.Bundle.Check, coordinator, shellJoin(mpirunArgs))
-	if strings.TrimSpace(output) != "" {
+	mpirunCommand := xcclTrackedMPIRunCommand(workDir, mpirunArgs)
+	fmt.Fprintf(opts.Output, "INFO xccl mpirun coordinator=%s ranks=%d: %s\n", coordinator.Name, totalRanks, mpirunCommand)
+	var liveWriter *lineCallbackWriter
+	var liveStdout io.Writer
+	if live != nil {
+		liveWriter = &lineCallbackWriter{callback: live.ConsumeLine}
+		liveStdout = liveWriter
+	}
+	output, err := runCheckCommandStreaming(opts, coordinator, mpirunCommand, liveStdout, nil)
+	if opts.checkTUI != nil && strings.TrimSpace(output) != "" {
+		opts.checkTUI.AppendLog(checkTUIStageXCCL, strings.TrimRight(output, "\n"))
+	}
+	if liveWriter != nil {
+		liveWriter.Flush()
+	} else if strings.TrimSpace(output) != "" {
 		fmt.Fprintln(opts.Output, "XCCL raw output:")
 		fmt.Fprintln(opts.Output, strings.TrimRight(output, "\n"))
 	}
 	if err != nil {
+		if live != nil && strings.TrimSpace(output) != "" {
+			fmt.Fprintln(opts.Output, "XCCL failure output:")
+			fmt.Fprintln(opts.Output, strings.TrimRight(output, "\n"))
+		}
 		return fmt.Errorf("run XCCL %s on %d ranks: %w", cfg.Test, totalRanks, err)
 	}
 	rows := parseXCCLPerformanceRows(output)
@@ -166,7 +193,9 @@ func runXCCLCheck(opts Options, targets []Target, groupsByTarget resolvedRDMAGro
 		return fmt.Errorf("XCCL %s completed but no performance rows were parsed", cfg.Test)
 	}
 	fmt.Fprintln(opts.Output, "INFO xccl validation: disabled (-c 0 performance mode); bandwidth results exclude accuracy-check overhead")
-	return printXCCLResult(opts, plans, totalRanks, rows)
+	evaluation := evaluateXCCLResult(opts, plans, rows)
+	live.Finalize(evaluation)
+	return printXCCLResultEvaluation(opts, totalRanks, rows, evaluation)
 }
 
 func validateXCCLConfig(cfg spec.CheckXCCLConfig) error {
@@ -593,6 +622,7 @@ func cleanupXCCLTargets(opts Options, plans []xcclTargetPlan, workDir, marker st
 
 func xcclCleanupCommand(workDir, marker string, removeSSHAuthorization bool) string {
 	temporaryMPICH := filepath.Join(workDir, "runtime", "mpich-"+xcclMPICHVersion)
+	mpirunPID := filepath.Join(workDir, "mpirun.pid")
 	commands := []string{}
 	if removeSSHAuthorization {
 		commands = append(commands,
@@ -603,10 +633,16 @@ func xcclCleanupCommand(workDir, marker string, removeSSHAuthorization bool) str
 		)
 	}
 	commands = append(commands,
+		fmt.Sprintf("if [ -f %s ]; then p=$(cat %s 2>/dev/null || true); case \"$p\" in ''|*[!0-9]*) ;; *) if [ -r \"/proc/$p/cmdline\" ] && tr '\\0' ' ' < \"/proc/$p/cmdline\" | grep -F -q -- %s; then kill \"$p\" >/dev/null 2>&1 || true; fi ;; esac; fi", shellQuote(mpirunPID), shellQuote(mpirunPID), shellQuote(workDir)),
 		fmt.Sprintf("if [ -f %s ] && [ -L %s ] && [ \"$(readlink %s)\" = %s ]; then rm -f %s; fi", shellQuote(filepath.Join(workDir, "mpich-link-created")), shellQuote(xcclMPICHPrefix), shellQuote(xcclMPICHPrefix), shellQuote(temporaryMPICH), shellQuote(xcclMPICHPrefix)),
 		fmt.Sprintf("rm -rf -- %s", shellQuote(workDir)),
 	)
 	return strings.Join(commands, "; ")
+}
+
+func xcclTrackedMPIRunCommand(workDir string, args []string) string {
+	pidPath := filepath.Join(workDir, "mpirun.pid")
+	return fmt.Sprintf("printf '%%s\\n' \"$$\" > %s; exec %s", shellQuote(pidPath), shellJoin(args))
 }
 
 func generateXCCLSSHKey(localTemp, marker string) (string, string, error) {
@@ -686,7 +722,15 @@ func parseXCCLPerformanceRows(output string) []xcclPerformanceRow {
 	return rows
 }
 
-func printXCCLResult(opts Options, plans []xcclTargetPlan, totalRanks int, rows []xcclPerformanceRow) error {
+type xcclEvaluation struct {
+	Status   string
+	Selected xcclPerformanceRow
+	Degraded bool
+	Hosts    []string
+	Topology string
+}
+
+func evaluateXCCLResult(opts Options, plans []xcclTargetPlan, rows []xcclPerformanceRow) xcclEvaluation {
 	selected := selectXCCLPerformanceRow(rows)
 	status := "PASS"
 	if opts.Bundle.Check.XCCL.MinBusBandwidthGBs > 0 && selected.BusGBs < opts.Bundle.Check.XCCL.MinBusBandwidthGBs {
@@ -704,8 +748,18 @@ func printXCCLResult(opts Options, plans []xcclTargetPlan, totalRanks int, rows 
 	if degraded {
 		topology = "DEGRADED"
 	}
+	return xcclEvaluation{Status: status, Selected: selected, Degraded: degraded, Hosts: hostNames, Topology: topology}
+}
+
+func printXCCLResult(opts Options, plans []xcclTargetPlan, totalRanks int, rows []xcclPerformanceRow) error {
+	return printXCCLResultEvaluation(opts, totalRanks, rows, evaluateXCCLResult(opts, plans, rows))
+}
+
+func printXCCLResultEvaluation(opts Options, totalRanks int, rows []xcclPerformanceRow, evaluation xcclEvaluation) error {
+	selected := evaluation.Selected
+	status := evaluation.Status
 	headers := []string{"STATUS", "TEST", "HOSTS", "RANKS", "TOPOLOGY", "MODE", "SIZE(B)", "TIME(us)", "ALGBW(GB/s)", "BUSBW(GB/s)"}
-	cells := []string{status, opts.Bundle.Check.XCCL.Test, strings.Join(hostNames, ","), strconv.Itoa(totalRanks), topology, firstNonEmpty(selected.Mode, "out-of-place"), strconv.FormatInt(selected.SizeBytes, 10), fmt.Sprintf("%.2f", selected.TimeUS), fmt.Sprintf("%.2f", selected.AlgGBs), fmt.Sprintf("%.2f", selected.BusGBs)}
+	cells := []string{status, opts.Bundle.Check.XCCL.Test, strings.Join(evaluation.Hosts, ","), strconv.Itoa(totalRanks), evaluation.Topology, firstNonEmpty(selected.Mode, "out-of-place"), strconv.FormatInt(selected.SizeBytes, 10), fmt.Sprintf("%.2f", selected.TimeUS), fmt.Sprintf("%.2f", selected.AlgGBs), fmt.Sprintf("%.2f", selected.BusGBs)}
 	widths := make([]int, len(headers))
 	for idx := range headers {
 		widths[idx] = maxInt(len(headers[idx]), len(cells[idx]))
@@ -719,7 +773,7 @@ func printXCCLResult(opts Options, plans []xcclTargetPlan, totalRanks int, rows 
 	}
 	fmt.Fprintln(opts.Output, line)
 	printXCCLSizeResults(opts.Output, rows, selected)
-	if degraded {
+	if evaluation.Degraded {
 		fmt.Fprintln(opts.Output, "WARN xccl result topology: at least one XPU used a non-PIX RDMA mapping; collective bandwidth may be limited by the PCIe/NUMA path")
 	}
 	if status == "FAIL" {

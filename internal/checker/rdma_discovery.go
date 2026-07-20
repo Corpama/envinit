@@ -363,7 +363,17 @@ func shouldIgnoreManagementIface(name string) bool {
 	if name == "" || name == "lo" {
 		return true
 	}
-	for _, prefix := range []string{"ib", "rdma", "vxlan.", "cali", "flannel", "docker", "veth", "br-", "virbr", "kube"} {
+	for _, prefix := range []string{"ib", "rdma"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return isVirtualOverlayIface(name)
+}
+
+func isVirtualOverlayIface(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, prefix := range []string{"vxlan.", "cali", "flannel", "docker", "veth", "br-", "virbr", "kube", "ovn", "ovs"} {
 		if strings.HasPrefix(name, prefix) {
 			return true
 		}
@@ -718,12 +728,7 @@ func shouldIgnoreDiscoveredIface(name string) bool {
 	if name == "" || name == "lo" || name == "bond0" || strings.HasPrefix(name, "bond") {
 		return true
 	}
-	for _, prefix := range []string{"vxlan.", "cali", "flannel", "docker", "veth", "br-", "virbr", "kube"} {
-		if strings.HasPrefix(name, prefix) {
-			return true
-		}
-	}
-	return false
+	return isVirtualOverlayIface(name)
 }
 
 func ipv4SortKey(value string) uint32 {

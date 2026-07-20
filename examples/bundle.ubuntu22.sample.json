@@ -79,7 +79,7 @@
       "message_size": 0,
       "report_gbits": true,
       "mmap_device": "",
-      "min_gbits": 0,
+      "min_gbits": "auto",
       "parallel": false,
       "base_port": 0
     },

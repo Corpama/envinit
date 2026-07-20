@@ -1062,7 +1062,7 @@ MST Device Review 中使用上下方向键或 `j/k` 移动，空格切换当前�
     "message_size": 0,
     "report_gbits": true,
     "mmap_device": "",
-    "min_gbits": 0,
+    "min_gbits": "auto",
     "parallel": false,
     "base_port": 0
   },
@@ -1097,15 +1097,16 @@ MST Device Review 中使用上下方向键或 `j/k` 移动，空格切换当前�
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `iterations` | `100` | 传给 `ib_write_bw -n` 的迭代次数 |
+| `run_by_duration` | `false` | `true` 时使用 `-D duration -f 2 -N`，不再使用 `-n`；交互向导默认启用 |
 | `bandwidth_qps` | `0` | QP 数；正数传给 `-q`，`0` 使用 perftest 默认值；命令行 `--bandwidth-qps` 优先 |
-| `min_gbits` | `0` | 每条流最低带宽，单位 `Gbps`；`0` 只记录，正数用于 PASS/FAIL |
+| `min_gbits` | `"auto"` | `"auto"` 按两端网卡最大支持速率的较小值乘以 70% 逐流判定；`0` 只记录；正数使用固定 Gbps 门槛 |
 | `parallel` | `false` | 是否按“不让同一批中的同一客户端/服务端 RDMA 口重复占用”的规则分批并发 |
 | `base_port` | `18515` | 第一条 `ib_write_bw` 流端口，后续流依次递增 |
 | `message_size` | `0` | 运行时派生字段；当前命令行会先清零，仅 `--emu-kv-transfer` 设置为 8 MiB |
 | `mmap_device` | 空 | 运行时派生字段；当前命令行会先清空，仅 `--bandwidth-mmap xdr` 设置为 `/dev/xdrdrv` |
 | `report_gbits` | `true` | 输出使用 `--report_gbits`，汇总单位为 `Gbps` |
-| `duration` | `1` | 兼容保留；当前带宽命令按 `iterations` 执行，不传 `ib_write_bw -D` |
-| `gid_index` | `3` | 兼容保留；当前使用 RDMA CM `-R`，不传 `ib_write_bw -x` |
+| `duration` | `1` | `run_by_duration=true` 时传给 `ib_write_bw -D`；交互向导默认调整为 10 秒 |
+| `gid_index` | `3` | Verbs 模式传给 `ib_write_bw -x`；RDMA-CM 模式由对端 RDMA IP 选路 |
 | `rdma_groups` | 省略 | 旧 bundle 兼容字段；新配置从 inventory/defaults 的 `rdmaN_name`、sysfs 和 topo 动态生成 |
 
 `check.rdma_ping` 参数：
@@ -1291,18 +1292,20 @@ Review 左侧是当前机器的 `mgmt`、`rdma1..rdmaN` 槽位，右侧是管理
 | `rdma-ping` | 所有参测 RDMA 口之间的 IPv4 大包、无分片连通性 | 至少 2 台 |
 | `xccl` | 单机或多机 XPU 集合通信、XCCL/MPICH 运行时和 RoCE 数据路径 | 允许 1 台 |
 
-默认 `--check-stage all`：执行 bandwidth 和 rdma-ping；只有 `check.xccl.enabled=true` 时才把 XCCL 加入默认流程。显式使用 `--check-stage xccl` 时会直接执行 XCCL，用于单机 smoke test 或临时覆盖默认开关。
+交互终端中省略 `--hosts` 会先进入 `Hosts -> Checks -> Parameters -> Review` 配置向导：从 inventory 勾选机器，选择 Ping/Bandwidth/XCCL，并对本轮参数做临时覆盖；Review 会显示双向交叉矩阵数量，确认后才开始远端发现和测试。向导不会写回 bundle。Bandwidth 默认同时生成独立的 `BW Verbs` 和 `BW RDMA-CM` stage：Verbs 使用管理地址交换控制信息、通过两端 `IB device/GID index` 建立数据路径且不传 `-R`；RDMA-CM 使用对端规划 RDMA IP 并传 `-R`。两种模式分别展示结果、热力图、RDMA Counter Delta 和 Raw Logs。
+
+显式 CLI 模式保持兼容：默认 `--check-stage all` 执行 bandwidth 和 rdma-ping；只有 `check.xccl.enabled=true` 时才把 XCCL 加入默认流程。未通过向导指定 bandwidth mode 的旧命令仍只运行原有 RDMA-CM 模式。显式使用 `--check-stage xccl` 时会直接执行 XCCL，用于单机 smoke test 或临时覆盖默认开关。
 
 一次非 dry-run 的总体顺序是：
 
-1. 从 inventory 解析 `--hosts` 并识别本地目标。通常使用 inventory 的 `mgmt_ip`；也可以用 `inventory身份=SSH地址` 只覆盖本次控制地址。
+1. 从配置向导或 `--hosts` 解析目标并识别本地目标。通常使用 inventory 的 `mgmt_ip`；也可以用 `inventory身份=SSH地址` 只覆盖本次控制地址。
 2. 对目标机实际 hostname 与 inventory 不一致的情况打印警告，但仍按选定的管理 IP 继续。
 3. bandwidth/XCCL 按每个 `rdmaN_name` 从 `/sys/class/net/<iface>/device/infiniband/` 解析本机真实 `mlx5_N`；XDR bandwidth 在起流前读取 `xpu-smi topo -m`，XCCL 在自身 stage 内读取 topo。
 4. 采集所有参测 RDMA 网卡的 NIC 计数器 before 快照。
-5. 执行 rdma-ping；若启用 bandwidth/XCCL，再采集 IB device 计数器 before 快照。
-6. 执行 bandwidth，再执行 XCCL。
+5. 执行 rdma-ping；交互终端的 check TUI 会先显示完整双向交叉矩阵，初始状态为 `WAIT`，起测后改为 `RUNNING`，每条路径完成后在对应条目填入 `PASS/FAIL`。若启用 bandwidth/XCCL，再采集 IB device 计数器 before 快照。
+6. 执行 bandwidth，再执行 XCCL。bandwidth 同样预先生成完整流矩阵；命令失败时，选中对应条目并按 `Space` 可分别查看客户端和服务端的完整错误与原始输出。XCCL 会预先按消息 size 和 out-of-place/in-place 模式生成条目，收到性能行后填入 time、algbw 和 busbw。
 7. 采集 IB device 和 NIC after 快照，计算 delta。
-8. 输出所有汇总表。任一命令失败、吞吐低于门槛、ping 丢包或异常计数器增长，最终 check 返回非零。
+8. 每个参测检查在 TUI 中固定复用 `Results / Counter Delta / Raw Logs` 三个选项卡。Results 保留原汇总表的全部列，`Up/Down` 选择行，`PgUp/PgDown` 翻阅主列表；`Space` 打开或关闭右侧/下侧完整详情，`Ctrl+U/Ctrl+D` 单独翻阅详情；`Left/Right` 可横向查看超宽表。Counter Delta 和 Raw Logs 同样使用 `PgUp/PgDown` 翻阅主内容。Bandwidth Results 页按 `p` 可切换列表/热力图，热力图中按 `m` 切换测试方向并用方向键选择单元格；XCCL Results 页按 `p` 切换表格/折线图、按 `m` 切换 out-of-place/in-place。Counter Delta 直接展示原有 NIC/RDMA compare 逻辑生成的完整 summary，不另做统计；Raw Logs 保存该检查的逐项结果及命令原始输出。使用 `Tab/Shift+Tab` 切换三个页面，使用 `[`/`]` 切换 Ping/Bandwidth/XCCL stage，底部会明确显示 `[/]: switch stage`。测试运行中，Results 页按 `q` 只中止光标选中的 Ping/Bandwidth 项，已完成项不会响应；由于 XCCL 的全部 size/mode 共用同一个 mpirun 进程，XCCL 页按 `q` 会中止当前整个 XCCL stage，并给出明确提示。按一次 `Esc` 中止当前 stage；1.5 秒内连续按两次 `Esc` 中止整条 check。若本次只选择了一个 stage，一次 `Esc` 中止该 stage 后，check 会在清理完成后自然结束。`Ctrl-C` 仍用于立即中止整条 check 并退出 TUI。所有中止都会终止对应本地/SSH 进程并进入已有的 bandwidth/XCCL 清理流程，最终返回非零。整轮 check 完成后，可在 Ping 或 Bandwidth 的 Results 列表/热力图中选中一条链路并按 `Enter` 单独重测；该行会回到 `RUNNING` 并在完成后原位更新，最新详情和带 `RETEST` 前缀的记录写入 Raw Logs。为避免重测流量污染首次检查的并发性能与 counter 快照，运行过程中不会立即重测；人工重测是诊断复核，不覆盖首次检查的总退出结论和 Counter Delta，按 `q` 退出并中止仍在执行的重测。TUI 只改变展示方式，不改变门槛判断和退出状态；重定向到文件或非交互环境时仍输出普通汇总表和完整错误。任一命令失败、吞吐低于门槛、ping 丢包或异常计数器增长，最终 check 返回非零。
 
 #### 8.2.2 check 公共参数
 
@@ -1310,10 +1313,11 @@ Review 左侧是当前机器的 `mgmt`、`rdma1..rdmaN` 槽位，右侧是管理
 | --- | --- | --- |
 | `--inventory <path>` | 必需 | 读取目标管理 IP、RDMA 逻辑顺序、接口名和地址 |
 | `--bundle <path>` | 必需 | 读取 `check.ssh/bandwidth/rdma_ping/xccl` |
-| `--hosts <list>` | 必需 | `host_id`、`hostname`、`mgmt_ip`，或 `inventory身份=SSH地址`；支持逗号、空格、分号、竖线分隔 |
+| `--hosts <list>` | 交互可省略 | 交互终端省略时进入配置向导；非交互、`--dry-run` 或 `--no-tui` 时必需。值支持 `host_id`、`hostname`、`mgmt_ip` 或 `inventory身份=SSH地址` |
 | `--sheet <name>` | 第一张表 | XLSX inventory 工作表 |
 | `--check-stage <list>` | `all` | `bandwidth`、`rdma-ping`、`xccl` 或组合；`--checks` 是弃用别名 |
 | `--dry-run` | `false` | 不启动测试流量；不同子检查的只读发现边界见下文 |
+| `--no-tui` | `false` | 即使 stdout 是交互终端也禁用 check TUI，改用普通文本结果；适合脚本和伪终端 |
 | `--bandwidth-qps <n>` | bundle 值 | 覆盖 `check.bandwidth.bandwidth_qps`，必须非负 |
 | `--emu-kv-transfer` | `false` | 把 bandwidth message size 设置为 8 MiB |
 | `--bandwidth-mmap xdr` | 关闭 | 启用 `/dev/xdrdrv` mmap，并按真实 XPU/NIC 拓扑生成 offset |
@@ -1326,9 +1330,10 @@ Review 左侧是当前机器的 `mgmt`、`rdma1..rdmaN` 槽位，右侧是管理
 ```bash
 sudo ./env_init check \
   --inventory planning/inventory.csv \
-  --bundle planning/bundle.json \
-  --hosts node-a,node-b
+  --bundle planning/bundle.json
 ```
+
+上述命令进入配置向导。自动化和非交互环境继续显式提供 `--hosts node-a,node-b`。
 
 `--dry-run` 的含义不是所有模式都完全不访问远端：
 
@@ -1389,7 +1394,7 @@ check 的显式映射只覆盖控制通道，不会像 discover 一样按远端 
 | `check.bandwidth.bandwidth_qps` | 正数时添加 `-q` |
 | `check.bandwidth.base_port` | 第一条 server 监听端口，后续流递增 |
 | `check.bandwidth.parallel` | 启用无端口冲突的分批并发 |
-| `check.bandwidth.min_gbits` | 每条完成流的最低 `BW average[Gb/sec]`；任一流低于门槛即失败 |
+| `check.bandwidth.min_gbits` | `"auto"` 时探测两端最大支持速率并按木桶效应逐流计算 70% 下限；`0` 不限制；正数使用固定 `BW average[Gb/sec]` 门槛 |
 
 临时使用 4 个 QP：
 
@@ -1436,7 +1441,7 @@ RDMA 网卡与 IB 设备的对应关系：
   "bandwidth": {
     "iterations": 100,
     "bandwidth_qps": 0,
-    "min_gbits": 380,
+    "min_gbits": "auto",
     "parallel": true
   },
   "rdma_ping": {
@@ -1451,7 +1456,7 @@ RDMA 网卡与 IB 设备的对应关系：
 }
 ```
 
-`min_gbits` 是每一条带宽流的最低门槛。示例中正常值约为 `390 Gbps`，因此使用 `380` 留出少量波动空间。首次摸底时也可以先设置为 `0`，只记录结果，不按吞吐失败。
+`min_gbits` 默认使用 `"auto"`。Bandwidth stage 开始时会在每台目标机一次性读取所有参测 RDMA 网卡的当前速率和 `ethtool` Supported link modes 最大速率；每条流取客户端与服务端最大速率的较小值作为 baseline，并以 baseline 的 70% 为通过门槛。例如 400G ↔ 200G 的 baseline 是 200 Gbps、门槛是 140 Gbps。若任一端无法取得最大速率，该流仍会执行并保留实测值，但判定为 `FAIL auto threshold unavailable`，详情会给出两端探测值。显式设置 `0` 可只记录、不按吞吐失败；设置正数（例如 `380`）则保持固定门槛模式。
 
 #### 8.3.4 执行命令与结果
 
@@ -1476,7 +1481,7 @@ PASS    node-a  node-b  ens15np0    ens15np0    10.247.3.11  10.247.3.12  mlx5_3
 PASS    node-a  node-b  ens17np0    ens17np0    10.247.4.11  10.247.4.12  mlx5_4      mlx5_5      18530  -           -           -            -            388.94 Gbps
 ```
 
-实际输出会包含完整交叉矩阵。只要某一行低于 `check.bandwidth.min_gbits`，该行会标记为 `FAIL`，整个 `check` 返回失败。
+实际输出会包含完整交叉矩阵。只要某一行低于该行解析出的 auto/固定门槛，或 auto 模式无法取得两端最大速率，该行会标记为 `FAIL`，整个 `check` 返回失败。交互终端在 Results 页按 `p` 可在列表和 Bandwidth 热力图之间切换；热力图按客户端 NIC/XPU 为行、服务端 NIC/XPU 为列，按 `m` 切换方向，方向键移动单元格，`Space` 查看两端速率、baseline、门槛、利用率和原始输出。auto 模式下 ≥90% baseline 显示绿色、70%～90% 显示黄色、低于 70% 显示红色；`min_gbits=0` 使用中性色。
 
 ### 8.4 rdma-ping：RDMA 大包连通性检查
 
@@ -1743,7 +1748,7 @@ EVAL  SIZE(B)    COUNT     TYPE   OP   MODE          TIME(us)  ALGBW(GB/s)  BUSB
       268435456  67108864  float  sum  in-place      4205.00   63.83        111.70
 ```
 
-`systest/xccl_perf` 同时输出 out-of-place 和 in-place 两组数据；envinit 会保留原始输出，并把每个 size 的两组 time、algbw、busbw 再整理到 `XCCL size result details`，方便比较完整性能曲线。`EVAL=*` 是最终门槛采用的行。交付判定按照 SOP 读取倒数第二个消息档位的 in-place 数据，并在汇总中明确显示 `MODE=in-place`。默认 `1024 -> 256m`、步进 2 时判定档位是 `128m`；只有一个消息档位时使用该唯一档位。如果任一 XPU 只能使用非 PIX 网卡，汇总行会显示 `STATUS=WARN`、`TOPOLOGY=DEGRADED`，并额外打印 PCIe/NUMA 限速提示；如果同时低于配置的带宽门槛则仍显示 `FAIL`。性能阶段会明确输出 `validation: disabled (-c 0 performance mode)`，原始表格中的 `#wrong`/`Out of bounds` 不作为精度通过依据。
+`systest/xccl_perf` 同时输出 out-of-place 和 in-place 两组数据；交互终端的 Results 页不再显示额外的 `SUMMARY` 行，只保留 `STATUS/EVAL/MODE/SIZE/TYPE/OP/TIME/ALGBW/BUSBW` 性能结果，并按 `OUT-OF-PLACE` 全部档位、`IN-PLACE` 全部档位分组展示，不把同一 size 的两种模式交错排列。收到性能行后在原位置填入 time、algbw 和 busbw；按 `Space` 可在详情中查看 test、hosts、ranks、topology 和带宽门槛，按 `p` 可在表格与折线图模式间切换，折线图模式分别绘制 AlgBW、BusBW，按 `m` 切换 out-of-place/in-place，按 `Left/Right` 移动数据点并查看对应 message size 和精确带宽值。最终判定完成时，被选中的 size 行更新为 `PASS/FAIL/WARN`，并用 `EVAL=*` 标出门槛采用行。准备、分发或 mpirun 在产生性能数据前失败时，Results 页会追加一条独立 `FAIL` 错误行，完整错误保留在详情和 Raw Logs。envinit 同时保留完整 stdout，并把结果整理到 `XCCL size result details`，方便比较完整性能曲线；非交互输出仍在命令结束后打印原始输出和汇总。交付判定按照 SOP 读取倒数第二个消息档位的 in-place 数据，并在汇总中明确显示 `MODE=in-place`。默认 `1024 -> 256m`、步进 2 时判定档位是 `128m`；只有一个消息档位时使用该唯一档位。如果任一 XPU 只能使用非 PIX 网卡，最终采用行会显示 `STATUS=WARN`，详情及非交互汇总会显示 `TOPOLOGY=DEGRADED`，并额外打印 PCIe/NUMA 限速提示；如果同时低于配置的带宽门槛则仍显示 `FAIL`。性能阶段会明确输出 `validation: disabled (-c 0 performance mode)`，原始表格中的 `#wrong`/`Out of bounds` 不作为精度通过依据。
 
 ### 8.7 汇总结果、计数器和退出状态
 
@@ -1782,7 +1787,7 @@ mlx5 的 `rx_err_lane_N_phy` 名称虽然包含 `err`，Linux 驱动实际将它
 
 - 目标解析、SSH、sysfs/topo 发现或测试命令失败；
 - rdma-ping 任一路径不是 `0% packet loss`；
-- bandwidth 任一完成流低于 `check.bandwidth.min_gbits`，或无法解析需要判定的吞吐；
+- bandwidth 任一完成流低于逐流 auto/固定门槛、auto 模式无法探测两端最大速率，或无法解析需要判定的吞吐；
 - XCCL 没有解析到性能行，或 SOP 判定档位的 in-place busbw 低于 `check.xccl.min_bus_bandwidth_gbs`；
 - NIC/RDMA device 风险计数器出现正 delta；
 - XCCL 运行时分发、依赖检查、临时 SSH 或清理失败。

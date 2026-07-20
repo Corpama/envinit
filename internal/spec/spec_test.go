@@ -79,6 +79,48 @@ func TestCheckConfigNestedBandwidthTakesPrecedenceOverLegacyFields(t *testing.T)
 	}
 }
 
+func TestBandwidthMinGBitsSupportsAutoDisabledAndManual(t *testing.T) {
+	for name, raw := range map[string]string{
+		"auto":     `{"bandwidth":{"min_gbits":"auto"}}`,
+		"disabled": `{"bandwidth":{"min_gbits":0}}`,
+		"manual":   `{"bandwidth":{"min_gbits":380}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var cfg CheckConfig
+			if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+				t.Fatalf("unmarshal %s threshold: %v", name, err)
+			}
+			if got := cfg.Bandwidth.MinGBitsMode(); got != name {
+				t.Fatalf("threshold mode = %q, want %q: %#v", got, name, cfg.Bandwidth)
+			}
+			encoded, err := json.Marshal(cfg.Bandwidth)
+			if err != nil {
+				t.Fatalf("marshal threshold: %v", err)
+			}
+			if name == "auto" && !strings.Contains(string(encoded), `"min_gbits":"auto"`) {
+				t.Fatalf("auto threshold did not round-trip: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestBandwidthMinGBitsDefaultsToAutoButExplicitZeroStaysDisabled(t *testing.T) {
+	var omitted Bundle
+	omitted.ApplyDefaults()
+	if got := omitted.Check.Bandwidth.MinGBitsMode(); got != "auto" {
+		t.Fatalf("omitted min_gbits mode = %q, want auto", got)
+	}
+	var explicit CheckConfig
+	if err := json.Unmarshal([]byte(`{"bandwidth":{"min_gbits":0}}`), &explicit); err != nil {
+		t.Fatal(err)
+	}
+	bundle := Bundle{Check: explicit}
+	bundle.ApplyDefaults()
+	if got := bundle.Check.Bandwidth.MinGBitsMode(); got != "disabled" {
+		t.Fatalf("explicit zero mode = %q, want disabled", got)
+	}
+}
+
 func TestCheckConfigRejectsUnknownTopLevelField(t *testing.T) {
 	var cfg CheckConfig
 	err := json.Unmarshal([]byte(`{"bandwidth": {}, "unexpected": true}`), &cfg)

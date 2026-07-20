@@ -24,7 +24,7 @@ func collectNICCounterSnapshots(opts Options, targets []Target, phase string) (m
 			fmt.Fprintf(opts.Output, "dry-run nic-counters %s %s: %s\n", phase, target.Name, command)
 			continue
 		}
-		output, err := runCommand(opts.Bundle.Check, target, command)
+		output, err := runCheckCommand(opts, target, command)
 		if err != nil {
 			message := fmt.Sprintf("nic-counters %s %s: %v", phase, target.Name, err)
 			failures = append(failures, message)
@@ -301,6 +301,12 @@ func unionCounterNames(before map[string]int64, after map[string]int64) []string
 }
 
 func printNICCounterTable(output io.Writer, rows []nicCounterRow) {
+	if controller, ok := output.(*checkTUIController); ok {
+		var summary strings.Builder
+		printNICCounterTable(&summary, rows)
+		controller.AppendCounterSummary("nic", summary.String())
+		return
+	}
 	if len(rows) == 0 {
 		fmt.Fprintln(output, "PASS nic-counters no nonzero counters or counter deltas")
 		return
@@ -322,7 +328,6 @@ func printNICCounterTable(output io.Writer, rows []nicCounterRow) {
 		}
 		return false
 	})
-
 	headers := []string{"STATUS", "NODE", "IFACE", "COUNTER", "BEFORE", "AFTER", "DELTA"}
 	widths := make([]int, len(headers))
 	for idx, header := range headers {
@@ -372,7 +377,7 @@ func collectRDMADeviceCounterSnapshots(opts Options, targets []Target, groupsByT
 			fmt.Fprintf(opts.Output, "dry-run rdma-device-counters %s %s: %s\n", phase, target.Name, command)
 			continue
 		}
-		output, err := runCommand(opts.Bundle.Check, target, command)
+		output, err := runCheckCommand(opts, target, command)
 		if err != nil {
 			message := fmt.Sprintf("rdma-device-counters %s %s: %v", phase, target.Name, err)
 			failures = append(failures, message)
@@ -499,7 +504,7 @@ func compareRDMADeviceCounterSnapshots(opts Options, targets []Target, groupsByT
 			}
 		}
 	}
-	printRDMADeviceCounterTable(opts.Output, rows)
+	printRDMADeviceCounterTable(opts.Output, rows, opts.counterStage)
 	if abnormalCount > 0 {
 		return []string{fmt.Sprintf("rdma-device-counters detected %d abnormal counter delta(s); see RDMA device counter delta summary", abnormalCount)}
 	}
@@ -527,7 +532,17 @@ func unionRDMADevicePorts(before map[string]map[string]int64, after map[string]m
 	return ports
 }
 
-func printRDMADeviceCounterTable(output io.Writer, rows []rdmaDeviceCounterRow) {
+func printRDMADeviceCounterTable(output io.Writer, rows []rdmaDeviceCounterRow, stage string) {
+	if controller, ok := output.(*checkTUIController); ok {
+		var summary strings.Builder
+		printRDMADeviceCounterTable(&summary, rows, "")
+		if stage != "" {
+			controller.AppendCounterSummaryForStage(stage, summary.String())
+		} else {
+			controller.AppendCounterSummary("rdma", summary.String())
+		}
+		return
+	}
 	if len(rows) == 0 {
 		fmt.Fprintln(output, "PASS rdma-device-counters no nonzero counters or counter deltas")
 		return
