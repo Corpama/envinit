@@ -89,6 +89,26 @@ func TestParseDirectIBDeviceHeadersWithANSIFormatting(t *testing.T) {
 	}
 }
 
+func TestParseDirectNonMellanoxRDMADeviceHeaders(t *testing.T) {
+	output := `
+       XPU0 XPU1 hns_0 bnxt_re1 irdma2 CPU Affinity NUMA Affinity
+XPU0   X    XL   PIX   SYS      NODE   0-7 0
+XPU1   XL   X    SYS   PIX      NODE   8-15 1
+hns_0  PIX  SYS  X     SYS      SYS
+bnxt_re1 SYS PIX  SYS   X        SYS
+irdma2 NODE NODE SYS   SYS      X
+`
+	topology, err := parseXPUTopology(output)
+	if err != nil {
+		t.Fatalf("parse generic RDMA device headers: %v", err)
+	}
+	for _, device := range []string{"hns_0", "bnxt_re1", "irdma2"} {
+		if got := topology.NICDevices[device]; got != device {
+			t.Fatalf("generic device mapping %s = %q", device, got)
+		}
+	}
+}
+
 func TestParseNICHeadersWithoutLegendUsesDeviceRows(t *testing.T) {
 	output := strings.Replace(sampleXPUTopology, "NIC Legend:\n  NIC0: mlx5_0\n  NIC1: mlx5_1\n  NIC2: mlx5_2\n  NIC3: mlx5_3\n  NIC4: mlx5_4", "", 1)
 	output = strings.Replace(output, "Legend:\n  X = Self", "mlx5_0 NODE NODE NODE NODE SYS SYS SYS SYS X NODE NODE SYS SYS\nmlx5_1 PIX PIX NODE NODE SYS SYS SYS SYS NODE X NODE SYS SYS\nmlx5_2 NODE NODE PIX PIX SYS SYS SYS SYS NODE NODE X SYS SYS\nmlx5_3 SYS SYS SYS SYS PIX PIX NODE NODE SYS SYS SYS X NODE\nmlx5_4 SYS SYS SYS SYS NODE NODE PIX PIX SYS SYS SYS NODE X\n\nLegend:\n  X = Self", 1)

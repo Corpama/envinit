@@ -3110,12 +3110,74 @@ func TestRenameRDMATemporarilyUsesTwoPhaseRenameForNameConflicts(t *testing.T) {
 	got := output.String()
 	firstMove := strings.Index(got, "run: ip link set dev enp20s0 name ei-tmp0")
 	conflictMove := strings.Index(got, "run: ip link set dev ens15np0 name ei-tmp1")
+	altNameCleanup := strings.Index(got, "run (allow failure): ip link property del dev ei-tmp0 altname ens15np0")
 	targetMove := strings.Index(got, "run: ip link set dev ei-tmp0 name ens15np0")
-	if firstMove == -1 || conflictMove == -1 || targetMove == -1 {
+	if firstMove == -1 || conflictMove == -1 || altNameCleanup == -1 || targetMove == -1 {
 		t.Fatalf("missing expected rename commands:\n%s", got)
 	}
-	if !(firstMove < targetMove && conflictMove < targetMove) {
-		t.Fatalf("expected all current names to move to temp names before target renames:\n%s", got)
+	if !(firstMove < targetMove && conflictMove < targetMove && altNameCleanup < targetMove) {
+		t.Fatalf("expected all current names to move to temp names and target altname cleanup before target renames:\n%s", got)
+	}
+}
+
+func TestRenameRDMATemporarilySupportsRenamingBackFromPersistentAltName(t *testing.T) {
+	root := t.TempDir()
+	mustWriteMAC(t, root, "ens13f0np0", "aa:bb:cc:dd:ee:11")
+
+	var output strings.Builder
+	app := &App{Root: root, DryRun: true, Output: &output}
+	if err := app.renameRDMATemporarily([]interfaceBinding{
+		{Kind: "rdma", Name: "ens3f0np0", CurrentName: "ens13f0np0"},
+	}); err != nil {
+		t.Fatalf("rename interface back to persistent altname: %v", err)
+	}
+
+	got := output.String()
+	cleanup := strings.Index(got, "run (allow failure): ip link property del dev ei-tmp0 altname ens3f0np0")
+	rename := strings.Index(got, "run: ip link set dev ei-tmp0 name ens3f0np0")
+	if cleanup == -1 || rename == -1 || cleanup > rename {
+		t.Fatalf("expected self altname to be removed before restoring the old primary name:\n%s", got)
+	}
+}
+
+func TestRenameRDMATemporarilyRollsBackPartialFailure(t *testing.T) {
+	root := t.TempDir()
+	for _, iface := range []string{"rdma-a", "rdma-b"} {
+		mustWriteMAC(t, root, iface, "aa:bb:cc:dd:ee:11")
+		if err := os.WriteFile(filepath.Join(root, "sys/class/net", iface, "flags"), []byte("0x1\n"), 0o644); err != nil {
+			t.Fatalf("write flags for %s: %v", iface, err)
+		}
+	}
+
+	binDir := t.TempDir()
+	ipStub := filepath.Join(binDir, "ip")
+	stub := "#!/bin/sh\ncase \"$*\" in\n  *\"ei-tmp1 name target-b\"*) exit 2 ;;\nesac\nexit 0\n"
+	if err := os.WriteFile(ipStub, []byte(stub), 0o755); err != nil {
+		t.Fatalf("write ip stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var output strings.Builder
+	app := &App{Root: root, Output: &output}
+	err := app.renameRDMATemporarily([]interfaceBinding{
+		{Kind: "rdma", Name: "target-a", CurrentName: "rdma-a"},
+		{Kind: "rdma", Name: "target-b", CurrentName: "rdma-b"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "original interface names were restored") {
+		t.Fatalf("expected failed rename with successful rollback, got %v", err)
+	}
+
+	got := output.String()
+	for _, want := range []string{
+		"run: ip link set dev target-a name ei-tmp0",
+		"run: ip link set dev ei-tmp1 name rdma-b",
+		"run: ip link set dev rdma-b up",
+		"run: ip link set dev ei-tmp0 name rdma-a",
+		"run: ip link set dev rdma-a up",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected rollback command %q, got:\n%s", want, got)
+		}
 	}
 }
 

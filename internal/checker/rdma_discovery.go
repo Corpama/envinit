@@ -924,7 +924,7 @@ func inventoryRDMAField(key string) (int, string, bool) {
 
 func isSupportedInventoryRDMAField(field string) bool {
 	switch field {
-	case "name", "ip", "prefix", "gateway", "mac", "table", "route_cidr":
+	case "name", "ip", "prefix", "gateway", "mac", "table", "route_cidr", "rail_id", "rail":
 		return true
 	default:
 		return false
@@ -1016,6 +1016,8 @@ func writeTargetInventoryFields(row []string, headerIndex map[string]int, target
 			"mac":        item.MAC,
 			"table":      item.Table,
 			"route_cidr": item.RouteCIDR,
+			"rail_id":    item.RailID,
+			"rail":       item.RailID,
 		}
 		for field, value := range values {
 			column, ok := headerIndex[fmt.Sprintf("rdma%d_%s", idx+1, field)]

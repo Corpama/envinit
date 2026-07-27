@@ -65,6 +65,50 @@ func TestLoadCSVParsesDynamicRDMAColumns(t *testing.T) {
 	}
 }
 
+func TestLoadCSVParsesExplicitRDMARailIDs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inventory.csv")
+	content := "host_id,rdma1_name,rdma1_ip,rdma1_rail_id,rdma2_name,rdma2_ip,rdma2_rail\n" +
+		"xpu21,ens11f0np0,10.61.10.41,fabric-a-port-1,ens11f1np1,10.61.10.42,fabric-a-port-2\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write csv: %v", err)
+	}
+
+	rows, err := Load(path, "")
+	if err != nil {
+		t.Fatalf("load csv: %v", err)
+	}
+	if got := rows[0].RDMA[0].RailID; got != "fabric-a-port-1" {
+		t.Fatalf("rdma1 rail id = %q", got)
+	}
+	if got := rows[0].RDMA[1].RailID; got != "fabric-a-port-2" {
+		t.Fatalf("rdma2 rail alias = %q", got)
+	}
+}
+
+func TestLoadCSVAllowsBlankRDMARailIDs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inventory.csv")
+	content := "host_id,rdma1_name,rdma1_ip,rdma1_prefix,rdma1_rail_id,rdma2_name,rdma2_ip,rdma2_prefix,rdma2_rail_id\n" +
+		"xpu21,ens11f0np0,10.61.10.41,24,,ens13f0np0,10.61.10.42,24,\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write csv: %v", err)
+	}
+
+	rows, err := Load(path, "")
+	if err != nil {
+		t.Fatalf("load csv with blank rail IDs: %v", err)
+	}
+	if len(rows) != 1 || len(rows[0].RDMA) != 2 {
+		t.Fatalf("blank rail IDs changed RDMA records: %#v", rows)
+	}
+	for index, record := range rows[0].RDMA {
+		if record.RailID != "" {
+			t.Fatalf("rdma%d rail id = %q, want blank", index+1, record.RailID)
+		}
+	}
+}
+
 func TestLoadCSVTrimsTrailingEmptyRDMASlots(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "inventory.csv")

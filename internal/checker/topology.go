@@ -165,12 +165,13 @@ func sanitizeTopologyToken(value string) string {
 
 func isDirectIBDeviceHeader(value string) bool {
 	value = strings.TrimSpace(value)
-	if !strings.HasPrefix(value, "mlx5_") || len(value) <= len("mlx5_") {
+	upper := strings.ToUpper(value)
+	if value == "" || strings.HasPrefix(upper, "XPU") || strings.HasPrefix(upper, "NIC") || upper == "CPU" || upper == "NUMA" || upper == "AFFINITY" {
 		return false
 	}
 	hasDigit := false
-	for _, char := range strings.TrimPrefix(value, "mlx5_") {
-		if (char < '0' || char > '9') && char != '_' {
+	for _, char := range value {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') && char != '_' && char != '-' && char != '.' {
 			return false
 		}
 		if char >= '0' && char <= '9' {

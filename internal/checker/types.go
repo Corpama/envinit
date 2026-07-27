@@ -245,8 +245,12 @@ type rdmaDeviceCounterRow struct {
 type xcclTargetPlan struct {
 	Target          Target
 	XPUCount        int
+	XPUOrder        []int
 	RDMANICs        []string
 	RDMANICOrder    []string
+	RDMADeviceOrder []string
+	RDMALinkOrder   []string
+	RDMARailOrder   []string
 	Mapping         []string
 	SocketInterface string
 }

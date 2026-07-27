@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"envinit/internal/spec"
+	"envinit/internal/xpuvariant"
 )
 
 const (
@@ -33,11 +34,30 @@ func runXCCLCheck(opts Options, targets []Target, groupsByTarget resolvedRDMAGro
 		showXCCLTUIInitialFailure(opts, cfg, nil, targets, err)
 		return err
 	}
-	if err := validateXCCLPlanConsistency(plans); err != nil {
+	multiHost := len(plans) > 1
+	cfg, err = resolveXCCLMachineClass(opts, cfg, targets, multiHost)
+	if err != nil {
 		showXCCLTUIInitialFailure(opts, cfg, plans, targets, err)
 		return err
 	}
-	printXCCLPlan(opts, plans)
+	if err := validateXCCLExecutionConfig(cfg, multiHost); err != nil {
+		showXCCLTUIInitialFailure(opts, cfg, plans, targets, err)
+		return err
+	}
+	cfg = effectiveXCCLConfig(cfg, multiHost)
+	opts.Bundle.Check.XCCL = cfg
+	if err := validateConfiguredXCCLPlanConsistency(cfg, plans); err != nil {
+		showXCCLTUIInitialFailure(opts, cfg, plans, targets, err)
+		return err
+	}
+	if multiHost {
+		for _, warning := range xcclRailInferenceWarnings(plans) {
+			fmt.Fprintln(opts.Output, warning)
+		}
+	}
+	if multiHost && !cfg.TopologyValidationEnabled() {
+		fmt.Fprintln(opts.Output, "WARN xccl topology validation disabled: cross-host XPU count, XPU/NIC sharing, link class, and RDMA rail order were not checked")
+	}
 
 	runID := "dry-run"
 	if !opts.DryRun {
@@ -49,11 +69,24 @@ func runXCCLCheck(opts Options, targets []Target, groupsByTarget resolvedRDMAGro
 	workDir := filepath.Join(filepath.Clean(cfg.WorkRoot), runID)
 	marker := "envinit-xccl-" + runID
 	coordinator := plans[0].Target
-	multiHost := len(plans) > 1
-	totalRanks := 0
+	discoveredRanks := 0
 	for _, plan := range plans {
-		totalRanks += plan.XPUCount
+		discoveredRanks += plan.XPUCount
 	}
+	totalRanks, rankSource, err := resolveXCCLRanks(cfg, discoveredRanks)
+	if err != nil {
+		showXCCLTUIInitialFailure(opts, cfg, plans, targets, err)
+		return err
+	}
+	plans, err = limitXCCLPlansForRanks(cfg, plans, totalRanks)
+	if err != nil {
+		showXCCLTUIInitialFailure(opts, cfg, plans, targets, err)
+		return err
+	}
+	coordinator = plans[0].Target
+	fmt.Fprintf(opts.Output, "INFO xccl ranks: np=%d source=%s discovered_xpus=%d\n", totalRanks, rankSource, discoveredRanks)
+	printXCCLPlan(opts, plans)
+	printXCCLRankEnvironments(opts, cfg, plans, workDir, multiHost)
 
 	if opts.DryRun {
 		printXCCLDryRun(opts, plans, coordinator, workDir, marker, totalRanks, multiHost)
@@ -110,7 +143,7 @@ func runXCCLCheck(opts Options, targets []Target, groupsByTarget resolvedRDMAGro
 			return fmt.Errorf("prepare XCCL runtime on %s: %w", plan.Target.Name, err)
 		}
 		rankScript := filepath.Join(localTemp, fmt.Sprintf("rank-%d.sh", idx))
-		if err := os.WriteFile(rankScript, []byte(xcclRankScript(cfg, plan, workDir)), 0o700); err != nil {
+		if err := os.WriteFile(rankScript, []byte(xcclRankScript(cfg, plan, workDir, multiHost)), 0o700); err != nil {
 			return fmt.Errorf("write XCCL rank script for %s: %w", plan.Target.Name, err)
 		}
 		copies := [][2]string{
@@ -192,7 +225,7 @@ func runXCCLCheck(opts Options, targets []Target, groupsByTarget resolvedRDMAGro
 	if len(rows) == 0 {
 		return fmt.Errorf("XCCL %s completed but no performance rows were parsed", cfg.Test)
 	}
-	fmt.Fprintln(opts.Output, "INFO xccl validation: disabled (-c 0 performance mode); bandwidth results exclude accuracy-check overhead")
+	fmt.Fprintln(opts.Output, "INFO xccl accuracy check: disabled (-c 0 performance mode); bandwidth results exclude accuracy-check overhead")
 	evaluation := evaluateXCCLResult(opts, plans, rows)
 	live.Finalize(evaluation)
 	return printXCCLResultEvaluation(opts, totalRanks, rows, evaluation)
@@ -236,17 +269,38 @@ func validateXCCLConfig(cfg spec.CheckXCCLConfig) error {
 	if _, ok := xcclCollectiveName(cfg.Test); !ok {
 		return fmt.Errorf("bundle check.xccl.test %q is not supported", cfg.Test)
 	}
-	if cfg.StepFactor <= 0 || cfg.WarmupIterations < 0 || cfg.Iterations <= 0 || cfg.Timeout <= 0 || cfg.MinBusBandwidthGBs < 0 {
+	if cfg.StepFactor <= 0 || cfg.WarmupIterations < 0 || cfg.Iterations <= 0 || cfg.Timeout <= 0 || cfg.MinBusBandwidthGBs < 0 || cfg.Ranks < 0 {
 		return errors.New("bundle check.xccl step_factor, iterations, and timeout must be positive; warmup_iterations and min_bus_bandwidth_gbs must not be negative")
 	}
 	if strings.TrimSpace(cfg.MinBytes) == "" || strings.TrimSpace(cfg.MaxBytes) == "" || strings.TrimSpace(cfg.DataType) == "" {
 		return errors.New("bundle check.xccl min_bytes, max_bytes, and data_type must not be empty")
 	}
+	layout := normalizedXCCLLayout(cfg.Layout)
+	if layout != "full_ring" && layout != "same_index" {
+		return fmt.Errorf("bundle check.xccl.layout %q is not supported; use full_ring or same_index", cfg.Layout)
+	}
+	ordering := normalizedXCCLXPUOrdering(cfg.XPUOrdering)
+	if ordering != "auto" && ordering != "rail_aligned" && ordering != "physical" {
+		return fmt.Errorf("bundle check.xccl.xpu_ordering %q is not supported; use auto, rail_aligned, or physical", cfg.XPUOrdering)
+	}
+	if layout == "same_index" && cfg.SplitStep <= 0 {
+		return errors.New("bundle check.xccl.split_step must be positive for same_index layout")
+	}
+	if cfg.SplitOperation < 0 {
+		return errors.New("bundle check.xccl.split_operation must not be negative")
+	}
+	evaluationMode := normalizedXCCLEvaluationMode(cfg.EvaluationMode)
+	if evaluationMode != "auto" && evaluationMode != "manual" && evaluationMode != "disabled" {
+		return fmt.Errorf("bundle check.xccl.evaluation_mode %q is not supported; use auto, manual, or disabled", cfg.EvaluationMode)
+	}
+	if evaluationMode == "manual" && cfg.MinBusBandwidthGBs <= 0 {
+		return errors.New("bundle check.xccl.min_bus_bandwidth_gbs must be positive in manual evaluation mode")
+	}
 	protected := map[string]bool{
 		"PATH": true, "LD_LIBRARY_PATH": true, "XPU_HOME": true, "XPU_VISIBLE_DEVICES": true, "CUDA_VISIBLE_DEVICES": true,
 		"BKCL_TIMEOUT": true, "BKCL_ENABLE_XDR": true,
 		"BKCL_RDMA_NICS": true, "BKCL_FORCE_RDMA_NICS_ORDER": true, "BKCL_SOCKET_IFNAME": true,
-		"BKCL_SWITCH_TOPO": true, "BKCL_RDMA_VERBS": true, "BKCL_TREE_THRESHOLD": true,
+		"BKCL_SWITCH_TOPO": true, "BKCL_RDMA_VERBS": true,
 	}
 	for key, value := range cfg.Environment {
 		if !validEnvironmentName(key) {
@@ -260,6 +314,182 @@ func validateXCCLConfig(cfg spec.CheckXCCLConfig) error {
 		}
 	}
 	return nil
+}
+
+func validateXCCLExecutionConfig(cfg spec.CheckXCCLConfig, multiHost bool) error {
+	if !multiHost || normalizedXCCLEvaluationMode(cfg.EvaluationMode) != "auto" {
+		return nil
+	}
+	if cfg.Test != "all_reduce" {
+		return fmt.Errorf("automatic XCCL evaluation is currently defined only for all_reduce; set check.xccl.evaluation_mode to manual or disabled for %s", cfg.Test)
+	}
+	if normalizedXCCLLayout(cfg.Layout) != "full_ring" {
+		return nil
+	}
+	machineClass := normalizedXCCLMachineClass(cfg.MachineClass)
+	if machineClass != "vc" && machineClass != "vd" {
+		return fmt.Errorf("bundle check.xccl.machine_class %q is not supported for multi-host full_ring auto evaluation; use VC or VD", cfg.MachineClass)
+	}
+	return nil
+}
+
+func resolveXCCLMachineClass(opts Options, cfg spec.CheckXCCLConfig, targets []Target, multiHost bool) (spec.CheckXCCLConfig, error) {
+	if !multiHost || normalizedXCCLEvaluationMode(cfg.EvaluationMode) != "auto" || normalizedXCCLLayout(cfg.Layout) != "full_ring" {
+		return cfg, nil
+	}
+	configured := normalizedXCCLMachineClass(cfg.MachineClass)
+	if configured == "vc" || configured == "vd" {
+		fmt.Fprintf(opts.Output, "INFO xccl machine class: configured=%s; automatic host classification skipped\n", strings.ToUpper(configured))
+		return cfg, nil
+	}
+	if configured != "" && configured != "auto" {
+		return cfg, fmt.Errorf("bundle check.xccl.machine_class %q is not supported; use auto, VC, or VD", cfg.MachineClass)
+	}
+	selected := "vd"
+	var vcHosts, vdHosts []string
+	for _, target := range targets {
+		output, err := runDiscoveryCommand(opts, target, "xpu-smi -q")
+		if err != nil {
+			return cfg, fmt.Errorf("detect XCCL machine class for %s: %w", target.Name, err)
+		}
+		variant, partNumbers, err := xpuvariant.ClassifyPartNumbers(output)
+		if err != nil {
+			return cfg, fmt.Errorf("detect XCCL machine class for %s: %w", target.Name, err)
+		}
+		fmt.Fprintf(opts.Output, "INFO xccl machine class: %s detected=%s xpus=%d part_numbers=%s\n", target.Name, variant, len(partNumbers), strings.Join(partNumbers, ","))
+		if variant == "VC" {
+			selected = "vc"
+			vcHosts = append(vcHosts, target.Name)
+		} else {
+			vdHosts = append(vdHosts, target.Name)
+		}
+	}
+	if len(vcHosts) > 0 && len(vdHosts) > 0 {
+		fmt.Fprintf(opts.Output, "WARN xccl machine class downgrade: VC hosts=%s VD hosts=%s; applying VC full-ring baseline to all hosts by weakest-link policy\n", strings.Join(vcHosts, ","), strings.Join(vdHosts, ","))
+	} else {
+		fmt.Fprintf(opts.Output, "INFO xccl machine class selected=%s source=auto weakest-link\n", strings.ToUpper(selected))
+	}
+	cfg.MachineClass = selected
+	return cfg, nil
+}
+
+func effectiveXCCLConfig(cfg spec.CheckXCCLConfig, multiHost bool) spec.CheckXCCLConfig {
+	if multiHost {
+		return cfg
+	}
+	cfg.Layout = "single_host"
+	cfg.XPUOrdering = "physical"
+	if normalizedXCCLEvaluationMode(cfg.EvaluationMode) == "auto" {
+		// The supplied automatic baselines apply only to the two multi-host
+		// layouts. Preserve the historical single-host behavior unless the user
+		// explicitly selects a manual threshold.
+		cfg.EvaluationMode = "disabled"
+	}
+	return cfg
+}
+
+func normalizedXCCLLayout(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "full_ring"
+	}
+	return strings.ReplaceAll(value, "-", "_")
+}
+
+func normalizedXCCLXPUOrdering(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "auto"
+	}
+	return strings.ReplaceAll(value, "-", "_")
+}
+
+func resolvedXCCLXPUOrdering(cfg spec.CheckXCCLConfig) string {
+	ordering := normalizedXCCLXPUOrdering(cfg.XPUOrdering)
+	if ordering != "auto" {
+		return ordering
+	}
+	if normalizedXCCLLayout(cfg.Layout) == "same_index" {
+		return "physical"
+	}
+	return "rail_aligned"
+}
+
+func normalizedXCCLMachineClass(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "auto"
+	}
+	return value
+}
+
+func normalizedXCCLEvaluationMode(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "auto"
+	}
+	return value
+}
+
+func resolveXCCLRanks(cfg spec.CheckXCCLConfig, discovered int) (int, string, error) {
+	if discovered <= 0 {
+		return 0, "", errors.New("XCCL rank discovery found no XPUs")
+	}
+	if cfg.Ranks == 0 {
+		return discovered, "auto", nil
+	}
+	if cfg.Ranks > discovered {
+		return 0, "", fmt.Errorf("bundle check.xccl.ranks=%d exceeds %d discovered XPUs; use 0 for automatic rank selection", cfg.Ranks, discovered)
+	}
+	return cfg.Ranks, "manual", nil
+}
+
+func limitXCCLPlansForRanks(cfg spec.CheckXCCLConfig, plans []xcclTargetPlan, totalRanks int) ([]xcclTargetPlan, error) {
+	capacity := 0
+	for _, plan := range plans {
+		capacity += plan.XPUCount
+	}
+	if totalRanks == capacity {
+		return plans, nil
+	}
+	if len(plans) > 1 && totalRanks < len(plans) {
+		return nil, fmt.Errorf("XCCL ranks=%d cannot include all %d selected hosts; use at least one rank per host", totalRanks, len(plans))
+	}
+	if len(plans) > 1 && normalizedXCCLLayout(cfg.Layout) == "same_index" && totalRanks%len(plans) != 0 {
+		return nil, fmt.Errorf("XCCL same_index ranks=%d must be divisible by %d selected hosts", totalRanks, len(plans))
+	}
+	counts := make([]int, len(plans))
+	for assigned := 0; assigned < totalRanks; {
+		progress := false
+		for index := range plans {
+			if assigned >= totalRanks {
+				break
+			}
+			if counts[index] >= plans[index].XPUCount {
+				continue
+			}
+			counts[index]++
+			assigned++
+			progress = true
+		}
+		if !progress {
+			return nil, fmt.Errorf("XCCL ranks=%d exceeds usable per-host XPU capacity", totalRanks)
+		}
+	}
+	limited := make([]xcclTargetPlan, len(plans))
+	for index, plan := range plans {
+		count := counts[index]
+		plan.XPUCount = count
+		plan.XPUOrder = append([]int(nil), plan.XPUOrder[:count]...)
+		plan.RDMANICOrder = append([]string(nil), plan.RDMANICOrder[:count]...)
+		plan.RDMADeviceOrder = append([]string(nil), plan.RDMADeviceOrder[:count]...)
+		plan.RDMALinkOrder = append([]string(nil), plan.RDMALinkOrder[:count]...)
+		plan.RDMARailOrder = append([]string(nil), plan.RDMARailOrder[:count]...)
+		plan.Mapping = append([]string(nil), plan.Mapping[:count]...)
+		plan.RDMANICs = uniqueStringsInOrder(plan.RDMANICOrder)
+		limited[index] = plan
+	}
+	return limited, nil
 }
 
 func resolveXCCLTargetPlans(opts Options, targets []Target, groupsByTarget resolvedRDMAGroups) ([]xcclTargetPlan, error) {
@@ -277,13 +507,100 @@ func resolveXCCLTargetPlans(opts Options, targets []Target, groupsByTarget resol
 		if err != nil {
 			return nil, err
 		}
-		plan.SocketInterface, err = resolveXCCLSocketInterface(opts, target)
+		plans = append(plans, plan)
+	}
+	if len(plans) > 1 && resolvedXCCLXPUOrdering(opts.Bundle.Check.XCCL) == "rail_aligned" {
+		alignXCCLPlansByRail(plans)
+	}
+	for idx := range plans {
+		socketInterface, err := resolveXCCLSocketInterface(opts, plans[idx].Target, plans[idx])
 		if err != nil {
 			return nil, err
 		}
-		plans = append(plans, plan)
+		plans[idx].SocketInterface = socketInterface
 	}
 	return plans, nil
+}
+
+func alignXCCLPlansByRail(plans []xcclTargetPlan) {
+	if len(plans) < 2 {
+		return
+	}
+	baseline := plans[0]
+	for planIndex := 1; planIndex < len(plans); planIndex++ {
+		plan := plans[planIndex]
+		if len(plan.RDMARailOrder) != len(baseline.RDMARailOrder) {
+			continue
+		}
+		used := make([]bool, len(plan.RDMARailOrder))
+		order := make([]int, 0, len(baseline.RDMARailOrder))
+		for logicalRank, rail := range baseline.RDMARailOrder {
+			match := -1
+			for idx := range plan.RDMARailOrder {
+				if used[idx] || plan.RDMARailOrder[idx] != rail {
+					continue
+				}
+				if match < 0 {
+					match = idx
+				}
+				if logicalRank < len(baseline.RDMALinkOrder) && idx < len(plan.RDMALinkOrder) && plan.RDMALinkOrder[idx] == baseline.RDMALinkOrder[logicalRank] {
+					match = idx
+					break
+				}
+			}
+			if match < 0 {
+				order = nil
+				break
+			}
+			used[match] = true
+			order = append(order, match)
+		}
+		if len(order) == len(plan.RDMARailOrder) {
+			plans[planIndex] = reorderXCCLPlan(plan, order)
+		}
+	}
+}
+
+func reorderXCCLPlan(plan xcclTargetPlan, order []int) xcclTargetPlan {
+	reorderStrings := func(values []string) []string {
+		out := make([]string, 0, len(order))
+		for _, idx := range order {
+			if idx >= 0 && idx < len(values) {
+				out = append(out, values[idx])
+			}
+		}
+		return out
+	}
+	reorderInts := func(values []int) []int {
+		out := make([]int, 0, len(order))
+		for _, idx := range order {
+			if idx >= 0 && idx < len(values) {
+				out = append(out, values[idx])
+			}
+		}
+		return out
+	}
+	plan.XPUOrder = reorderInts(plan.XPUOrder)
+	plan.RDMANICOrder = reorderStrings(plan.RDMANICOrder)
+	plan.RDMADeviceOrder = reorderStrings(plan.RDMADeviceOrder)
+	plan.RDMALinkOrder = reorderStrings(plan.RDMALinkOrder)
+	plan.RDMARailOrder = reorderStrings(plan.RDMARailOrder)
+	plan.Mapping = reorderStrings(plan.Mapping)
+	plan.RDMANICs = uniqueStringsInOrder(plan.RDMANICOrder)
+	return plan
+}
+
+func uniqueStringsInOrder(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func validateXCCLPlanConsistency(plans []xcclTargetPlan) error {
@@ -295,14 +612,82 @@ func validateXCCLPlanConsistency(plans []xcclTargetPlan) error {
 		if plan.XPUCount != baseline.XPUCount {
 			return fmt.Errorf("XCCL requires the same XPU count on every host: %s=%d, %s=%d", baseline.Target.Name, baseline.XPUCount, plan.Target.Name, plan.XPUCount)
 		}
-		if strings.Join(plan.RDMANICOrder, ",") != strings.Join(baseline.RDMANICOrder, ",") {
-			return fmt.Errorf("XCCL requires the same RDMA interface names and XPU order on every host: %s=%s, %s=%s", baseline.Target.Name, strings.Join(baseline.RDMANICOrder, ","), plan.Target.Name, strings.Join(plan.RDMANICOrder, ","))
+		baselineShape := xcclDeviceSharingShape(baseline.RDMADeviceOrder)
+		planShape := xcclDeviceSharingShape(plan.RDMADeviceOrder)
+		if strings.Join(planShape, ",") != strings.Join(baselineShape, ",") {
+			return fmt.Errorf("XCCL XPU/NIC sharing differs across hosts: %s=%s, %s=%s", baseline.Target.Name, strings.Join(baselineShape, ","), plan.Target.Name, strings.Join(planShape, ","))
 		}
-		if plan.SocketInterface != baseline.SocketInterface {
-			return fmt.Errorf("XCCL requires the same BKCL_SOCKET_IFNAME on every host: %s=%s, %s=%s; set check.xccl.socket_interface after normalizing the management interface name", baseline.Target.Name, baseline.SocketInterface, plan.Target.Name, plan.SocketInterface)
+		if strings.Join(plan.RDMALinkOrder, ",") != strings.Join(baseline.RDMALinkOrder, ",") {
+			return fmt.Errorf("XCCL XPU/RDMA topology link classes differ across hosts: %s=%s, %s=%s", baseline.Target.Name, strings.Join(baseline.RDMALinkOrder, ","), plan.Target.Name, strings.Join(plan.RDMALinkOrder, ","))
+		}
+		if strings.Join(plan.RDMARailOrder, ",") != strings.Join(baseline.RDMARailOrder, ",") {
+			return fmt.Errorf("XCCL XPU/RDMA rail order differs across hosts: %s=%s, %s=%s; review the per-host mapping or set check.xccl.validate_topology=false to force the run", baseline.Target.Name, strings.Join(baseline.RDMARailOrder, ","), plan.Target.Name, strings.Join(plan.RDMARailOrder, ","))
 		}
 	}
 	return nil
+}
+
+func xcclRailInferenceWarnings(plans []xcclTargetPlan) []string {
+	var warnings []string
+	for _, plan := range plans {
+		warnings = append(warnings, xcclRailInferenceWarningsForPlan(plan)...)
+	}
+	return warnings
+}
+
+func xcclRailInferenceWarningsForPlan(plan xcclTargetPlan) []string {
+	devicesByRail := map[string]map[string]bool{}
+	for idx, rail := range plan.RDMARailOrder {
+		if strings.HasPrefix(rail, "slot:") {
+			return []string{fmt.Sprintf("WARN xccl rail inference: %s has no RDMA IP/prefix for %s; retaining topology/inventory order. rdmaN_rail_id is optional and should be filled only to force a known cross-host physical rail mapping", plan.Target.Name, strings.TrimPrefix(rail, "slot:"))}
+		}
+		device := ""
+		if idx < len(plan.RDMADeviceOrder) {
+			device = plan.RDMADeviceOrder[idx]
+		}
+		if devicesByRail[rail] == nil {
+			devicesByRail[rail] = map[string]bool{}
+		}
+		devicesByRail[rail][device] = true
+	}
+	var warnings []string
+	for rail, devices := range devicesByRail {
+		if !strings.HasPrefix(rail, "explicit:") && len(devices) > 1 {
+			warnings = append(warnings, fmt.Sprintf("WARN xccl rail inference: %s has %d physical RDMA devices in shared fabric %s; retaining topology-derived order. Leave rdmaN_rail_id empty for normal shared-fabric operation, or fill it on every host only to force known isolated-rail correspondence", plan.Target.Name, len(devices), rail))
+		}
+	}
+	sort.Strings(warnings)
+	return warnings
+}
+
+func validateConfiguredXCCLPlanConsistency(cfg spec.CheckXCCLConfig, plans []xcclTargetPlan) error {
+	if !cfg.TopologyValidationEnabled() {
+		return nil
+	}
+	return validateXCCLPlanConsistency(plans)
+}
+
+func xcclDeviceSharingShape(devices []string) []string {
+	ids := make(map[string]int)
+	next := 0
+	shape := make([]string, 0, len(devices))
+	for _, device := range devices {
+		id, ok := ids[device]
+		if !ok {
+			id = next
+			ids[device] = id
+			next++
+		}
+		shape = append(shape, strconv.Itoa(id))
+	}
+	return shape
+}
+
+type xcclNICCandidate struct {
+	iface  string
+	device string
+	nic    string
+	rail   string
 }
 
 func xcclPlanFromTopology(bundle spec.Bundle, target Target, groups []spec.CheckRDMAGroup, topology xpuTopology) (xcclTargetPlan, error) {
@@ -313,12 +698,7 @@ func xcclPlanFromTopology(bundle spec.Bundle, target Target, groups []spec.Check
 	for nic, device := range topology.NICDevices {
 		deviceToNIC[strings.TrimSpace(device)] = nic
 	}
-	type candidate struct {
-		iface  string
-		device string
-		nic    string
-	}
-	candidates := make([]candidate, 0, len(groups))
+	candidates := make([]xcclNICCandidate, 0, len(groups))
 	for idx, group := range groups {
 		iface := strings.TrimSpace(targetRDMAInterfaceName(bundle, target, idx))
 		device := strings.TrimSpace(group.IBDevice)
@@ -326,7 +706,7 @@ func xcclPlanFromTopology(bundle spec.Bundle, target Target, groups []spec.Check
 		if iface == "" || device == "" || nic == "" {
 			return xcclTargetPlan{}, fmt.Errorf("resolve XCCL RDMA mapping for %s rdma%d: iface=%q ib_device=%q is incomplete or absent from xpu-smi topology NIC columns/mapping", target.Name, idx+1, iface, device)
 		}
-		candidates = append(candidates, candidate{iface: iface, device: device, nic: nic})
+		candidates = append(candidates, xcclNICCandidate{iface: iface, device: device, nic: nic, rail: xcclRDMARail(bundle, target, idx)})
 	}
 
 	xpuIndexes := make([]int, 0, len(topology.Links))
@@ -336,25 +716,19 @@ func xcclPlanFromTopology(bundle spec.Bundle, target Target, groups []spec.Check
 	sort.Ints(xpuIndexes)
 	plan := xcclTargetPlan{Target: target, XPUCount: len(xpuIndexes)}
 	seenNICs := map[string]bool{}
-	for _, xpu := range xpuIndexes {
-		bestRank := int(^uint(0) >> 1)
-		best := -1
-		bestLink := ""
-		for idx, item := range candidates {
-			link := strings.ToUpper(strings.TrimSpace(topology.Links[xpu][item.nic]))
-			rank, ok := topologyLinkRank(link)
-			if !ok || rank >= bestRank {
-				continue
-			}
-			bestRank = rank
-			best = idx
-			bestLink = link
-		}
-		if best < 0 {
-			return xcclTargetPlan{}, fmt.Errorf("resolve XCCL RDMA mapping for %s XPU%d: no reachable participating NIC", target.Name, xpu)
-		}
+	assignments, err := assignXCCLCandidates(topology, xpuIndexes, candidates)
+	if err != nil {
+		return xcclTargetPlan{}, fmt.Errorf("resolve XCCL RDMA mapping for %s: %w", target.Name, err)
+	}
+	for row, xpu := range xpuIndexes {
+		best := assignments[row]
+		bestLink := strings.ToUpper(strings.TrimSpace(topology.Links[xpu][candidates[best].nic]))
 		item := candidates[best]
+		plan.XPUOrder = append(plan.XPUOrder, xpu)
 		plan.RDMANICOrder = append(plan.RDMANICOrder, item.iface)
+		plan.RDMADeviceOrder = append(plan.RDMADeviceOrder, item.device)
+		plan.RDMALinkOrder = append(plan.RDMALinkOrder, bestLink)
+		plan.RDMARailOrder = append(plan.RDMARailOrder, item.rail)
 		plan.Mapping = append(plan.Mapping, fmt.Sprintf("XPU%d=%s(%s,%s)", xpu, item.iface, item.device, bestLink))
 		if !seenNICs[item.iface] {
 			seenNICs[item.iface] = true
@@ -367,7 +741,165 @@ func xcclPlanFromTopology(bundle spec.Bundle, target Target, groups []spec.Check
 	return plan, nil
 }
 
-func resolveXCCLSocketInterface(opts Options, target Target) (string, error) {
+// assignXCCLCandidates performs a global assignment. Topology distance is the
+// primary objective (PIX before PXB/PHB/NODE/SYS); load balancing is considered
+// only among assignments with the same aggregate topology quality.
+func assignXCCLCandidates(topology xpuTopology, xpuIndexes []int, candidates []xcclNICCandidate) ([]int, error) {
+	if len(xpuIndexes) == 0 || len(candidates) == 0 {
+		return nil, errors.New("no XPU or participating NIC candidates")
+	}
+	type slot struct {
+		candidate int
+		load      int
+	}
+	slots := make([]slot, 0, len(xpuIndexes)*len(candidates))
+	for candidate := range candidates {
+		for load := 0; load < len(xpuIndexes); load++ {
+			slots = append(slots, slot{candidate: candidate, load: load})
+		}
+	}
+	const balanceWeight = 1000
+	rankWeight := (len(xpuIndexes)*len(xpuIndexes)+1)*balanceWeight + len(candidates)*100 + 1
+	const unavailable = int(^uint(0) >> 3)
+	costs := make([][]int, len(xpuIndexes))
+	for row, xpu := range xpuIndexes {
+		costs[row] = make([]int, len(slots))
+		reachable := false
+		for column, currentSlot := range slots {
+			link := topology.Links[xpu][candidates[currentSlot.candidate].nic]
+			rank, ok := topologyLinkRank(link)
+			if !ok {
+				costs[row][column] = unavailable
+				continue
+			}
+			reachable = true
+			costs[row][column] = rank*rankWeight + currentSlot.load*balanceWeight + currentSlot.candidate*10 + currentSlot.load
+		}
+		if !reachable {
+			return nil, fmt.Errorf("XPU%d has no reachable participating NIC", xpu)
+		}
+	}
+	columns, err := minimumCostColumns(costs, unavailable)
+	if err != nil {
+		return nil, err
+	}
+	assignments := make([]int, len(columns))
+	for row, column := range columns {
+		assignments[row] = slots[column].candidate
+	}
+	return assignments, nil
+}
+
+// minimumCostColumns is the rectangular Hungarian algorithm. It assigns each
+// row to one unique column and returns the selected column for every row.
+func minimumCostColumns(costs [][]int, unavailable int) ([]int, error) {
+	n := len(costs)
+	if n == 0 {
+		return nil, nil
+	}
+	m := len(costs[0])
+	if m < n {
+		return nil, errors.New("assignment has fewer slots than XPUs")
+	}
+	for _, row := range costs {
+		if len(row) != m {
+			return nil, errors.New("assignment cost matrix is not rectangular")
+		}
+	}
+	u := make([]int, n+1)
+	v := make([]int, m+1)
+	p := make([]int, m+1)
+	way := make([]int, m+1)
+	for i := 1; i <= n; i++ {
+		p[0] = i
+		j0 := 0
+		minv := make([]int, m+1)
+		used := make([]bool, m+1)
+		for j := 1; j <= m; j++ {
+			minv[j] = unavailable
+		}
+		for {
+			used[j0] = true
+			i0 := p[j0]
+			delta := unavailable
+			j1 := 0
+			for j := 1; j <= m; j++ {
+				if used[j] {
+					continue
+				}
+				cur := costs[i0-1][j-1] - u[i0] - v[j]
+				if cur < minv[j] {
+					minv[j] = cur
+					way[j] = j0
+				}
+				if minv[j] < delta {
+					delta = minv[j]
+					j1 = j
+				}
+			}
+			if delta >= unavailable || j1 == 0 {
+				return nil, errors.New("no complete reachable XPU/NIC assignment")
+			}
+			for j := 0; j <= m; j++ {
+				if used[j] {
+					u[p[j]] += delta
+					v[j] -= delta
+				} else {
+					minv[j] -= delta
+				}
+			}
+			j0 = j1
+			if p[j0] == 0 {
+				break
+			}
+		}
+		for {
+			j1 := way[j0]
+			p[j0] = p[j1]
+			j0 = j1
+			if j0 == 0 {
+				break
+			}
+		}
+	}
+	assignment := make([]int, n)
+	for j := 1; j <= m; j++ {
+		if p[j] > 0 {
+			assignment[p[j]-1] = j - 1
+		}
+	}
+	return assignment, nil
+}
+
+func xcclRDMARail(bundle spec.Bundle, target Target, index int) string {
+	if index < 0 || index >= len(target.RDMA) {
+		return fmt.Sprintf("slot:rdma%d", index+1)
+	}
+	record := target.RDMA[index]
+	if railID := strings.TrimSpace(record.RailID); railID != "" {
+		return "explicit:" + railID
+	}
+	ip := net.ParseIP(strings.TrimSpace(record.IP))
+	if ip == nil {
+		return fmt.Sprintf("slot:rdma%d", index+1)
+	}
+	prefix := strings.TrimSpace(record.Prefix)
+	if prefix == "" && bundle.Defaults.RDMAPrefix > 0 {
+		prefix = strconv.Itoa(bundle.Defaults.RDMAPrefix)
+	}
+	if prefix == "" && ip.To4() != nil {
+		prefix = "24"
+	}
+	if prefix != "" {
+		_, network, err := net.ParseCIDR(ip.String() + "/" + prefix)
+		if err == nil {
+			return network.String()
+		}
+	}
+	return ip.String()
+}
+
+func resolveXCCLSocketInterface(opts Options, target Target, plan xcclTargetPlan) (string, error) {
 	if value := strings.TrimSpace(opts.Bundle.Check.XCCL.SocketInterface); value != "" {
 		command := fmt.Sprintf("test -d /sys/class/net/%s && printf '%%s\\n' %s", shellQuote(value), shellQuote(value))
 		output, err := runDiscoveryCommand(opts, target, command)
@@ -376,27 +908,17 @@ func resolveXCCLSocketInterface(opts Options, target Target) (string, error) {
 		}
 		return strings.TrimSpace(strings.SplitN(output, "\n", 2)[0]), nil
 	}
-	address := strings.TrimSpace(target.Address)
-	command := "ip -o -4 route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i==\"dev\") {print $(i+1); exit}}'"
-	if net.ParseIP(address) != nil {
-		command = fmt.Sprintf("ip -o -4 addr show scope global 2>/dev/null | awk -v ip=%s '$4 ~ (\"^\" ip \"/\") {print $2; exit}'", shellQuote(address))
+	if len(plan.RDMANICs) == 0 || strings.TrimSpace(plan.RDMANICs[0]) == "" {
+		return "", fmt.Errorf("discover XCCL socket interface for %s: no participating RDMA interface is available", target.Name)
 	}
-	output, err := runDiscoveryCommand(opts, target, command)
-	if err != nil {
-		return "", fmt.Errorf("discover XCCL socket interface for %s: %w", target.Name, err)
-	}
-	iface := strings.TrimSpace(strings.SplitN(output, "\n", 2)[0])
-	if iface == "" {
-		return "", fmt.Errorf("discover XCCL socket interface for %s: no interface carries management address %s; set check.xccl.socket_interface explicitly", target.Name, target.Address)
-	}
-	return iface, nil
+	return strings.TrimSpace(plan.RDMANICs[0]), nil
 }
 
 func printXCCLPlan(opts Options, plans []xcclTargetPlan) {
 	for _, plan := range plans {
-		fmt.Fprintf(opts.Output, "INFO xccl topology: %s xpus=%d socket_iface=%s rdma_nics=%s force_order=%s mapping=%s\n",
-			plan.Target.Name, plan.XPUCount, firstNonEmpty(plan.SocketInterface, "auto"), strings.Join(plan.RDMANICs, ","),
-			strings.Join(plan.RDMANICOrder, ","), strings.Join(plan.Mapping, ";"))
+		fmt.Fprintf(opts.Output, "INFO xccl topology: %s xpus=%d xpu_order=%s socket_iface=%s unique_rdma_nics(%d)=%s rdma_nics(%d)=%s force_order(%d)=%s rail_order=%s mapping=%s\n",
+			plan.Target.Name, plan.XPUCount, xcclPlanVisibleDevices(plan), firstNonEmpty(plan.SocketInterface, "auto"), len(plan.RDMANICs), strings.Join(plan.RDMANICs, ","),
+			len(plan.RDMANICOrder), strings.Join(plan.RDMANICOrder, ","), len(plan.RDMANICOrder), strings.Join(plan.RDMANICOrder, ","), strings.Join(plan.RDMARailOrder, ","), strings.Join(plan.Mapping, ";"))
 		for _, mapping := range plan.Mapping {
 			if strings.HasSuffix(mapping, ",PIX)") {
 				continue
@@ -411,7 +933,7 @@ func printXCCLDryRun(opts Options, plans []xcclTargetPlan, coordinator Target, w
 		fmt.Fprintf(opts.Output, "dry-run xccl prepare %s: %s\n", plan.Target.Name, xcclPrepareDirectoriesCommand(workDir))
 		fmt.Fprintf(opts.Output, "dry-run xccl copy %s: %s -> %s/incoming/mpich.tar.gz\n", plan.Target.Name, opts.Bundle.Check.XCCL.MPICHArchive, workDir)
 		fmt.Fprintf(opts.Output, "dry-run xccl copy %s: %s -> %s/incoming/xccl.tar.gz\n", plan.Target.Name, opts.Bundle.Check.XCCL.XCCLArchive, workDir)
-		fmt.Fprintf(opts.Output, "dry-run xccl rank environment %s:\n%s", plan.Target.Name, xcclRankScript(opts.Bundle.Check.XCCL, plan, workDir))
+		fmt.Fprintf(opts.Output, "dry-run xccl rank environment %s:\n%s", plan.Target.Name, xcclRankScript(opts.Bundle.Check.XCCL, plan, workDir, multiHost))
 		if multiHost {
 			fmt.Fprintf(opts.Output, "dry-run xccl temporary authorization %s: append one key marked %s to $HOME/.ssh/authorized_keys\n", plan.Target.Name, marker)
 		}
@@ -476,7 +998,29 @@ func xcclAuthorizeKeyCommand(workDir, marker string) string {
 	}, "; ")
 }
 
-func xcclRankScript(cfg spec.CheckXCCLConfig, plan xcclTargetPlan, workDir string) string {
+func xcclRankScript(cfg spec.CheckXCCLConfig, plan xcclTargetPlan, workDir string, multiHost bool) string {
+	env := xcclManagedRankEnvironment(cfg, plan, multiHost)
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	lines := []string{
+		"#!/bin/sh",
+		"set -eu",
+		"unset XPU_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES BKCL_ENABLE_XDR BKCL_USE_XDR_COPY BKCL_SWITCH_TOPO BKCL_RDMA_VERBS BKCL_TREE_THRESHOLD BKCL_DEBUG BKCL_PERF_DEBUG BKCL_MPIRUN_PRINT_MISMATCH BKCL_RDMA_PROXY_DISABLE BKCL_RING_BUFFER_SIZE BKCL_RING_BUFFER_GM BKCL_RING_OPT BKCL_FLAT_RING BKCL_USE_AR BKCL_USE_RDMA BKCL_FORCE_L3_RDMA BKCL_XLINK_D2D BKCL_XLINK_C2C BKCL_XLINK_ETH XPU_ZEBU_MODE BCCL_TRACE_HANG_ENABLE BCCL_UNIX_SOCKET_PATH BCCL_ERROR_FILE 2>/dev/null || true",
+		fmt.Sprintf("export XPU_HOME=%s", shellQuote(strings.TrimRight(cfg.XPUHome, "/"))),
+		fmt.Sprintf("if [ -n \"${PATH:-}\" ]; then export PATH=%s:\"$PATH\"; else export PATH=%s; fi", shellQuote(xcclMPICHPrefix+"/bin:"+strings.TrimRight(cfg.XPUHome, "/")+"/bin"), shellQuote(xcclMPICHPrefix+"/bin:"+strings.TrimRight(cfg.XPUHome, "/")+"/bin")),
+		fmt.Sprintf("if [ -n \"${LD_LIBRARY_PATH:-}\" ]; then export LD_LIBRARY_PATH=%s:\"$LD_LIBRARY_PATH\"; else export LD_LIBRARY_PATH=%s; fi", shellQuote(xcclLibraryPath(cfg, workDir)), shellQuote(xcclLibraryPath(cfg, workDir))),
+	}
+	for _, key := range keys {
+		lines = append(lines, fmt.Sprintf("export %s=%s", key, shellQuote(env[key])))
+	}
+	lines = append(lines, fmt.Sprintf("exec %s \"$@\"", shellQuote(filepath.Join(workDir, "runtime", "xccl_Linux_x86_64", "systest", "xccl_perf"))))
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func xcclManagedRankEnvironment(cfg spec.CheckXCCLConfig, plan xcclTargetPlan, multiHost bool) map[string]string {
 	env := map[string]string{
 		"BKCL_TIMEOUT":               strconv.Itoa(cfg.Timeout),
 		"BKCL_RDMA_NICS":             strings.Join(plan.RDMANICOrder, ","),
@@ -488,32 +1032,116 @@ func xcclRankScript(cfg spec.CheckXCCLConfig, plan xcclTargetPlan, workDir strin
 	if cfg.EnableXDR != nil && *cfg.EnableXDR {
 		env["BKCL_ENABLE_XDR"] = "1"
 	}
+	multiHostDefaults := xcclMultiHostEnvironmentDefaults()
+	if multiHost {
+		for key, value := range multiHostDefaults {
+			env[key] = value
+		}
+		visibleDevices := xcclPlanVisibleDevices(plan)
+		env["CUDA_VISIBLE_DEVICES"] = visibleDevices
+		env["XPU_VISIBLE_DEVICES"] = visibleDevices
+		if cfg.EnableXDR != nil && *cfg.EnableXDR {
+			env["BKCL_USE_XDR_COPY"] = "1"
+		}
+	}
 	if cfg.Supernode {
 		env["BKCL_SWITCH_TOPO"] = "1"
 		env["BKCL_RDMA_VERBS"] = "1"
-		env["BKCL_TREE_THRESHOLD"] = "0"
+		if !multiHost {
+			env["BKCL_TREE_THRESHOLD"] = "0"
+		}
 	}
 	for key, value := range cfg.Environment {
+		if !multiHost {
+			if _, multiHostOnly := multiHostDefaults[key]; multiHostOnly {
+				continue
+			}
+			if key == "BKCL_USE_XDR_COPY" {
+				continue
+			}
+		}
 		env[key] = value
 	}
-	keys := make([]string, 0, len(env))
-	for key := range env {
-		keys = append(keys, key)
+	return env
+}
+
+func xcclMultiHostEnvironmentDefaults() map[string]string {
+	return map[string]string{
+		"BKCL_USE_AR":                "1",
+		"BKCL_RING_OPT":              "1",
+		"BKCL_DEBUG":                 "0",
+		"BKCL_PERF_DEBUG":            "0",
+		"BKCL_MPIRUN_PRINT_MISMATCH": "0",
+		"BKCL_RDMA_PROXY_DISABLE":    "1",
+		"BKCL_RING_BUFFER_SIZE":      "2097152",
+		"XPU_ZEBU_MODE":              "1",
+		"BKCL_XLINK_D2D":             "0",
+		"BKCL_XLINK_C2C":             "1",
+		"BKCL_XLINK_ETH":             "0",
+		"BKCL_TREE_THRESHOLD":        "1",
+		"BKCL_RING_BUFFER_GM":        "1",
+		"BKCL_FLAT_RING":             "1",
+		"BKCL_USE_RDMA":              "1",
+		"BKCL_FORCE_L3_RDMA":         "0",
+		"BCCL_TRACE_HANG_ENABLE":     "1",
+		"BCCL_UNIX_SOCKET_PATH":      "/var/bccl/sockets",
+		"BCCL_ERROR_FILE":            "/var/bccl/logs/err.%h.%p.log",
 	}
-	sort.Strings(keys)
-	lines := []string{
-		"#!/bin/sh",
-		"set -eu",
-		"unset XPU_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES BKCL_ENABLE_XDR BKCL_SWITCH_TOPO BKCL_RDMA_VERBS BKCL_TREE_THRESHOLD BKCL_DEBUG BKCL_FORCE_L3_RDMA 2>/dev/null || true",
-		fmt.Sprintf("export XPU_HOME=%s", shellQuote(strings.TrimRight(cfg.XPUHome, "/"))),
-		fmt.Sprintf("if [ -n \"${PATH:-}\" ]; then export PATH=%s:\"$PATH\"; else export PATH=%s; fi", shellQuote(xcclMPICHPrefix+"/bin:"+strings.TrimRight(cfg.XPUHome, "/")+"/bin"), shellQuote(xcclMPICHPrefix+"/bin:"+strings.TrimRight(cfg.XPUHome, "/")+"/bin")),
-		fmt.Sprintf("if [ -n \"${LD_LIBRARY_PATH:-}\" ]; then export LD_LIBRARY_PATH=%s:\"$LD_LIBRARY_PATH\"; else export LD_LIBRARY_PATH=%s; fi", shellQuote(xcclLibraryPath(cfg, workDir)), shellQuote(xcclLibraryPath(cfg, workDir))),
+}
+
+func xcclPreviewRankEnvironment(cfg spec.CheckXCCLConfig, multiHost bool) map[string]string {
+	plan := xcclTargetPlan{XPUCount: 0}
+	env := xcclManagedRankEnvironment(cfg, plan, multiHost)
+	env["XPU_HOME"] = strings.TrimRight(cfg.XPUHome, "/")
+	env["PATH"] = xcclMPICHPrefix + "/bin:" + strings.TrimRight(cfg.XPUHome, "/") + "/bin:${PATH:-}"
+	env["LD_LIBRARY_PATH"] = "<run>/runtime/xccl_Linux_x86_64/so:" + xcclMPICHPrefix + "/lib:" + strings.TrimRight(cfg.XPUHome, "/") + "/so:...:${LD_LIBRARY_PATH:-}"
+	dynamicKeys := []string{"BKCL_RDMA_NICS", "BKCL_FORCE_RDMA_NICS_ORDER", "BKCL_SOCKET_IFNAME"}
+	if multiHost {
+		dynamicKeys = append(dynamicKeys, "CUDA_VISIBLE_DEVICES", "XPU_VISIBLE_DEVICES")
 	}
-	for _, key := range keys {
-		lines = append(lines, fmt.Sprintf("export %s=%s", key, shellQuote(env[key])))
+	for _, key := range dynamicKeys {
+		if _, ok := env[key]; !ok || env[key] == "" {
+			env[key] = "<resolved per host after topology discovery>"
+		}
 	}
-	lines = append(lines, fmt.Sprintf("exec %s \"$@\"", shellQuote(filepath.Join(workDir, "runtime", "xccl_Linux_x86_64", "systest", "xccl_perf"))))
-	return strings.Join(lines, "\n") + "\n"
+	return env
+}
+
+func printXCCLRankEnvironments(opts Options, cfg spec.CheckXCCLConfig, plans []xcclTargetPlan, workDir string, multiHost bool) {
+	for _, plan := range plans {
+		env := xcclManagedRankEnvironment(cfg, plan, multiHost)
+		env["XPU_HOME"] = strings.TrimRight(cfg.XPUHome, "/")
+		env["PATH"] = xcclMPICHPrefix + "/bin:" + strings.TrimRight(cfg.XPUHome, "/") + "/bin:${PATH:-}"
+		env["LD_LIBRARY_PATH"] = xcclLibraryPath(cfg, workDir) + ":${LD_LIBRARY_PATH:-}"
+		keys := make([]string, 0, len(env))
+		for key := range env {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		fmt.Fprintf(opts.Output, "INFO xccl environment: host=%s variables=%d\n", plan.Target.Name, len(keys))
+		for _, key := range keys {
+			fmt.Fprintf(opts.Output, "ENV xccl %s %s=%s\n", plan.Target.Name, key, env[key])
+		}
+	}
+}
+
+func xcclVisibleDevices(order []int) string {
+	devices := make([]string, 0, len(order))
+	for _, index := range order {
+		devices = append(devices, strconv.Itoa(index))
+	}
+	return strings.Join(devices, ",")
+}
+
+func xcclPlanVisibleDevices(plan xcclTargetPlan) string {
+	if len(plan.XPUOrder) == plan.XPUCount {
+		return xcclVisibleDevices(plan.XPUOrder)
+	}
+	order := make([]int, plan.XPUCount)
+	for index := range order {
+		order[index] = index
+	}
+	return xcclVisibleDevices(order)
 }
 
 func xcclLibraryPath(cfg spec.CheckXCCLConfig, workDir string) string {
@@ -579,8 +1207,8 @@ func xcclMPIRunArgs(cfg spec.CheckXCCLConfig, workDir string, totalRanks int, mu
 		args = append(args, "-launcher", "fork")
 	}
 	collective, _ := xcclCollectiveName(cfg.Test)
-	return append(args,
-		"-n", strconv.Itoa(totalRanks),
+	args = append(args,
+		"-np", strconv.Itoa(totalRanks),
 		"-wdir", workDir,
 		filepath.Join(workDir, "run-rank.sh"),
 		"-O", collective,
@@ -588,11 +1216,23 @@ func xcclMPIRunArgs(cfg spec.CheckXCCLConfig, workDir string, totalRanks int, mu
 		"-b", cfg.MinBytes,
 		"-e", cfg.MaxBytes,
 		"-f", strconv.Itoa(cfg.StepFactor),
-		"-w", strconv.Itoa(cfg.WarmupIterations),
+	)
+	if cfg.WarmupIterations > 0 {
+		args = append(args, "-w", strconv.Itoa(cfg.WarmupIterations))
+	}
+	args = append(args,
 		"-n", strconv.Itoa(cfg.Iterations),
 		"-c", "0",
 		"-d", cfg.DataType,
 	)
+	if normalizedXCCLLayout(cfg.Layout) == "same_index" {
+		args = append(args,
+			"--split_mode",
+			"--split_step", strconv.Itoa(cfg.SplitStep),
+			"--split_op", strconv.Itoa(cfg.SplitOperation),
+		)
+	}
+	return args
 }
 
 func xcclCollectiveName(test string) (string, bool) {
@@ -723,18 +1363,39 @@ func parseXCCLPerformanceRows(output string) []xcclPerformanceRow {
 }
 
 type xcclEvaluation struct {
-	Status   string
-	Selected xcclPerformanceRow
-	Degraded bool
-	Hosts    []string
-	Topology string
+	Status              string
+	Selected            xcclPerformanceRow
+	Degraded            bool
+	Hosts               []string
+	Topology            string
+	Layout              string
+	MachineClass        string
+	EvaluationMode      string
+	BaselineGBs         float64
+	RequiredUtilization float64
+	MeasuredUtilization float64
+	ManualMinimumBusGBs float64
 }
 
 func evaluateXCCLResult(opts Options, plans []xcclTargetPlan, rows []xcclPerformanceRow) xcclEvaluation {
+	cfg := opts.Bundle.Check.XCCL
 	selected := selectXCCLPerformanceRow(rows)
 	status := "PASS"
-	if opts.Bundle.Check.XCCL.MinBusBandwidthGBs > 0 && selected.BusGBs < opts.Bundle.Check.XCCL.MinBusBandwidthGBs {
-		status = "FAIL"
+	mode := normalizedXCCLEvaluationMode(cfg.EvaluationMode)
+	baseline, required := xcclAutomaticEvaluationRule(cfg)
+	utilization := 0.0
+	if baseline > 0 {
+		utilization = selected.BusGBs / baseline
+	}
+	switch mode {
+	case "auto":
+		if utilization <= required {
+			status = "FAIL"
+		}
+	case "manual":
+		if selected.BusGBs < cfg.MinBusBandwidthGBs {
+			status = "FAIL"
+		}
 	}
 	degraded := xcclPlansDegraded(plans)
 	if status == "PASS" && degraded {
@@ -748,7 +1409,21 @@ func evaluateXCCLResult(opts Options, plans []xcclTargetPlan, rows []xcclPerform
 	if degraded {
 		topology = "DEGRADED"
 	}
-	return xcclEvaluation{Status: status, Selected: selected, Degraded: degraded, Hosts: hostNames, Topology: topology}
+	return xcclEvaluation{
+		Status: status, Selected: selected, Degraded: degraded, Hosts: hostNames, Topology: topology,
+		Layout: normalizedXCCLLayout(cfg.Layout), MachineClass: normalizedXCCLMachineClass(cfg.MachineClass), EvaluationMode: mode,
+		BaselineGBs: baseline, RequiredUtilization: required, MeasuredUtilization: utilization, ManualMinimumBusGBs: cfg.MinBusBandwidthGBs,
+	}
+}
+
+func xcclAutomaticEvaluationRule(cfg spec.CheckXCCLConfig) (float64, float64) {
+	if normalizedXCCLLayout(cfg.Layout) == "same_index" {
+		return 200, 0.90
+	}
+	if normalizedXCCLMachineClass(cfg.MachineClass) == "vd" {
+		return 150, 0.60
+	}
+	return 100, 0.60
 }
 
 func printXCCLResult(opts Options, plans []xcclTargetPlan, totalRanks int, rows []xcclPerformanceRow) error {
@@ -758,8 +1433,8 @@ func printXCCLResult(opts Options, plans []xcclTargetPlan, totalRanks int, rows 
 func printXCCLResultEvaluation(opts Options, totalRanks int, rows []xcclPerformanceRow, evaluation xcclEvaluation) error {
 	selected := evaluation.Selected
 	status := evaluation.Status
-	headers := []string{"STATUS", "TEST", "HOSTS", "RANKS", "TOPOLOGY", "MODE", "SIZE(B)", "TIME(us)", "ALGBW(GB/s)", "BUSBW(GB/s)"}
-	cells := []string{status, opts.Bundle.Check.XCCL.Test, strings.Join(evaluation.Hosts, ","), strconv.Itoa(totalRanks), evaluation.Topology, firstNonEmpty(selected.Mode, "out-of-place"), strconv.FormatInt(selected.SizeBytes, 10), fmt.Sprintf("%.2f", selected.TimeUS), fmt.Sprintf("%.2f", selected.AlgGBs), fmt.Sprintf("%.2f", selected.BusGBs)}
+	headers := []string{"STATUS", "TEST", "LAYOUT", "HOSTS", "RANKS", "TOPOLOGY", "MODE", "SIZE(B)", "TIME(us)", "ALGBW(GB/s)", "BUSBW(GB/s)"}
+	cells := []string{status, opts.Bundle.Check.XCCL.Test, evaluation.Layout, strings.Join(evaluation.Hosts, ","), strconv.Itoa(totalRanks), evaluation.Topology, firstNonEmpty(selected.Mode, "out-of-place"), strconv.FormatInt(selected.SizeBytes, 10), fmt.Sprintf("%.2f", selected.TimeUS), fmt.Sprintf("%.2f", selected.AlgGBs), fmt.Sprintf("%.2f", selected.BusGBs)}
 	widths := make([]int, len(headers))
 	for idx := range headers {
 		widths[idx] = maxInt(len(headers[idx]), len(cells[idx]))
@@ -772,14 +1447,34 @@ func printXCCLResultEvaluation(opts Options, totalRanks int, rows []xcclPerforma
 		line = redText(line)
 	}
 	fmt.Fprintln(opts.Output, line)
+	printXCCLEvaluationRule(opts.Output, evaluation)
 	printXCCLSizeResults(opts.Output, rows, selected)
 	if evaluation.Degraded {
 		fmt.Fprintln(opts.Output, "WARN xccl result topology: at least one XPU used a non-PIX RDMA mapping; collective bandwidth may be limited by the PCIe/NUMA path")
 	}
 	if status == "FAIL" {
-		return fmt.Errorf("XCCL %s %.2f GB/s below %.2f GB/s at size %d", opts.Bundle.Check.XCCL.Test, selected.BusGBs, opts.Bundle.Check.XCCL.MinBusBandwidthGBs, selected.SizeBytes)
+		if evaluation.EvaluationMode == "auto" {
+			return fmt.Errorf("XCCL %s %s utilization %.2f%% is not greater than %.2f%% (%.2f/%.2f GB/s) at size %d", opts.Bundle.Check.XCCL.Test, evaluation.Layout, evaluation.MeasuredUtilization*100, evaluation.RequiredUtilization*100, selected.BusGBs, evaluation.BaselineGBs, selected.SizeBytes)
+		}
+		return fmt.Errorf("XCCL %s %.2f GB/s below %.2f GB/s at size %d", opts.Bundle.Check.XCCL.Test, selected.BusGBs, evaluation.ManualMinimumBusGBs, selected.SizeBytes)
 	}
 	return nil
+}
+
+func printXCCLEvaluationRule(output io.Writer, evaluation xcclEvaluation) {
+	switch evaluation.EvaluationMode {
+	case "auto":
+		machine := "n/a"
+		if evaluation.Layout == "full_ring" {
+			machine = strings.ToUpper(evaluation.MachineClass)
+		}
+		fmt.Fprintf(output, "XCCL evaluation: mode=auto layout=%s machine_class=%s measured=%.2f GB/s baseline=%.2f GB/s utilization=%.3f%% requirement=utilization>%.2f%%\n",
+			evaluation.Layout, machine, evaluation.Selected.BusGBs, evaluation.BaselineGBs, evaluation.MeasuredUtilization*100, evaluation.RequiredUtilization*100)
+	case "manual":
+		fmt.Fprintf(output, "XCCL evaluation: mode=manual measured=%.2f GB/s minimum=%.2f GB/s\n", evaluation.Selected.BusGBs, evaluation.ManualMinimumBusGBs)
+	default:
+		fmt.Fprintln(output, "XCCL evaluation: mode=disabled (result recorded without a bandwidth pass/fail threshold)")
+	}
 }
 
 func printXCCLSizeResults(output io.Writer, rows []xcclPerformanceRow, selected xcclPerformanceRow) {

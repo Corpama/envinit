@@ -11,14 +11,17 @@ import (
 )
 
 type xcclLiveTracker struct {
-	table       *liveResultTable
-	rowByID     map[string]int
-	cfg         spec.CheckXCCLConfig
-	hosts       []string
-	ranks       int
-	topology    string
-	finalized   bool
-	finalStatus string
+	table          *liveResultTable
+	rowByID        map[string]int
+	cfg            spec.CheckXCCLConfig
+	hosts          []string
+	xpuOrders      []string
+	orderingMode   string
+	orderingReason string
+	ranks          int
+	topology       string
+	finalized      bool
+	finalStatus    string
 }
 
 func showXCCLTUIInitialFailure(opts Options, cfg spec.CheckXCCLConfig, plans []xcclTargetPlan, targets []Target, err error) {
@@ -43,7 +46,8 @@ func showXCCLTUIInitialFailure(opts Options, cfg spec.CheckXCCLConfig, plans []x
 			topology = "DEGRADED"
 		}
 	}
-	tracker := &xcclLiveTracker{cfg: cfg, hosts: hosts, ranks: ranks, topology: topology}
+	orderingMode, orderingReason := xcclResolvedOrderingDisplay(cfg, plans)
+	tracker := &xcclLiveTracker{cfg: cfg, hosts: hosts, xpuOrders: xcclPlanOrderLabels(plans), orderingMode: orderingMode, orderingReason: orderingReason, ranks: ranks, topology: topology}
 	opts.checkTUI.SetResults(checkTUIStageXCCL, xcclTUIHeaders(), []checkTUIItem{tracker.failureItem(err)})
 }
 
@@ -60,7 +64,8 @@ func newXCCLLiveTracker(output io.Writer, enabled bool, cfg spec.CheckXCCLConfig
 	if xcclPlansDegraded(plans) {
 		topology = "DEGRADED"
 	}
-	tracker := &xcclLiveTracker{rowByID: map[string]int{}, cfg: cfg, hosts: hosts, ranks: totalRanks, topology: topology}
+	orderingMode, orderingReason := xcclResolvedOrderingDisplay(cfg, plans)
+	tracker := &xcclLiveTracker{rowByID: map[string]int{}, cfg: cfg, hosts: hosts, xpuOrders: xcclPlanOrderLabels(plans), orderingMode: orderingMode, orderingReason: orderingReason, ranks: totalRanks, topology: topology}
 	var rows [][]string
 	var tuiItems []checkTUIItem
 	for _, mode := range xcclPlotModes {
@@ -123,15 +128,15 @@ func (t *xcclLiveTracker) Fail(err error) {
 }
 
 func xcclTUIHeaders() []string {
-	return []string{"STATUS", "EVAL", "MODE", "SIZE(B)", "TYPE", "OP", "TIME(us)", "ALGBW(GB/s)", "BUSBW(GB/s)"}
+	return []string{"STATUS", "EVAL", "LAYOUT", "MODE", "SIZE(B)", "TYPE", "OP", "TIME(us)", "ALGBW(GB/s)", "BUSBW(GB/s)"}
 }
 
 func (t *xcclLiveTracker) failureItem(err error) checkTUIItem {
-	detail := fmt.Sprintf("XCCL failure\nTest: %s\nHosts: %s\nRanks: %d\nTopology: %s\nMinimum bus bandwidth: %.2f GB/s\n\nFailure:\n%s",
-		t.cfg.Test, strings.Join(t.hosts, ","), t.ranks, t.topology, t.cfg.MinBusBandwidthGBs, err)
+	detail := fmt.Sprintf("XCCL failure\nTest: %s\nLayout: %s\nRequested ordering: %s\nResolved ordering: %s\nOrdering reason: %s\nXPU order: %s\nHosts: %s\nRanks: %d (%s)\nTopology: %s\nEvaluation: %s\n\nFailure:\n%s",
+		t.cfg.Test, normalizedXCCLLayout(t.cfg.Layout), normalizedXCCLXPUOrdering(t.cfg.XPUOrdering), firstNonEmpty(t.orderingMode, "unknown"), firstNonEmpty(t.orderingReason, "not recorded"), strings.Join(t.xpuOrders, "; "), strings.Join(t.hosts, ","), t.ranks, xcclRankSource(t.cfg), t.topology, xcclEvaluationReview(t.cfg), err)
 	return checkTUIItem{
 		ID: "xccl-error", Section: checkTUIStageXCCL, Status: "FAIL",
-		Cells:  []string{"FAIL", "", "-", "-", "-", "-", "-", "-", "-"},
+		Cells:  []string{"FAIL", "", normalizedXCCLLayout(t.cfg.Layout), "-", "-", "-", "-", "-", "-", "-"},
 		Detail: detail,
 	}
 }
@@ -141,10 +146,14 @@ func (t *xcclLiveTracker) sizeItem(row xcclPerformanceRow, status string, evalua
 	if evaluated {
 		eval = "*"
 	}
-	detail := fmt.Sprintf("XCCL size result\nTest: %s\nHosts: %s\nRanks: %d\nTopology: %s\nMinimum bus bandwidth: %.2f GB/s\n\nEvaluation row: %s\nSize: %d bytes\nMode: %s\nData type: %s\nOperation: %s\nStatus: %s\n\nTime: %.2f us\nAlgorithm bandwidth: %.2f GB/s\nBus bandwidth: %.2f GB/s",
-		t.cfg.Test, strings.Join(t.hosts, ","), t.ranks, t.topology, t.cfg.MinBusBandwidthGBs,
+	detail := fmt.Sprintf("XCCL size result\nTest: %s\nLayout: %s\nRequested ordering: %s\nResolved ordering: %s\nOrdering reason: %s\nXPU order: %s\nHosts: %s\nRanks: %d (%s)\nTopology: %s\nEvaluation: %s\n\nEvaluation row: %s\nSize: %d bytes\nMode: %s\nData type: %s\nOperation: %s\nStatus: %s\n\nTime: %.2f us\nAlgorithm bandwidth: %.2f GB/s\nBus bandwidth: %.2f GB/s",
+		t.cfg.Test, normalizedXCCLLayout(t.cfg.Layout), normalizedXCCLXPUOrdering(t.cfg.XPUOrdering), firstNonEmpty(t.orderingMode, "unknown"), firstNonEmpty(t.orderingReason, "not recorded"), strings.Join(t.xpuOrders, "; "), strings.Join(t.hosts, ","), t.ranks, xcclRankSource(t.cfg), t.topology, xcclEvaluationReview(t.cfg),
 		firstNonEmpty(eval, "no"), row.SizeBytes, row.Mode, firstNonEmpty(row.DataType, t.cfg.DataType), firstNonEmpty(row.Operation, t.cfg.Test), status, row.TimeUS, row.AlgGBs, row.BusGBs)
-	cells := []string{status, eval, row.Mode, strconv.FormatInt(row.SizeBytes, 10), firstNonEmpty(row.DataType, t.cfg.DataType), firstNonEmpty(row.Operation, t.cfg.Test)}
+	if evaluated && normalizedXCCLEvaluationMode(t.cfg.EvaluationMode) == "auto" {
+		baseline, required := xcclAutomaticEvaluationRule(t.cfg)
+		detail += fmt.Sprintf("\nBaseline: %.2f GB/s\nUtilization: %.3f%%\nRequired: >%.2f%%", baseline, row.BusGBs/baseline*100, required*100)
+	}
+	cells := []string{status, eval, normalizedXCCLLayout(t.cfg.Layout), row.Mode, strconv.FormatInt(row.SizeBytes, 10), firstNonEmpty(row.DataType, t.cfg.DataType), firstNonEmpty(row.Operation, t.cfg.Test)}
 	cells = append(cells, xcclMetricCells(row, status)...)
 	ready := status == "DONE" || status == "PASS" || status == "FAIL" || status == "WARN"
 	return checkTUIItem{
@@ -153,6 +162,76 @@ func (t *xcclLiveTracker) sizeItem(row xcclPerformanceRow, status string, evalua
 		Detail: detail,
 		Plot:   &checkTUIPlotPoint{Mode: row.Mode, Size: row.SizeBytes, AlgBW: row.AlgGBs, BusBW: row.BusGBs, Ready: ready},
 	}
+}
+
+func xcclPlanOrderLabels(plans []xcclTargetPlan) []string {
+	labels := make([]string, 0, len(plans))
+	for _, plan := range plans {
+		labels = append(labels, plan.Target.Name+"="+xcclPlanVisibleDevices(plan))
+	}
+	return labels
+}
+
+func xcclResolvedOrderingDisplay(cfg spec.CheckXCCLConfig, plans []xcclTargetPlan) (string, string) {
+	requested := normalizedXCCLXPUOrdering(cfg.XPUOrdering)
+	layout := normalizedXCCLLayout(cfg.Layout)
+	if len(plans) == 0 {
+		switch {
+		case requested != "auto":
+			return requested, "configured explicitly; topology result unavailable"
+		case layout == "same_index":
+			return "physical", "same_index preserves physical XPU indices"
+		case layout == "single_host":
+			return "physical", "single-host execution preserves physical XPU indices"
+		default:
+			return "auto", "topology resolution did not complete"
+		}
+	}
+
+	physical := xcclPlansUsePhysicalXPUOrder(plans)
+	if requested == "physical" {
+		return "physical", "configured explicitly"
+	}
+	if requested == "rail_aligned" {
+		if physical {
+			return "physical", "rail alignment requested; physical rail order already matches"
+		}
+		return "rail_aligned", "configured rail alignment reordered at least one host"
+	}
+	if layout == "same_index" {
+		return "physical", "same_index preserves physical XPU indices"
+	}
+	if layout == "single_host" {
+		return "physical", "single-host execution preserves physical XPU indices"
+	}
+	if physical {
+		return "physical", "physical rail order already matches across hosts"
+	}
+	return "rail_aligned", "cross-host physical rail order differs"
+}
+
+func xcclPlansUsePhysicalXPUOrder(plans []xcclTargetPlan) bool {
+	for _, plan := range plans {
+		if len(plan.XPUOrder) == 0 {
+			continue
+		}
+		if len(plan.XPUOrder) != plan.XPUCount {
+			return false
+		}
+		for logicalIndex, physicalIndex := range plan.XPUOrder {
+			if logicalIndex != physicalIndex {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func xcclRankSource(cfg spec.CheckXCCLConfig) string {
+	if cfg.Ranks > 0 {
+		return "manual"
+	}
+	return "auto"
 }
 
 func xcclMetricCells(row xcclPerformanceRow, status string) []string {

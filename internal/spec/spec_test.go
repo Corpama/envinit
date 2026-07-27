@@ -155,11 +155,23 @@ func TestApplyDefaultsSetsXCCLRuntimeDefaults(t *testing.T) {
 	if b.Check.XCCL.WorkRoot != "/tmp/envinit-xccl-check" || b.Check.XCCL.XPUHome != "/usr/local/xpu" {
 		t.Fatalf("unexpected XCCL runtime defaults: %#v", b.Check.XCCL)
 	}
-	if b.Check.XCCL.Test != "all_reduce" || b.Check.XCCL.MinBytes != "1024" || b.Check.XCCL.MaxBytes != "256m" {
+	if b.Check.XCCL.Test != "all_reduce" || b.Check.XCCL.MinBytes != "1m" || b.Check.XCCL.MaxBytes != "2g" || b.Check.XCCL.DataType != "fp16" {
 		t.Fatalf("unexpected XCCL performance defaults: %#v", b.Check.XCCL)
+	}
+	if b.Check.XCCL.Layout != "full_ring" || b.Check.XCCL.XPUOrdering != "auto" || b.Check.XCCL.MachineClass != "" || b.Check.XCCL.Ranks != 0 || b.Check.XCCL.SplitStep != 8 || b.Check.XCCL.EvaluationMode != "auto" {
+		t.Fatalf("unexpected XCCL multi-host defaults: %#v", b.Check.XCCL)
 	}
 	if b.Check.XCCL.EnableXDR == nil || !*b.Check.XCCL.EnableXDR {
 		t.Fatalf("XCCL XDR should default to enabled: %#v", b.Check.XCCL.EnableXDR)
+	}
+	if !b.Check.XCCL.TopologyValidationEnabled() {
+		t.Fatal("XCCL cross-host topology validation should default to enabled")
+	}
+	disabled := false
+	b.Check.XCCL.ValidateTopology = &disabled
+	b.ApplyDefaults()
+	if b.Check.XCCL.TopologyValidationEnabled() {
+		t.Fatal("ApplyDefaults must preserve an explicit disabled topology validation setting")
 	}
 }
 

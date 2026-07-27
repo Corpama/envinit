@@ -494,6 +494,8 @@ Kylin 路径下，工具会使用 `offline_repo` 生成 yum repo 文件，执行
 8. **TUI 最终确认。** TUI 展示规划目标、当前接口名、MAC、PCI、驱动、最大/当前速率、MTU、链路状态，以及简短的 `Why [confidence]`。用户选择的绑定拥有最高优先级，可以覆盖自动推荐；同一物理网卡不能重复使用。确认结果会同步到本轮运行内存，并写入 `/var/lib/envinit/selected_interfaces` 和分离的 management/RDMA udev 规则，但不会反向修改 inventory。为兼容现有 RDMA 服务脚本，`/etc/rdma/rdma_conf/selected_interfaces` 会保留为指向新路径的软链接。
 9. **当前启动周期与重启。** RDMA 接口需要供后续 stage 使用，因此确认后会通过临时名中转，安全处理接口名称互换，再改成规划名。管理接口只有在 `apply_network_immediately=true` 时才会在本轮临时改名；为 `false` 时不会 down/rename 当前管理口，只写配置和持久化规则，等重启后生效。
 
+临时改名是带回滚的两阶段事务。工具会先确认目标主名称没有被本轮之外的接口占用，再把所有待改接口移到 `ei-tmpN` 临时名，最后统一切换为规划名。对于“第一次改成统一名称，第二次又改回原名称”的场景，Linux 可能仍把原名称保留为同一接口的 `altname`；工具会在最终改名前删除该冲突 `altname`，避免 `RTNETLINK answers: File exists`。任一步失败时会倒序恢复已经移动的接口及其原始 `UP` 状态，并在错误中明确说明自动回滚是否完整，不再把部分网卡遗留在 `ei-tmpN` 名称下。
+
 #### 5.4.2 NIC Binding Review 操作
 
 `Why` 后面的置信度帮助判断自动推荐的依据：`exact` 表示 MAC、已有接口名或规划 IP 精确命中；`strong` 表示硬件分组和规划数量能够形成唯一完整组；`weak` 表示只有不足以独立确认的辅助依据；`ambiguous` 表示存在多个等价选择；`conflict` 表示精确线索彼此冲突。人工改选后显示为 `manual`，其优先级最高。
@@ -744,10 +746,10 @@ ipmitool power soft
 | 管理网 | `mgmt_ip`, `mgmt_prefix`, `mgmt_gateway`, `mgmt_bond_name`, `mgmt_nameservers` |
 | 管理口 1 | `mgmt_iface1`, `mgmt_mac1` |
 | 管理口 2 | `mgmt_iface2`, `mgmt_mac2` |
-| RDMA 口 1 | `rdma1_name`, `rdma1_ip`, `rdma1_mac`, `rdma1_prefix`, `rdma1_gateway`, `rdma1_table`, `rdma1_route_cidr` |
-| RDMA 口 2 | `rdma2_name`, `rdma2_ip`, `rdma2_mac`, `rdma2_prefix`, `rdma2_gateway`, `rdma2_table`, `rdma2_route_cidr` |
-| RDMA 口 3 | `rdma3_name`, `rdma3_ip`, `rdma3_mac`, `rdma3_prefix`, `rdma3_gateway`, `rdma3_table`, `rdma3_route_cidr` |
-| RDMA 口 4 | `rdma4_name`, `rdma4_ip`, `rdma4_mac`, `rdma4_prefix`, `rdma4_gateway`, `rdma4_table`, `rdma4_route_cidr` |
+| RDMA 口 1 | `rdma1_name`, `rdma1_ip`, `rdma1_mac`, `rdma1_prefix`, `rdma1_gateway`, `rdma1_table`, `rdma1_route_cidr`, `rdma1_rail_id` |
+| RDMA 口 2 | `rdma2_name`, `rdma2_ip`, `rdma2_mac`, `rdma2_prefix`, `rdma2_gateway`, `rdma2_table`, `rdma2_route_cidr`, `rdma2_rail_id` |
+| RDMA 口 3 | `rdma3_name`, `rdma3_ip`, `rdma3_mac`, `rdma3_prefix`, `rdma3_gateway`, `rdma3_table`, `rdma3_route_cidr`, `rdma3_rail_id` |
+| RDMA 口 4 | `rdma4_name`, `rdma4_ip`, `rdma4_mac`, `rdma4_prefix`, `rdma4_gateway`, `rdma4_table`, `rdma4_route_cidr`, `rdma4_rail_id` |
 | 更多 RDMA 口 | `rdma5_name`, `rdma5_ip` ... |
 
 工具也支持 `.tsv`、`.txt` 和 `.xlsx`。使用 `.xlsx` 时默认读取第一张表，也可以增加 `--sheet Sheet1`。
@@ -772,6 +774,7 @@ ipmitool power soft
 | `rdmaN_gateway` | 可选 | 第 N 个 RDMA 网关；为空时按 RDMA IP 推导 `.1` |
 | `rdmaN_table` | 可选 | 第 N 个 RDMA 路由表号；为空时使用 bundle 对应项，仍未配置时按顺序使用 `101、102、103...` |
 | `rdmaN_route_cidr` | 可选 | 第 N 个 RDMA 直连网段；通常按 `rdmaN_ip/prefix` 自动推导，仅特殊路由规划时覆盖 |
+| `rdmaN_rail_id` | 可选，默认留空 | XCCL 跨主机 rail 的显式物理身份覆盖，例如 `fabric-a`、`leaf-a`；也接受别名 `rdmaN_rail`。正常自动发现时无需填写，仅在程序无法从网段和拓扑判断已知的跨主机对应关系时使用 |
 
 其中 `N` 从 `1` 开始，可按机器实际 RDMA 口数量扩展，例如 8 卡机器可填写到 `rdma8_name` / `rdma8_ip`。
 
@@ -783,7 +786,38 @@ MAC -> planning.csv 中的接口名 -> bundle.json 中的默认接口名
 
 如果只填写 `mgmt_iface1` 或 `mgmt_mac1`，并把第二个管理口留空，工具会配置单管理口，不创建 bond。
 
-### 6.3 示例：不配置 RDMA IP
+### 6.3 XCCL rail_id 的自动推断与手工覆盖
+
+`rdmaN_rail_id` 已预留在 `examples/inventory.csv` 和 `examples/inventory.sample.csv` 的表头中，但模板数据默认全部留空。这是正常用法，不会阻止 XCCL 测试。它不是网卡编号、XPU 编号，也不是要求每次交付都维护的字段，而是“这张物理 RDMA 网卡接入哪一条跨主机通信 rail”的可选稳定标识。
+
+完整的本机 topo 分配、共享网卡处理、跨主机 rail 对齐、`physical/rail_aligned` 选择和失败边界见 [`docs/xccl-topology-rail-matching.md`](docs/xccl-topology-rail-matching.md)。
+
+程序按以下优先级确定 rail：
+
+1. `rdmaN_rail_id` 非空时，把它作为人工确认的强制对应关系。
+2. 未填写时，优先根据 `rdmaN_ip/rdmaN_prefix` 推导网段；不同网段可直接作为不同 rail 的自动身份。
+3. 多张物理 HCA 位于同一网段时，将其视为共享 fabric，继续使用 `xpu-smi topo -m` 的 PIX 优先全局分配及 inventory 物理顺序，不要求补填 rail ID；Raw Logs 会给出提示，说明本轮采用了拓扑顺序回退。
+4. IP 或 prefix 也缺失时，保留拓扑和 `rdmaN` 槽位顺序并给出提示。
+
+只有在“多个彼此隔离的物理 rail 恰好使用相同网段”或“现场已经明确要求某些端口跨主机一一对应，而自动信息无法表达”时，才需要手工填写。填写规则如下：
+
+- 同一条跨主机物理 rail，在所有参测机器上使用完全相同的 ID；不同 rail 使用不同 ID。
+- `rdma1`、`rdma2` 的序号和 Linux 接口名可以因机器而不同，真正参与对齐的是 rail ID。
+- 建议使用有现场语义的稳定名称，例如 `fabric-a`、`fabric-b`、`leaf-a`，不要把临时接口名或 XPU 序号当作 rail ID。
+- 同一批参测机器应完整填写对应 rail。不要只在一台机器或一部分端口填写；这种不完整映射会在拓扑校验阶段被判为不一致。
+- 如果所有网卡本来就在同一个共享 RoCE fabric，保持全部为空即可，不要为了“填满表格”人为制造 rail。
+
+例如，node-a 的本地端口顺序是 fabric-a、fabric-b，而 node-b 恰好相反。下面的显式 ID 会让 XCCL 按物理 fabric 对齐，而不是错误地按 `rdma1` 对 `rdma1`：
+
+```csv
+host_id,hostname,rdma1_name,rdma1_ip,rdma1_prefix,rdma1_rail_id,rdma2_name,rdma2_ip,rdma2_prefix,rdma2_rail_id
+node-a,node-a,ens11np0,10.61.10.11,24,fabric-a,ens13np0,10.61.10.12,24,fabric-b
+node-b,node-b,ens7f0np0,10.61.10.21,24,fabric-b,ens3f0np0,10.61.10.22,24,fabric-a
+```
+
+如果 node-a 和 node-b 的这些端口都属于同一个可互通的共享 fabric，则上述两个 `rail_id` 列应直接留空。`check.xccl.validate_topology=false` 可以强制绕过跨主机一致性校验，但它只适合已知风险下的诊断试跑，不能替代正确的 rail 规划。
+
+### 6.4 示例：不配置 RDMA IP
 
 当 `bundle.json` 中设置 `"rdma_mode": "names_only"` 时，可以只规划 RDMA 网卡名：
 
@@ -804,7 +838,7 @@ RDMA 网：
 
 这种模式仍会执行 RDMA udev 命名、RoCE adaptive routing、ring buffer 调优和 `mlxconfig`，但不会写 RDMA netplan、路由和 policy rule，也不能做 `rdma-ping`。
 
-### 6.4 示例：配置 RDMA IP 和路由
+### 6.5 示例：配置 RDMA IP 和路由
 
 基础与管理网：
 
@@ -821,7 +855,7 @@ RDMA 网：
 | `rdma3` | `ens15np0` | `11.1.3.11` | `aa:bb:cc:dd:ee:13` |
 | `rdma4` | `ens17np0` | `11.1.4.11` | `aa:bb:cc:dd:ee:14` |
 
-### 6.5 如何写规划表
+### 6.6 如何写规划表
 
 建议按以下顺序整理：
 
@@ -830,7 +864,8 @@ RDMA 网：
 3. 如果现场已经有明确端口信息，记录管理口和 RDMA 口的 MAC；没有 MAC 时可留空，由工具在 `network` 阶段自动发现并进入 TUI 复核。
 4. 固定物理端口到 `rdma1` 至 `rdmaN` 的规划含义。同一列必须表示同一类物理端口。
 5. 如果需要 RDMA 三层网络，填写每个 `rdmaN_ip` 并使用 `rdma_mode=full`；如果只需要 RDMA 命名和调优，使用 `rdma_mode=names_only`。
-6. 每台机器先运行一次 `plan --host <host_id>`，确认解析结果再执行 `apply`。
+6. `rdmaN_rail_id` 通常保持为空；只有现场存在已知但无法自动推断的隔离 rail 对应关系时，才按 6.3 节在所有参测机器上成组填写。
+7. 每台机器先运行一次 `plan --host <host_id>`，确认解析结果再执行 `apply`。
 
 ## 7. bundle.json 结构
 
@@ -855,6 +890,8 @@ bundle 使用严格 JSON 字段校验：字段名拼写错误、已经删除的�
   "post_power_action": {}
 }
 ```
+
+示例中的 `duration=0`、`gid_index=0` 和 `base_port=0` 是 profile 模板使用的“采用程序有效默认值”占位写法。bundle 加载后分别归一化为 `1` 秒、GID index `3` 和端口 `18515`；进入交互式 check 向导后，为了更适合持续带宽压测，本轮临时值进一步调整为 duration 模式、`10` 秒和 `1 MiB` message size，但不会写回 bundle。
 
 ### 7.2 defaults
 
@@ -1078,7 +1115,13 @@ MST Device Review 中使用上下方向键或 `j/k` 移动，空格切换当前�
   "xccl": {
     "enabled": true,
     "mpich_archive": "data/misc/mpich-5.0.1-ubuntu22.04-x86_64.tar.gz",
-    "xccl_archive": "data/misc/xccl_Linux_x86_64-3.2.2.0.tar.gz"
+    "xccl_archive": "data/misc/xccl_Linux_x86_64-3.2.2.0.tar.gz",
+    "layout": "full_ring",
+    "xpu_ordering": "auto",
+    "machine_class": "",
+    "ranks": 0,
+    "evaluation_mode": "auto",
+    "validate_topology": true
   }
 }
 ```
@@ -1292,7 +1335,7 @@ Review 左侧是当前机器的 `mgmt`、`rdma1..rdmaN` 槽位，右侧是管理
 | `rdma-ping` | 所有参测 RDMA 口之间的 IPv4 大包、无分片连通性 | 至少 2 台 |
 | `xccl` | 单机或多机 XPU 集合通信、XCCL/MPICH 运行时和 RoCE 数据路径 | 允许 1 台 |
 
-交互终端中省略 `--hosts` 会先进入 `Hosts -> Checks -> Parameters -> Review` 配置向导：从 inventory 勾选机器，选择 Ping/Bandwidth/XCCL，并对本轮参数做临时覆盖；Review 会显示双向交叉矩阵数量，确认后才开始远端发现和测试。向导不会写回 bundle。Bandwidth 默认同时生成独立的 `BW Verbs` 和 `BW RDMA-CM` stage：Verbs 使用管理地址交换控制信息、通过两端 `IB device/GID index` 建立数据路径且不传 `-R`；RDMA-CM 使用对端规划 RDMA IP 并传 `-R`。两种模式分别展示结果、热力图、RDMA Counter Delta 和 Raw Logs。
+交互终端中省略 `--hosts` 会先进入 `Hosts -> Checks -> Parameters -> Environment -> Review` 配置向导：从 inventory 勾选机器，选择 Ping/Bandwidth/XCCL，并对本轮参数做临时覆盖；Environment 展示 XCCL 公共变量和需要在拓扑发现后逐机解析的变量，Review 会显示双向交叉矩阵数量及环境变量数量，确认后才开始远端发现和测试。向导不会写回 bundle。Bandwidth 默认同时生成独立的 `BW Verbs` 和 `BW RDMA-CM` stage：Verbs 使用管理地址交换控制信息、通过两端 `IB device/GID index` 建立数据路径且不传 `-R`；RDMA-CM 使用对端规划 RDMA IP 并传 `-R`。两种模式分别展示结果、热力图、RDMA Counter Delta 和 Raw Logs。
 
 显式 CLI 模式保持兼容：默认 `--check-stage all` 执行 bandwidth 和 rdma-ping；只有 `check.xccl.enabled=true` 时才把 XCCL 加入默认流程。未通过向导指定 bandwidth mode 的旧命令仍只运行原有 RDMA-CM 模式。显式使用 `--check-stage xccl` 时会直接执行 XCCL，用于单机 smoke test 或临时覆盖默认开关。
 
@@ -1370,15 +1413,20 @@ check 的显式映射只覆盖控制通道，不会像 discover 一样按远端 
 | `bandwidth` | 能控制所有目标 | `ib_write_bw`、`ethtool`、可读取 RDMA sysfs | 必须有 `rdmaN_name`；正式 RDMA 验收应同时有 `rdmaN_ip` |
 | `rdma-ping` | 能控制所有目标 | IPv4 `ping`、`ethtool` | 每个参测槽位必须同时有 `rdmaN_name`、`rdmaN_ip` |
 | XDR bandwidth | 同 bandwidth | 支持 mmap 的 `ib_write_bw`、`xpu-smi`、`/dev/xdrdrv` | `rdmaN_name`，topo 的直接 `mlx5_N` 列或 NIC legend 必须包含对应 IB device |
-| `xccl` | 多机模式需要 `ssh-keygen`；物料路径从当前工作目录读取 | `xpu-smi`、XRE/XPU 动态库、tar；可运行临时 MPICH/XCCL | 所有机器的 XPU 数和按 XPU 排列的 RDMA 接口顺序必须一致 |
+| `xccl` | 多机模式需要 `ssh-keygen`；物料路径从当前工作目录读取 | `xpu-smi`、XRE/XPU 动态库、tar；可运行临时 MPICH/XCCL | 必须列出全部参测 `rdmaN_name`；不同机器的 Linux 接口名、RDMA device 编号和本地槽位顺序可以不同，程序按 topo 与 rail 语义对齐；只有自动信息无法表达隔离 rail 时才填写 `rdmaN_rail_id` |
 
-`check` 默认使用 inventory 中的管理 IP 建立控制连接；管理 IP 不可达或尚未写入时，可以用 `inventory身份=SSH地址` 临时覆盖，但 inventory 仍必须存在该机器的 RDMA 规划。标准 bandwidth 在某个目标缺少 `rdmaN_ip` 时会回退到该目标的控制地址作为 peer address，这只是一项兼容行为，通常不能代表规划的 RDMA 数据面；正式验收应先通过 discover 或人工方式补齐 RDMA IP。bundle 中使用 `data/...` 的 MPICH/XCCL 路径时，仍必须从 `env_tool/` 目录启动命令。
+`check` 默认使用 inventory 中的管理 IP 建立控制连接；管理 IP 不可达或尚未写入时，可以用 `inventory身份=SSH地址` 临时覆盖，但 inventory 仍必须存在该机器的 RDMA 规划。Bandwidth Verbs 始终使用控制地址完成 perftest 控制信息交换，实际数据路径由两端 IB device 与 GID index 决定；RDMA-CM 优先使用对应 `rdmaN_ip` 作为 peer address。RDMA-CM 在某个目标缺少 `rdmaN_ip` 时会回退到该目标的控制地址，这只是一项旧配置兼容行为，通常不能代表规划的 RDMA 数据面；正式验收应先通过 discover 或人工方式补齐 RDMA IP。bundle 中使用 `data/...` 的 MPICH/XCCL 路径时，仍必须从 `env_tool/` 目录启动命令。
 
 ### 8.3 bandwidth：标准 RDMA 带宽检查
 
 #### 8.3.1 功能和测试矩阵
 
-标准 bandwidth 使用 OFED/perftest 自带的 `ib_write_bw`。每条流在服务端后台启动一个 server，在客户端用对应 RDMA 地址连接；命令使用 `-R` 通过 RDMA CM 建链、`-F` 忽略 CPU frequency 警告，并通过两端各自的真实 IB device 绑定端口。
+标准 bandwidth 使用 OFED/perftest 自带的 `ib_write_bw`。每条流都在服务端后台启动一个 server，并通过两端各自的真实 IB device 绑定端口；`-F` 用于忽略 CPU frequency 警告。交互向导默认把同一矩阵拆成两种独立 stage：
+
+- `BW Verbs`：客户端连接服务端控制地址，不传 `-R`，两端显式使用各自的 `IB device`、port `1` 和配置的 GID index `-x`，验证 Verbs 数据路径。
+- `BW RDMA-CM`：客户端连接对应服务端 RDMA IP 并传 `-R`，验证 RDMA-CM、RoCE IP 和策略路由路径。
+
+显式 CLI 未选择 bandwidth mode 时继续只执行历史 RDMA-CM 模式，保持自动化兼容。两种模式使用相同的双向全交叉矩阵、吞吐门槛和 counter 统计，但结果、热力图和错误详情分别展示。
 
 对于每一对机器，工具执行两个方向。若客户端有 N 个逻辑 RDMA 口、服务端有 M 个逻辑 RDMA 口，则每个方向生成 `N × M` 条流，不仅测试同编号端口。因此两台 4 卡机器共有 `2 × 4 × 4 = 32` 条标准带宽流。
 
@@ -1390,10 +1438,16 @@ check 的显式映射只覆盖控制通道，不会像 discover 一样按远端 
 
 | 参数 | 对测试的影响 |
 | --- | --- |
-| `check.bandwidth.iterations` | `ib_write_bw -n` |
+| `check.bandwidth.run_by_duration` | `true` 时使用 `-D <duration> -f 2 -N`；`false` 时使用迭代次数 |
+| `check.bandwidth.duration` | duration 模式的持续秒数；向导默认临时调整为 10 秒 |
+| `check.bandwidth.iterations` | iteration 模式的 `ib_write_bw -n` |
+| `check.bandwidth.message_size` | 正数时添加 `-s`；向导默认临时调整为 1 MiB |
 | `check.bandwidth.bandwidth_qps` | 正数时添加 `-q` |
+| `check.bandwidth.gid_index` | Verbs 模式的 `-x`；RDMA-CM 模式不使用该字段选路 |
 | `check.bandwidth.base_port` | 第一条 server 监听端口，后续流递增 |
 | `check.bandwidth.parallel` | 启用无端口冲突的分批并发 |
+| `check.bandwidth.mmap_device` | 非空时使用 XDR mmap memory backend；向导可在 host memory 与 XDR mmap 间切换 |
+| `check.bandwidth.report_gbits` | 启用 `--report_gbits`；加载配置时固定为 true |
 | `check.bandwidth.min_gbits` | `"auto"` 时探测两端最大支持速率并按木桶效应逐流计算 70% 下限；`0` 不限制；正数使用固定 `BW average[Gb/sec]` 门槛 |
 
 临时使用 4 个 QP：
@@ -1628,14 +1682,22 @@ bundle 配置示例：
   "work_root": "/tmp/envinit-xccl-check",
   "xpu_home": "/usr/local/xpu",
   "test": "all_reduce",
-  "min_bytes": "1024",
-  "max_bytes": "256m",
+  "min_bytes": "1m",
+  "max_bytes": "2g",
   "step_factor": 2,
-  "warmup_iterations": 5,
+  "warmup_iterations": 0,
   "iterations": 20,
-  "data_type": "float",
+  "data_type": "fp16",
   "timeout": 120,
+  "layout": "full_ring",
+  "xpu_ordering": "auto",
+  "machine_class": "",
+  "ranks": 0,
+  "split_step": 8,
+  "split_operation": 0,
+  "evaluation_mode": "auto",
   "enable_xdr": true,
+  "validate_topology": true,
   "supernode": false,
   "socket_interface": "",
   "min_bus_bandwidth_gbs": 0,
@@ -1653,29 +1715,36 @@ bundle 配置示例：
 | `work_root` | `/tmp/envinit-xccl-check` | 每轮远端临时目录的父目录；必须是 `/tmp` 或 `/var/tmp` 下的专用绝对路径 |
 | `xpu_home` | `/usr/local/xpu` | XRE/XPU 用户态安装根目录，必须是绝对路径 |
 | `test` | `all_reduce` | 支持 `all_reduce`、`all_gather`、`all_to_all`、`broadcast`、`reduce`、`reduce_scatter`、`sendrecv` |
-| `min_bytes` / `max_bytes` | `1024` / `256m` | 传给 `systest/xccl_perf` 的 `-b/-e` 消息范围；默认覆盖交付测试用例的完整消息曲线 |
+| `min_bytes` / `max_bytes` | `1m` / `2g` | 传给 `systest/xccl_perf` 的 `-b/-e` 多机消息范围 |
 | `step_factor` | `2` | 消息大小步进因子 `-f` |
-| `warmup_iterations` | `5` | 预热次数 `-w`，可为 0 |
+| `warmup_iterations` | `0` | 预热次数；0 不传 `-w`，正数才追加 `-w` |
 | `iterations` | `20` | 正式迭代次数 `-n`，必须为正数 |
-| `data_type` | `float` | XCCL perf 数据类型 `-d` |
+| `data_type` | `fp16` | XCCL perf 数据类型 `-d` |
 | `timeout` | `120` | `BKCL_TIMEOUT` 秒数 |
+| `layout` | `full_ring` | `full_ring` 为多机大环全卡；`same_index` 为多机 8 路同号卡并追加 split 参数 |
+| `xpu_ordering` | `auto` | `auto` 在 `full_ring` 先检查各主机的物理 XPU rail 顺序：已经一致时保持 `physical`，不一致时才执行 `rail_aligned`；在 `same_index` 固定为 `physical`。也可显式固定其中一种。`rail_aligned` 按首台机器的 RDMA rail 顺序重排逻辑 XPU/rank，`physical` 固定物理 XPU 0..N-1 顺序 |
+| `machine_class` | `auto` | 大环全卡自动判定时逐台执行 `xpu-smi -q`，复用 Apply/XRE 的 P800 VC/VD Part Number 规则；混合机型按木桶原则选择 VC 基准。也可显式指定 `vc` 或 `vd` |
+| `ranks` | `0` | MPI `-np`；0 按每台机器实际发现的 XPU 数量求和。正数为人工覆盖，会尽量均匀分配到所有参测主机；少于主机数会拒绝，`same_index` 还要求可被主机数整除 |
+| `split_step` / `split_operation` | `8` / `0` | `same_index` 模式的 `--split_step` / `--split_op` |
+| `evaluation_mode` | `auto` | `auto` 使用当前已定义的 `all_reduce` 交付标准；其他 collective 必须选 `manual` 或 `disabled`，避免误套阈值。单机固定显示并执行为 `disabled` |
 | `enable_xdr` | `true` | 是否注入 `BKCL_ENABLE_XDR=1` |
+| `validate_topology` | `true` | 是否校验跨主机 XPU 数量、XPU/NIC 共享结构、链路等级和 RDMA 网段顺序；关闭后仍保留本机拓扑解析、物料和参数等基础校验 |
 | `supernode` | `false` | 是否额外设置 switch topology/RDMA verbs/tree threshold 变量 |
-| `socket_interface` | 自动 | `BKCL_SOCKET_IFNAME`；为空时按管理 IP 查找承载接口 |
-| `min_bus_bandwidth_gbs` | `0` | 倒数第二个消息档位的最低 in-place `busbw`，单位 `GB/s`；0 只记录，只有一个档位时使用该档位 |
-| `environment` | `{}` | 追加没有专用字段的环境变量；不能覆盖 envinit 管理的 PATH、XPU、BKCL 拓扑变量 |
+| `socket_interface` | 自动 | `BKCL_SOCKET_IFNAME`；为空时使用每台机器第一张参与测试的 RDMA 接口 |
+| `min_bus_bandwidth_gbs` | `0` | 仅 `evaluation_mode=manual` 使用的倒数第二档 in-place `busbw` 绝对下限 |
+| `environment` | profile 默认表 | 调整当前 XCCL 测试的 BKCL/BCCL 可调环境变量；profile 模板显式列出多机脚本默认值。PATH、XPU 可见卡、RDMA NIC 顺序、socket interface 等按节点动态生成的变量不能覆盖 |
 
-Ubuntu 和 Kylin 必须使用各自 profile 中的 MPICH 包，不能混用。XCCL 原包可以共用。工具使用统一入口 `systest/xccl_perf`，将 bundle 的 `all_reduce`、`all_gather`、`reduce_scatter`、`all_to_all` 分别转换为程序要求的 `allReduce`、`allGather`、`reduceScatter`、`alltoall`，并固定传入 `-x 1`，即每个 MPI rank 使用一张 XPU。`min_bus_bandwidth_gbs` 的单位是 `GB/s`；设置为 `0` 时只记录结果，设置为正数时按照交付用例取倒数第二个消息档位的 in-place `busbw(GB/s)` 判定 PASS/FAIL；只有一个消息档位时使用该唯一档位。
+Ubuntu 和 Kylin 必须使用各自 profile 中的 MPICH 包，不能混用。XCCL 原包可以共用。工具使用统一入口 `systest/xccl_perf`，固定传入 `-x 1`，即每个 MPI rank 使用一张 XPU。`ranks=0` 时 `-np` 等于所有参测机器实际发现的 XPU 数量之和；人工指定时会显示 `source=manual`，并均匀裁剪每台机器的可见 XPU/hostfile slot。`full_ring` 执行大环全卡命令；`same_index` 额外追加 `--split_mode --split_step 8 --split_op 0`。`all_reduce` 自动判定统一取倒数第二个消息档位的 in-place `busbw`：VC 大环按 `busbw/100 > 60%`，VD 大环按 `busbw/150 > 60%`，同号卡按 `busbw/200 > 90%`；其他 collective 没有交付基准时必须人工给阈值或关闭判定。大环自动判定会逐台记录 VC/VD 识别结果，任意一台为 VC 时整组降级使用 VC 基准。默认的跨主机校验比较语义拓扑，不要求各主机使用相同的 Linux 网卡名或 `BKCL_SOCKET_IFNAME`；如需强制试跑，可关闭 `validate_topology`，但本机映射、运行物料及参数校验仍保留。
 
-以单机 8 卡、默认参数为例，最终核心命令等价于：
+以两台 8 卡机器、自动 rank、默认大环参数为例，最终核心命令等价于：
 
 ```bash
-mpirun -np 8 systest/xccl_perf \
-  -O allReduce -x 1 -b 1024 -e 256m -f 2 \
-  -w 5 -n 20 -c 0 -d float
+mpirun -np 16 -f hosts systest/xccl_perf \
+  -O allReduce -x 1 -b 1m -e 2g -f 2 \
+  -n 20 -c 0 -d fp16
 ```
 
-envinit 实际使用随包交付的 `mpiexec.hydra`，单机增加本地 `fork` launcher，多机增加临时 hostfile 和 SSH launcher；测试程序及参数语义与上述交付用例一致。mpiexec 会显式使用 `-wdir <本轮临时目录>`，该目录已在所有目标机创建，避免 Hydra 把协调机当前目录传播到其他机器后因路径不存在而在创建远端 rank 前失败。XCCL 自带文档定义 `-c 0` 为性能模式、`-c 1` 为精度模式，因此 bandwidth 判定固定使用 `-c 0`，避免把精度校验开销计入通信耗时。精度检查后续应作为独立测试执行，不能用其带宽结果评价性能。
+envinit 实际使用随包交付的 `mpiexec.hydra`。setup TUI 只选择一台机器时，Checks 页只保留 XCCL，参数页明确显示 `execution scope=single_host` 和 `evaluation mode=disabled`；运行使用本地 `fork` launcher，不创建 hostfile、临时 SSH mesh，也不注入多机脚本专用环境。选择多台时参数页显示 `execution scope=multi_host`，并增加 layout、ordering、machine class、split 和跨主机校验选项。独立的 Environment 页列出本轮公共变量以及待拓扑发现后逐机解析的变量，Review 页给出环境变量数量，运行后的 Raw Logs 则逐台打印最终实际值。mpiexec 会显式使用 `-wdir <本轮临时目录>`，该目录已在所有目标机创建，避免 Hydra 把协调机当前目录传播到其他机器后因路径不存在而在创建远端 rank 前失败。XCCL 自带文档定义 `-c 0` 为性能模式、`-c 1` 为精度模式，因此 bandwidth 判定固定使用 `-c 0`，避免把精度校验开销计入通信耗时。精度检查后续应作为独立测试执行，不能用其带宽结果评价性能。
 
 当前交付物料为 MPICH `5.0.1` 和 XCCL `3.2.2.0`。MPICH 使用 `ch3:sock + Hydra`、共享库模式构建，安装前缀固定为 `/var/lib/envinit/check-runtime/mpich-5.0.1`，并随包提供 XCCL 原版 perf 所需的 `libmpi.so.0` 兼容链接。两个 profile 的构建入口分别是：
 
@@ -1688,13 +1757,21 @@ envinit 实际使用随包交付的 `mpiexec.hydra`，单机增加本地 `fork` 
 
 #### 8.6.3 拓扑、进程数量和一致性校验
 
-工具会在每台机器执行只读的 `xpu-smi topo -m`，并从 inventory 的 `rdmaN_name` 解析该机真实 `mlx5_N`。拓扑解析同时支持 `NIC0... + NIC Legend` 和现场常见的直接 `mlx5_0...` 列名格式。每个 XPU 只选择 inventory 参测网卡中距离最近的一张，优先级为 `PIX -> PXB -> PHB -> NODE -> SYS`。由此自动生成：
+工具会在每台机器执行只读的 `xpu-smi topo -m`，并从 inventory 的 `rdmaN_name` 解析该机真实 RDMA device。拓扑解析同时支持 `NIC0... + NIC Legend`、直接 `mlx5_0...` 列名，以及 `hns_0`、`bnxt_re1`、`irdma2` 等带数字的通用 RDMA device 名。XPU/NIC 选择使用全局最优分配，优先级为 `PIX -> PXB -> PHB -> NODE -> SYS`，先保证整机链路等级最优，再平衡同等级候选的负载；因此不会因为先处理一个选择较多的 XPU，而迫使后续受限 XPU 从 PIX 退化到 SYS。8 张 XPU 配 8 张等价 PIX RoCE 网卡时会形成一对一映射。由此自动生成：
 
-- 每台机器的 XPU 数量，也就是该机 MPI slot 数；两台 8 卡机器最终使用 16 个 rank。
+本节给出运行时行为摘要；算法的输入、匈牙利全局分配、共享 NIC、rail 身份、跨主机置换和完整失败边界见 [`docs/xccl-topology-rail-matching.md`](docs/xccl-topology-rail-matching.md)。
+
+- 每台机器的 XPU 数量，也就是该机 MPI slot 数；`ranks=0` 时两台 8 卡机器自动使用 16 个 rank，正数可人工覆盖 `-np`。
 - `BKCL_FORCE_RDMA_NICS_ORDER`：严格按 XPU0、XPU1……排列，四张网卡对应八张 XPU 时网卡名会按拓扑重复。
 - `BKCL_RDMA_NICS`：同样按 XPU0、XPU1……生成完整映射，作为兼容旧版 XCCL 的回退值；新版优先使用 `BKCL_FORCE_RDMA_NICS_ORDER`。
 
-每台机器都有独立的 rank wrapper，因此各机 `mlx5_N` 编号可以不同；但 XCCL 要求每台机器的 XPU 数量、RDMA 接口名及其 XPU 顺序、`BKCL_SOCKET_IFNAME` 一致，工具会在起流前逐项校验，不一致时直接报错。正常情况下 `apply` 会把项目内接口名固化为相同命名。某个 XPU 没有 PIX 路径、只能选择更远网卡时会打印 `WARN xccl topology degraded`，避免把受 PCIe/NUMA 限制的结果误判为正常 RoCE 性能。
+多机大环且 ordering 为 `auto` 或 `rail_aligned` 时，以第一台机器的 rail 顺序为基准，对其余机器的物理 XPU 顺序求等价置换。若求出的置换仍是 `0,1,...`，实际执行保持 `physical`；只有置换非恒等时，结果详情才显示 `rail_aligned`。例如第二台机器的物理 rail 顺序为 `13,14,11,12,17,18,15,16` 时，会同时生成 `XPU_VISIBLE_DEVICES=2,3,0,1,6,7,4,5` 和 `CUDA_VISIBLE_DEVICES=2,3,0,1,6,7,4,5`，使逻辑 rank rail 顺序对齐为 `11,12,13,14,15,16,17,18`。昆仑芯运行时优先读取 `XPU_VISIBLE_DEVICES`，CUDA 兼容变量保持相同值；每张物理 XPU 仍使用自己对应的 PIX 网卡。`same_index + auto` 固定物理编号；如确需让同号模式也按 rail 重排，可显式选择 `rail_aligned`。
+
+Setup 和 Review 页只描述尚未执行拓扑发现的策略：`auto (physical first; rail fallback)`。运行完成后，结果详情分别显示 `Requested ordering`、`Resolved ordering` 和 `Ordering reason`；因此 rail 本来一致的机器会明确显示 `Resolved ordering: physical`，不会再把一次恒等对齐误报为发生了重排。
+
+Raw Logs 中的拓扑摘要会分别显示 `unique_rdma_nics(N)`（实际使用且去重后的物理参测网卡）以及 `rdma_nics(N)`、`force_order(N)`（按每张 XPU 展开的实际环境变量顺序），并显示每台机器最终的 `xpu_order`，避免混淆物理网卡数量、XPU映射项数和逻辑 rank 顺序。
+
+每台机器都有独立的 rank wrapper，因此 Linux 接口名、RDMA device 编号和 `BKCL_SOCKET_IFNAME` 可以不同。默认跨主机校验比较 XPU 数量、XPU/NIC 共享结构、链路等级和 RDMA rail 顺序，不再比较本地命名。rail 身份优先使用 inventory 中非空的 `rdmaN_rail_id`，否则按网段自动推导；同机多张物理 HCA 位于同一网段时视为共享 fabric，保留 PIX 优先的拓扑分配和 inventory 物理顺序，并在 Raw Logs 中提示，不再要求为日常交付补填 rail ID。只有已知隔离 rail 无法由网段区分时，才按 6.3 节在所有参测机器上填写一致的显式 ID。可通过 `validate_topology=false` 强制试跑。某个 XPU 没有 PIX 路径、只能选择更远网卡时会打印 `WARN xccl topology degraded`，避免把受 PCIe/NUMA 限制的结果误判为正常 RoCE 性能。
 
 #### 8.6.4 mpirun 前设置的环境变量
 
@@ -1706,14 +1783,16 @@ envinit 实际使用随包交付的 `mpiexec.hydra`，单机增加本地 `fork` 
 | `PATH` | 自动加入 MPICH `bin` 和 `${XPU_HOME}/bin` |
 | `LD_LIBRARY_PATH` | 自动加入 XCCL `so`、MPICH `lib`、`${XPU_HOME}/so`、`lib`、`lib64` 以及 Ubuntu/Kylin 系统库目录 |
 | `BKCL_TIMEOUT` | 来自 `timeout`，默认 120 秒 |
-| `BKCL_SOCKET_IFNAME` | `socket_interface` 非空时使用指定值；为空时根据每台机器的管理 IP 自动发现承载接口 |
+| `BKCL_SOCKET_IFNAME` | `socket_interface` 非空时使用指定值；为空时使用本机第一张参与测试的 RDMA 接口 |
 | `BKCL_RDMA_NICS` | 根据 inventory 和真实拓扑按 XPU 顺序自动生成，作为兼容回退 |
 | `BKCL_FORCE_RDMA_NICS_ORDER` | 根据每个 XPU 的最近网卡自动生成，一项对应一个 XPU |
 | `BKCL_ENABLE_XDR` | `enable_xdr=true` 时设置为 `1`，让数据直接走 XPU/RDMA 路径 |
-| `BKCL_SWITCH_TOPO`、`BKCL_RDMA_VERBS`、`BKCL_TREE_THRESHOLD` | 仅 `supernode=true` 时分别设置为 `1`、`1`、`0` |
-| `environment` | 追加项目需要的变量，例如 `BKCL_DEBUG=1`、`BKCL_FORCE_L3_RDMA=1` |
+| 多机大环环境 | 自动设置 `BKCL_USE_AR=1`、ring/flat-ring、XLink、RDMA/XDR copy、buffer、BCCL hang trace 等交付脚本变量；`BKCL_TREE_THRESHOLD=1` |
+| `XPU_VISIBLE_DEVICES`、`CUDA_VISIBLE_DEVICES` | 两者始终设置为相同值；`physical` 使用 `0,1,...`，`rail_aligned` 按每台机器相对基准节点的 rail 对齐结果生成物理 XPU 置换。昆仑芯运行时优先使用前者，后者用于兼容现有脚本和运行时 |
+| `BKCL_SWITCH_TOPO`、`BKCL_RDMA_VERBS` | `supernode=true` 时额外设置为 `1` |
+| `environment` | 追加或覆盖可调的 BKCL/BCCL 项目变量；不能覆盖运行路径、XPU 可见卡、XPU/RDMA 映射等动态变量 |
 
-表中已有专用字段或由工具自动生成的变量均受保护，不能在 `environment` 中重复覆盖；`environment` 只用于追加没有专用字段的项目变量，例如 `BKCL_DEBUG` 和 `BKCL_FORCE_L3_RDMA`。wrapper 会先清除可能从远端登录环境残留的可选 BKCL 变量，再按 bundle 重建，并清除 `XPU_VISIBLE_DEVICES`/`CUDA_VISIBLE_DEVICES`；XCCL perf 采用一个 MPI rank 对应一张 XPU，由 MPI local rank 完成设备选择。
+PATH、XPU 可见卡、RDMA NIC 顺序、socket interface 等按运行时或每台机器拓扑生成的变量受保护，需通过专用字段或 inventory 调整。其余 BKCL/BCCL 参数可以直接在 `environment` 中覆盖 profile 默认值；wrapper 会先清除远端登录环境中可能残留的可选变量，再按测试布局、bundle override 和该节点 rail 结果重建。setup 的 Environment 页显示预览，Raw Logs 以 `ENV xccl <host> KEY=value` 记录每台机器最终值。XCCL perf 仍采用一个 MPI rank 对应一张 XPU。
 
 #### 8.6.5 临时 SSH、运行时分发与清理
 
@@ -1748,7 +1827,7 @@ EVAL  SIZE(B)    COUNT     TYPE   OP   MODE          TIME(us)  ALGBW(GB/s)  BUSB
       268435456  67108864  float  sum  in-place      4205.00   63.83        111.70
 ```
 
-`systest/xccl_perf` 同时输出 out-of-place 和 in-place 两组数据；交互终端的 Results 页不再显示额外的 `SUMMARY` 行，只保留 `STATUS/EVAL/MODE/SIZE/TYPE/OP/TIME/ALGBW/BUSBW` 性能结果，并按 `OUT-OF-PLACE` 全部档位、`IN-PLACE` 全部档位分组展示，不把同一 size 的两种模式交错排列。收到性能行后在原位置填入 time、algbw 和 busbw；按 `Space` 可在详情中查看 test、hosts、ranks、topology 和带宽门槛，按 `p` 可在表格与折线图模式间切换，折线图模式分别绘制 AlgBW、BusBW，按 `m` 切换 out-of-place/in-place，按 `Left/Right` 移动数据点并查看对应 message size 和精确带宽值。最终判定完成时，被选中的 size 行更新为 `PASS/FAIL/WARN`，并用 `EVAL=*` 标出门槛采用行。准备、分发或 mpirun 在产生性能数据前失败时，Results 页会追加一条独立 `FAIL` 错误行，完整错误保留在详情和 Raw Logs。envinit 同时保留完整 stdout，并把结果整理到 `XCCL size result details`，方便比较完整性能曲线；非交互输出仍在命令结束后打印原始输出和汇总。交付判定按照 SOP 读取倒数第二个消息档位的 in-place 数据，并在汇总中明确显示 `MODE=in-place`。默认 `1024 -> 256m`、步进 2 时判定档位是 `128m`；只有一个消息档位时使用该唯一档位。如果任一 XPU 只能使用非 PIX 网卡，最终采用行会显示 `STATUS=WARN`，详情及非交互汇总会显示 `TOPOLOGY=DEGRADED`，并额外打印 PCIe/NUMA 限速提示；如果同时低于配置的带宽门槛则仍显示 `FAIL`。性能阶段会明确输出 `validation: disabled (-c 0 performance mode)`，原始表格中的 `#wrong`/`Out of bounds` 不作为精度通过依据。
+`systest/xccl_perf` 同时输出 out-of-place 和 in-place 两组数据；交互终端的 Results 页使用 `STATUS/EVAL/LAYOUT/MODE/SIZE/TYPE/OP/TIME/ALGBW/BUSBW`，并按 `OUT-OF-PLACE`、`IN-PLACE` 分组展示。收到性能行后在原位置填入 time、algbw 和 busbw；按 `Space` 可查看 layout、ranks 的 auto/manual 来源、topology、基准、利用率和门槛，按 `p` 可在表格与折线图间切换，按 `m` 切换 out-of-place/in-place，按 `Left/Right` 查看数据点。最终采用倒数第二个消息档位的 in-place 行并更新为 `PASS/FAIL/WARN`，用 `EVAL=*` 标出；只有一个消息档位时使用该唯一档位。默认 `1m -> 2g`、步进 2 时判定档位是 `1g`。VC/VD 大环及同号卡分别执行前述自动利用率标准，`manual` 执行绝对 busbw 下限，`disabled` 只记录。如果任一 XPU 只能使用非 PIX 网卡，带宽达标时最终显示 `WARN`；带宽未达标仍显示 `FAIL`。性能阶段会明确输出 `accuracy check: disabled (-c 0 performance mode)`，原始表格中的 `#wrong`/`Out of bounds` 不作为精度通过依据。
 
 ### 8.7 汇总结果、计数器和退出状态
 
@@ -1870,6 +1949,29 @@ sudo ./env_init apply --inventory planning/inventory.csv --bundle planning/bundl
 先看报错对象在 AList 目录列表中的大小。若它是零字节、无 SHA256，而且本地正式 profile 中不存在，通常是历史软链接、目录占位或已删除对象留下的 AList/COS 残留。新版 downloader 会打印 WARNING 并跳过这种不可下载的空条目；仍应在存储侧删除残留并刷新 AList 缓存。
 
 如果对象大小非零或带有 SHA256，downloader 会保持失败，因为这表示正式物料缺失，不能通过跳过来掩盖。此时应恢复 COS 对象或修正 AList profile 内容，再使用原输出目录重跑；已经校验成功的文件不会重复下载。
+
+### 9.11 二次 Apply 改回网卡名时出现 `File exists`
+
+典型场景是第一次 Apply 已把网卡改成统一名称，之后修改 inventory 又希望改回原名称。Linux 可能把旧的 predictable name 保留为同一接口的 `altname`，旧版在第二阶段执行 `ip link set <temp> name <target>` 时会返回：
+
+```text
+RTNETLINK answers: File exists
+```
+
+新版会在改名前检查目标主名称占用，并删除同一接口上与目标名冲突的 `altname`。如果两阶段改名中途失败，会自动恢复已移动接口的原名称和原始 `UP` 状态。错误末尾出现 `original interface names were restored` 表示回滚完整；出现 `automatic rename rollback was incomplete` 时不要继续盲目重跑 Apply，应立即按 MAC 检查当前主名称、IP、udev 规则和持久化网络配置，先恢复一致状态。
+
+排查时至少保留：
+
+```bash
+ip -br link
+ip -d link show
+for p in /sys/class/net/*; do
+  [ -r "$p/address" ] || continue
+  printf '%s %s\n' "$(basename "$p")" "$(cat "$p/address")"
+done
+```
+
+不要仅凭 `show_gids` 中的顺序判断改名是否正确；应以 MAC、当前主名称、规划 IP、udev 规则和 netplan/NetworkManager 配置共同确认。
 
 ## 10. 编译可执行文件
 

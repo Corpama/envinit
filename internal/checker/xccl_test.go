@@ -21,10 +21,10 @@ func TestXCCLPlanUsesPerXPUTopologyOrder(t *testing.T) {
 	target := Target{
 		Name: "node-a",
 		RDMA: []spec.RDMARecord{
-			{Name: "ens11np0"},
-			{Name: "ens13np0"},
-			{Name: "ens15np0"},
-			{Name: "ens17np0"},
+			{Name: "ens11np0", IP: "10.61.11.27", Prefix: "24"},
+			{Name: "ens13np0", IP: "10.61.13.27", Prefix: "24"},
+			{Name: "ens15np0", IP: "10.61.15.27", Prefix: "24"},
+			{Name: "ens17np0", IP: "10.61.17.27", Prefix: "24"},
 		},
 	}
 	groups := []spec.CheckRDMAGroup{
@@ -44,9 +44,118 @@ func TestXCCLPlanUsesPerXPUTopologyOrder(t *testing.T) {
 	if plan.XPUCount != 8 {
 		t.Fatalf("unexpected XPU count: %d", plan.XPUCount)
 	}
+	wantRails := []string{"10.61.11.0/24", "10.61.11.0/24", "10.61.13.0/24", "10.61.13.0/24", "10.61.15.0/24", "10.61.15.0/24", "10.61.17.0/24", "10.61.17.0/24"}
+	if !reflect.DeepEqual(plan.RDMARailOrder, wantRails) {
+		t.Fatalf("unexpected XPU/RDMA rail order: got %#v want %#v", plan.RDMARailOrder, wantRails)
+	}
 	if !strings.Contains(strings.Join(plan.Mapping, ","), "XPU7=ens17np0(mlx5_4,PIX)") {
 		t.Fatalf("unexpected mapping: %#v", plan.Mapping)
 	}
+}
+
+func TestXCCLPlanUsesAllEightEqualPIXNICsAndAlignsRails(t *testing.T) {
+	topology := pairedEightNICXPUTopology()
+	groups := make([]spec.CheckRDMAGroup, 8)
+	for index := range groups {
+		groups[index].IBDevice = fmt.Sprintf("mlx5_%d", index)
+	}
+	targetA := Target{Name: "xpu-07"}
+	for rail := 11; rail <= 18; rail++ {
+		targetA.RDMA = append(targetA.RDMA, spec.RDMARecord{Name: fmt.Sprintf("ens%d", rail), IP: fmt.Sprintf("10.61.%d.27", rail), Prefix: "24"})
+	}
+	targetB := Target{Name: "xpu-23"}
+	for _, rail := range []int{13, 14, 11, 12, 17, 18, 15, 16} {
+		targetB.RDMA = append(targetB.RDMA, spec.RDMARecord{Name: fmt.Sprintf("ens%d", rail), IP: fmt.Sprintf("10.61.%d.43", rail), Prefix: "24"})
+	}
+	planA, err := xcclPlanFromTopology(spec.Bundle{}, targetA, groups, topology)
+	if err != nil {
+		t.Fatalf("plan xpu-07: %v", err)
+	}
+	planB, err := xcclPlanFromTopology(spec.Bundle{}, targetB, groups, topology)
+	if err != nil {
+		t.Fatalf("plan xpu-23: %v", err)
+	}
+	if len(planA.RDMANICs) != 8 || len(planB.RDMANICs) != 8 {
+		t.Fatalf("equal PIX candidates must be balanced across all eight NICs: A=%#v B=%#v", planA.RDMANICs, planB.RDMANICs)
+	}
+	plans := []xcclTargetPlan{planA, planB}
+	alignXCCLPlansByRail(plans)
+	wantXPUOrder := []int{2, 3, 0, 1, 6, 7, 4, 5}
+	if !reflect.DeepEqual(plans[1].XPUOrder, wantXPUOrder) {
+		t.Fatalf("xpu-23 aligned physical XPU order: got %#v want %#v", plans[1].XPUOrder, wantXPUOrder)
+	}
+	if !reflect.DeepEqual(plans[1].RDMARailOrder, plans[0].RDMARailOrder) {
+		t.Fatalf("aligned rail orders differ: A=%#v B=%#v", plans[0].RDMARailOrder, plans[1].RDMARailOrder)
+	}
+	wantNICOrder := []string{"ens11", "ens12", "ens13", "ens14", "ens15", "ens16", "ens17", "ens18"}
+	if !reflect.DeepEqual(plans[1].RDMANICOrder, wantNICOrder) {
+		t.Fatalf("xpu-23 aligned NIC order: got %#v want %#v", plans[1].RDMANICOrder, wantNICOrder)
+	}
+	if got := xcclPlanVisibleDevices(plans[1]); got != "2,3,0,1,6,7,4,5" {
+		t.Fatalf("xpu-23 CUDA_VISIBLE_DEVICES order = %q", got)
+	}
+	if err := validateXCCLPlanConsistency(plans); err != nil {
+		t.Fatalf("rail-aligned isomorphic plans should validate: %v", err)
+	}
+}
+
+func TestXCCLResolvedOrderingDisplayReportsActualPermutation(t *testing.T) {
+	cfg := spec.CheckXCCLConfig{Layout: "full_ring", XPUOrdering: "auto"}
+	physicalPlans := []xcclTargetPlan{
+		{Target: Target{Name: "node-a"}, XPUCount: 4, XPUOrder: []int{0, 1, 2, 3}},
+		{Target: Target{Name: "node-b"}, XPUCount: 4, XPUOrder: []int{0, 1, 2, 3}},
+	}
+	mode, reason := xcclResolvedOrderingDisplay(cfg, physicalPlans)
+	if mode != "physical" || !strings.Contains(reason, "already matches") {
+		t.Fatalf("identity alignment display = %q, %q", mode, reason)
+	}
+
+	reorderedPlans := append([]xcclTargetPlan(nil), physicalPlans...)
+	reorderedPlans[1].XPUOrder = []int{2, 3, 0, 1}
+	mode, reason = xcclResolvedOrderingDisplay(cfg, reorderedPlans)
+	if mode != "rail_aligned" || !strings.Contains(reason, "differs") {
+		t.Fatalf("reordered alignment display = %q, %q", mode, reason)
+	}
+}
+
+func TestXCCLGlobalAssignmentPreservesPIXForConstrainedXPU(t *testing.T) {
+	topology := xpuTopology{
+		NICDevices: map[string]string{"NIC0": "dev0", "NIC1": "dev1"},
+		Links: map[int]map[string]string{
+			0: {"NIC0": "PIX", "NIC1": "PIX"},
+			1: {"NIC0": "PIX", "NIC1": "SYS"},
+		},
+	}
+	candidates := []xcclNICCandidate{
+		{iface: "eth0", device: "dev0", nic: "NIC0"},
+		{iface: "eth1", device: "dev1", nic: "NIC1"},
+	}
+	assignments, err := assignXCCLCandidates(topology, []int{0, 1}, candidates)
+	if err != nil {
+		t.Fatalf("assign candidates: %v", err)
+	}
+	if want := []int{1, 0}; !reflect.DeepEqual(assignments, want) {
+		t.Fatalf("global assignment = %#v, want %#v", assignments, want)
+	}
+}
+
+func pairedEightNICXPUTopology() xpuTopology {
+	topology := xpuTopology{NICDevices: map[string]string{}, Links: map[int]map[string]string{}}
+	for nic := 0; nic < 8; nic++ {
+		topology.NICDevices[fmt.Sprintf("NIC%d", nic)] = fmt.Sprintf("mlx5_%d", nic)
+	}
+	for xpu := 0; xpu < 8; xpu++ {
+		topology.Links[xpu] = map[string]string{}
+		pairStart := xpu / 2 * 2
+		for nic := 0; nic < 8; nic++ {
+			link := "SYS"
+			if nic == pairStart || nic == pairStart+1 {
+				link = "PIX"
+			}
+			topology.Links[xpu][fmt.Sprintf("NIC%d", nic)] = link
+		}
+	}
+	return topology
 }
 
 func TestXCCLRankScriptExportsRuntimeAndTopologyEnvironment(t *testing.T) {
@@ -62,11 +171,12 @@ func TestXCCLRankScriptExportsRuntimeAndTopologyEnvironment(t *testing.T) {
 		},
 	}
 	plan := xcclTargetPlan{
+		XPUCount:        4,
 		RDMANICs:        []string{"ens11np0", "ens13np0"},
 		RDMANICOrder:    []string{"ens11np0", "ens11np0", "ens13np0", "ens13np0"},
 		SocketInterface: "bond0",
 	}
-	script := xcclRankScript(cfg, plan, "/tmp/envinit-xccl-check/run")
+	script := xcclRankScript(cfg, plan, "/tmp/envinit-xccl-check/run", true)
 	for _, want := range []string{
 		"unset XPU_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES",
 		"export XPU_HOME='/usr/local/xpu'",
@@ -78,7 +188,13 @@ func TestXCCLRankScriptExportsRuntimeAndTopologyEnvironment(t *testing.T) {
 		"BKCL_SOCKET_IFNAME='bond0'",
 		"BKCL_SWITCH_TOPO='1'",
 		"BKCL_RDMA_VERBS='1'",
-		"BKCL_TREE_THRESHOLD='0'",
+		"BKCL_TREE_THRESHOLD='1'",
+		"BKCL_USE_AR='1'",
+		"BKCL_FLAT_RING='1'",
+		"BKCL_USE_RDMA='1'",
+		"BKCL_USE_XDR_COPY='1'",
+		"CUDA_VISIBLE_DEVICES='0,1,2,3'",
+		"XPU_VISIBLE_DEVICES='0,1,2,3'",
 		"BKCL_DEBUG='1'",
 		"exec '/tmp/envinit-xccl-check/run/runtime/xccl_Linux_x86_64/systest/xccl_perf' \"$@\"",
 	} {
@@ -167,7 +283,7 @@ func TestXCCLMPIRunArgsUseSysTestInterface(t *testing.T) {
 	}
 	got := strings.Join(xcclMPIRunArgs(cfg, "/tmp/envinit-xccl-check/run", 8, false), " ")
 	for _, want := range []string{
-		"mpiexec.hydra -launcher fork -n 8",
+		"mpiexec.hydra -launcher fork -np 8",
 		"-wdir /tmp/envinit-xccl-check/run",
 		"run-rank.sh -O allReduce -x 1 -b 1024 -e 256m -f 2 -w 5 -n 20 -c 0 -d float",
 	} {
@@ -177,10 +293,224 @@ func TestXCCLMPIRunArgsUseSysTestInterface(t *testing.T) {
 	}
 }
 
+func TestXCCLMPIRunArgsAddSameIndexSplitMode(t *testing.T) {
+	cfg := spec.CheckXCCLConfig{
+		Test: "all_reduce", MinBytes: "1m", MaxBytes: "2g", StepFactor: 2,
+		Iterations: 20, DataType: "fp16", Layout: "same_index", SplitStep: 8, SplitOperation: 0,
+	}
+	got := strings.Join(xcclMPIRunArgs(cfg, "/tmp/envinit-xccl-check/run", 24, true), " ")
+	for _, want := range []string{
+		"-f /tmp/envinit-xccl-check/run/hosts -np 24",
+		"-d fp16 --split_mode --split_step 8 --split_op 0",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in same-index command:\n%s", want, got)
+		}
+	}
+}
+
+func TestResolveXCCLRanksAutoAndManual(t *testing.T) {
+	if got, source, err := resolveXCCLRanks(spec.CheckXCCLConfig{}, 24); err != nil || got != 24 || source != "auto" {
+		t.Fatalf("auto ranks = %d,%s,%v; want 24,auto,nil", got, source, err)
+	}
+	if got, source, err := resolveXCCLRanks(spec.CheckXCCLConfig{Ranks: 16}, 24); err != nil || got != 16 || source != "manual" {
+		t.Fatalf("manual ranks = %d,%s,%v; want 16,manual,nil", got, source, err)
+	}
+	if _, _, err := resolveXCCLRanks(spec.CheckXCCLConfig{Ranks: 25}, 24); err == nil || !strings.Contains(err.Error(), "exceeds 24 discovered XPUs") {
+		t.Fatalf("expected manual oversubscription error, got %v", err)
+	}
+}
+
+func TestXCCLAutomaticEvaluationRules(t *testing.T) {
+	tests := []struct {
+		name         string
+		cfg          spec.CheckXCCLConfig
+		bus          float64
+		wantStatus   string
+		wantBaseline float64
+		wantRequired float64
+	}{
+		{name: "vc full ring pass", cfg: spec.CheckXCCLConfig{Layout: "full_ring", MachineClass: "vc", EvaluationMode: "auto"}, bus: 60.01, wantStatus: "PASS", wantBaseline: 100, wantRequired: .60},
+		{name: "vc boundary fails", cfg: spec.CheckXCCLConfig{Layout: "full_ring", MachineClass: "vc", EvaluationMode: "auto"}, bus: 60, wantStatus: "FAIL", wantBaseline: 100, wantRequired: .60},
+		{name: "vd full ring pass", cfg: spec.CheckXCCLConfig{Layout: "full_ring", MachineClass: "vd", EvaluationMode: "auto"}, bus: 93.63, wantStatus: "PASS", wantBaseline: 150, wantRequired: .60},
+		{name: "same index pass", cfg: spec.CheckXCCLConfig{Layout: "same_index", EvaluationMode: "auto"}, bus: 182.39, wantStatus: "PASS", wantBaseline: 200, wantRequired: .90},
+		{name: "same index boundary fails", cfg: spec.CheckXCCLConfig{Layout: "same_index", EvaluationMode: "auto"}, bus: 180, wantStatus: "FAIL", wantBaseline: 200, wantRequired: .90},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			opts := Options{Bundle: spec.Bundle{Check: spec.CheckConfig{XCCL: test.cfg}}}
+			evaluation := evaluateXCCLResult(opts, nil, []xcclPerformanceRow{{SizeBytes: 1 << 30, Mode: "in-place", BusGBs: test.bus}})
+			if evaluation.Status != test.wantStatus || evaluation.BaselineGBs != test.wantBaseline || evaluation.RequiredUtilization != test.wantRequired {
+				t.Fatalf("evaluation = %#v", evaluation)
+			}
+		})
+	}
+}
+
+func TestEffectiveXCCLConfigSeparatesSingleAndMultiHostModes(t *testing.T) {
+	cfg := spec.CheckXCCLConfig{Layout: "full_ring", EvaluationMode: "auto", Test: "all_reduce"}
+	single := effectiveXCCLConfig(cfg, false)
+	if single.Layout != "single_host" || single.EvaluationMode != "disabled" {
+		t.Fatalf("single-host effective config = %#v", single)
+	}
+	multi := effectiveXCCLConfig(cfg, true)
+	if multi.Layout != "full_ring" || multi.EvaluationMode != "auto" {
+		t.Fatalf("multi-host effective config = %#v", multi)
+	}
+	if err := validateXCCLExecutionConfig(cfg, false); err != nil {
+		t.Fatalf("single-host execution must not require a multi-host machine class: %v", err)
+	}
+	if err := validateXCCLExecutionConfig(cfg, true); err == nil || !strings.Contains(err.Error(), "VC or VD") {
+		t.Fatalf("multi-host full-ring auto evaluation should require machine class, got %v", err)
+	}
+}
+
+func TestValidateXCCLExecutionConfigRejectsUndefinedAutomaticCollectiveBaseline(t *testing.T) {
+	cfg := spec.CheckXCCLConfig{Layout: "full_ring", EvaluationMode: "auto", MachineClass: "vc", Test: "all_to_all"}
+	err := validateXCCLExecutionConfig(cfg, true)
+	if err == nil || !strings.Contains(err.Error(), "only for all_reduce") {
+		t.Fatalf("expected fail-closed automatic evaluation error, got %v", err)
+	}
+	for _, mode := range []string{"manual", "disabled"} {
+		cfg.EvaluationMode = mode
+		if err := validateXCCLExecutionConfig(cfg, true); err != nil {
+			t.Fatalf("%s evaluation should permit all_to_all: %v", mode, err)
+		}
+	}
+}
+
+func TestResolveXCCLMachineClassUsesWeakestHost(t *testing.T) {
+	partNumbers := map[string]string{
+		"node-vd": "    XPU Part Number : B00100300110312\n",
+		"node-vc": "    XPU Part Number : B00100300110112\n",
+	}
+	var output bytes.Buffer
+	opts := Options{
+		Output: &output,
+		CommandRunner: func(_ spec.CheckConfig, target Target, command string) (string, error) {
+			if command != "xpu-smi -q" {
+				return "", fmt.Errorf("unexpected command: %s", command)
+			}
+			return partNumbers[target.Name], nil
+		},
+	}
+	cfg, err := resolveXCCLMachineClass(opts, spec.CheckXCCLConfig{Layout: "full_ring", EvaluationMode: "auto"}, []Target{{Name: "node-vd"}, {Name: "node-vc"}}, true)
+	if err != nil {
+		t.Fatalf("resolve machine class: %v", err)
+	}
+	if cfg.MachineClass != "vc" {
+		t.Fatalf("weakest-link machine class = %q, want vc", cfg.MachineClass)
+	}
+	for _, want := range []string{"node-vd detected=VD", "node-vc detected=VC", "machine class downgrade", "applying VC full-ring baseline"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("missing %q in machine classification log:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestResolveXCCLMachineClassKeepsAllVD(t *testing.T) {
+	var output bytes.Buffer
+	opts := Options{
+		Output: &output,
+		CommandRunner: func(_ spec.CheckConfig, _ Target, _ string) (string, error) {
+			return "XPU Part Number : B00100300110312\n", nil
+		},
+	}
+	cfg, err := resolveXCCLMachineClass(opts, spec.CheckXCCLConfig{Layout: "full_ring", EvaluationMode: "auto"}, []Target{{Name: "node-a"}, {Name: "node-b"}}, true)
+	if err != nil || cfg.MachineClass != "vd" {
+		t.Fatalf("all-VD machine class = %#v, err=%v", cfg, err)
+	}
+	if !strings.Contains(output.String(), "selected=VD source=auto weakest-link") {
+		t.Fatalf("missing automatic selection log:\n%s", output.String())
+	}
+}
+
+func TestLimitXCCLPlansBalancesManualRanksAcrossHosts(t *testing.T) {
+	makePlan := func(name string) xcclTargetPlan {
+		plan := xcclTargetPlan{Target: Target{Name: name, Address: name}, XPUCount: 8}
+		for index := 0; index < 8; index++ {
+			plan.XPUOrder = append(plan.XPUOrder, index)
+			plan.RDMANICOrder = append(plan.RDMANICOrder, fmt.Sprintf("eth%d", index))
+			plan.RDMADeviceOrder = append(plan.RDMADeviceOrder, fmt.Sprintf("dev%d", index))
+			plan.RDMALinkOrder = append(plan.RDMALinkOrder, "PIX")
+			plan.RDMARailOrder = append(plan.RDMARailOrder, fmt.Sprintf("rail%d", index))
+			plan.Mapping = append(plan.Mapping, fmt.Sprintf("XPU%d=eth%d", index, index))
+		}
+		return plan
+	}
+	plans, err := limitXCCLPlansForRanks(spec.CheckXCCLConfig{Layout: "full_ring"}, []xcclTargetPlan{makePlan("node-a"), makePlan("node-b")}, 8)
+	if err != nil {
+		t.Fatalf("limit ranks: %v", err)
+	}
+	if plans[0].XPUCount != 4 || plans[1].XPUCount != 4 || xcclHostFile(plans) != "node-a:4\nnode-b:4\n" {
+		t.Fatalf("manual ranks were not balanced: %#v hostfile=%q", plans, xcclHostFile(plans))
+	}
+	if got := xcclPlanVisibleDevices(plans[1]); got != "0,1,2,3" {
+		t.Fatalf("limited visible devices = %q", got)
+	}
+	if _, err := limitXCCLPlansForRanks(spec.CheckXCCLConfig{Layout: "same_index"}, []xcclTargetPlan{makePlan("node-a"), makePlan("node-b")}, 7); err == nil || !strings.Contains(err.Error(), "divisible") {
+		t.Fatalf("same-index uneven ranks should fail, got %v", err)
+	}
+	if _, err := limitXCCLPlansForRanks(spec.CheckXCCLConfig{Layout: "full_ring"}, []xcclTargetPlan{makePlan("node-a"), makePlan("node-b")}, 1); err == nil || !strings.Contains(err.Error(), "at least one rank per host") {
+		t.Fatalf("rank count below host count should fail, got %v", err)
+	}
+}
+
+func TestXCCLSharedSubnetUsesTopologyFallbackWithoutRequiringRailIDs(t *testing.T) {
+	plan := xcclTargetPlan{
+		Target:          Target{Name: "node-a"},
+		RDMADeviceOrder: []string{"dev0", "dev1"},
+		RDMARailOrder:   []string{"10.61.10.0/24", "10.61.10.0/24"},
+	}
+	warnings := xcclRailInferenceWarningsForPlan(plan)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "shared fabric") || !strings.Contains(warnings[0], "Leave rdmaN_rail_id empty") {
+		t.Fatalf("shared subnet fallback warning = %#v", warnings)
+	}
+	if err := validateXCCLPlanConsistency([]xcclTargetPlan{plan}); err != nil {
+		t.Fatalf("shared subnet must not require manual rail IDs: %v", err)
+	}
+
+	plan.RDMARailOrder = []string{"explicit:fabric-a-port-1", "explicit:fabric-a-port-2"}
+	if warnings := xcclRailInferenceWarningsForPlan(plan); len(warnings) != 0 {
+		t.Fatalf("explicit rail IDs should suppress inference warning: %#v", warnings)
+	}
+}
+
+func TestXCCLMissingRDMAIPUsesOptionalSlotFallback(t *testing.T) {
+	plan := xcclTargetPlan{Target: Target{Name: "node-a"}, RDMADeviceOrder: []string{"dev0"}, RDMARailOrder: []string{"slot:rdma1"}}
+	warnings := xcclRailInferenceWarningsForPlan(plan)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "optional") || !strings.Contains(warnings[0], "topology/inventory order") {
+		t.Fatalf("slot fallback warning = %#v", warnings)
+	}
+}
+
+func TestPrintXCCLRankEnvironmentsIncludesActualPerHostValues(t *testing.T) {
+	var output bytes.Buffer
+	cfg := spec.CheckXCCLConfig{XPUHome: "/usr/local/xpu", Timeout: 120, Environment: map[string]string{"CUSTOM_FLAG": "value"}}
+	plans := []xcclTargetPlan{{
+		Target: Target{Name: "node-a"}, XPUCount: 2, XPUOrder: []int{2, 3},
+		RDMANICOrder: []string{"eth1", "eth2"}, SocketInterface: "bond0",
+	}}
+	printXCCLRankEnvironments(Options{Output: &output}, cfg, plans, "/tmp/run", true)
+	for _, want := range []string{
+		"INFO xccl environment: host=node-a",
+		"ENV xccl node-a BKCL_RDMA_NICS=eth1,eth2",
+		"ENV xccl node-a BKCL_SOCKET_IFNAME=bond0",
+		"ENV xccl node-a CUDA_VISIBLE_DEVICES=2,3",
+		"ENV xccl node-a XPU_VISIBLE_DEVICES=2,3",
+		"ENV xccl node-a CUSTOM_FLAG=value",
+		"ENV xccl node-a LD_LIBRARY_PATH=/tmp/run/runtime/xccl_Linux_x86_64/so:",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("missing %q in environment log:\n%s", want, output.String())
+		}
+	}
+}
+
 func TestXCCLResultMarksDegradedTopologyAsWarning(t *testing.T) {
 	var output bytes.Buffer
 	opts := Options{
-		Bundle: spec.Bundle{Check: spec.CheckConfig{XCCL: spec.CheckXCCLConfig{Test: "all_reduce"}}},
+		Bundle: spec.Bundle{Check: spec.CheckConfig{XCCL: spec.CheckXCCLConfig{Test: "all_reduce", EvaluationMode: "disabled"}}},
 		Output: &output,
 	}
 	plans := []xcclTargetPlan{{
@@ -211,6 +541,7 @@ func TestRunXCCLDryRunDiscoversTopologyAndPrintsEnvironment(t *testing.T) {
 		Enabled:      true,
 		MPICHArchive: mpichArchive,
 		XCCLArchive:  xcclArchive,
+		MachineClass: "vc",
 	}}}
 	bundle.ApplyDefaults()
 	var output bytes.Buffer
@@ -245,11 +576,16 @@ func TestRunXCCLDryRunDiscoversTopologyAndPrintsEnvironment(t *testing.T) {
 	}
 	got := output.String()
 	for _, want := range []string{
-		"INFO xccl topology: node-a xpus=8 socket_iface=bond0",
-		"force_order=ens11np0,ens11np0,ens13np0,ens13np0,ens15np0,ens15np0,ens17np0,ens17np0",
+		"INFO xccl topology: node-a xpus=8 xpu_order=0,1,2,3,4,5,6,7 socket_iface=ens11np0",
+		"unique_rdma_nics(4)=ens11np0,ens13np0,ens15np0,ens17np0",
+		"rdma_nics(8)=ens11np0,ens11np0,ens13np0,ens13np0,ens15np0,ens15np0,ens17np0,ens17np0",
+		"force_order(8)=ens11np0,ens11np0,ens13np0,ens13np0,ens15np0,ens15np0,ens17np0,ens17np0",
 		"dry-run xccl copy node-a:",
 		"BKCL_ENABLE_XDR='1'",
-		"BKCL_SOCKET_IFNAME='bond0'",
+		"BKCL_SOCKET_IFNAME='ens11np0'",
+		"CUDA_VISIBLE_DEVICES='0,1,2,3,4,5,6,7'",
+		"XPU_VISIBLE_DEVICES='0,1,2,3,4,5,6,7'",
+		"INFO xccl ranks: np=16 source=auto discovered_xpus=16",
 		"mpiexec.hydra",
 		"ranks=16",
 		"remove only key marker envinit-xccl-dry-run",
@@ -273,6 +609,7 @@ func TestRunSingleHostXCCLDryRunUsesLocalLauncherWithoutSSHAuthorization(t *test
 		Enabled:      true,
 		MPICHArchive: mpichArchive,
 		XCCLArchive:  xcclArchive,
+		MachineClass: "vc",
 	}}}
 	bundle.ApplyDefaults()
 	var output bytes.Buffer
@@ -307,7 +644,7 @@ func TestRunSingleHostXCCLDryRunUsesLocalLauncherWithoutSSHAuthorization(t *test
 	}
 	got := output.String()
 	for _, want := range []string{
-		"INFO xccl topology: node-a xpus=8 socket_iface=bond0",
+		"INFO xccl topology: node-a xpus=8 xpu_order=0,1,2,3,4,5,6,7 socket_iface=ens11np0",
 		"local Hydra processes on node-a",
 		"authorized_keys will not be modified",
 		"'-launcher' 'fork'",
@@ -362,14 +699,35 @@ func TestXCCLDryRunIgnoresLegacyGroupCountAndResolvesActualDevices(t *testing.T)
 	}
 }
 
-func TestValidateXCCLPlanConsistencyRejectsDifferentPerHostMapping(t *testing.T) {
+func TestValidateXCCLPlanConsistencyAllowsDifferentLocalNames(t *testing.T) {
 	plans := []xcclTargetPlan{
-		{Target: Target{Name: "node-a"}, XPUCount: 2, RDMANICOrder: []string{"ens11np0", "ens11np0"}, SocketInterface: "bond0"},
-		{Target: Target{Name: "node-b"}, XPUCount: 2, RDMANICOrder: []string{"ens13np0", "ens13np0"}, SocketInterface: "bond0"},
+		{Target: Target{Name: "node-a"}, XPUCount: 2, RDMANICOrder: []string{"ens11np0", "ens11np0"}, RDMADeviceOrder: []string{"mlx5_0", "mlx5_0"}, RDMALinkOrder: []string{"PIX", "PIX"}, RDMARailOrder: []string{"10.61.11.0/24", "10.61.11.0/24"}, SocketInterface: "bond0"},
+		{Target: Target{Name: "node-b"}, XPUCount: 2, RDMANICOrder: []string{"rdma0", "rdma0"}, RDMADeviceOrder: []string{"mlx5_8", "mlx5_8"}, RDMALinkOrder: []string{"PIX", "PIX"}, RDMARailOrder: []string{"10.61.11.0/24", "10.61.11.0/24"}, SocketInterface: "eth0"},
+	}
+	if err := validateXCCLPlanConsistency(plans); err != nil {
+		t.Fatalf("local interface/device/socket names must not be compared across hosts: %v", err)
+	}
+}
+
+func TestValidateXCCLPlanConsistencyRejectsDifferentRailOrder(t *testing.T) {
+	plans := []xcclTargetPlan{
+		{Target: Target{Name: "node-a"}, XPUCount: 2, RDMADeviceOrder: []string{"mlx5_0", "mlx5_1"}, RDMALinkOrder: []string{"PIX", "PIX"}, RDMARailOrder: []string{"10.61.11.0/24", "10.61.13.0/24"}},
+		{Target: Target{Name: "node-b"}, XPUCount: 2, RDMADeviceOrder: []string{"mlx5_4", "mlx5_5"}, RDMALinkOrder: []string{"PIX", "PIX"}, RDMARailOrder: []string{"10.61.13.0/24", "10.61.11.0/24"}},
 	}
 	err := validateXCCLPlanConsistency(plans)
-	if err == nil || !strings.Contains(err.Error(), "same RDMA interface names") {
-		t.Fatalf("expected inconsistent XCCL mapping error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "rail order differs") {
+		t.Fatalf("expected semantic rail-order error, got %v", err)
+	}
+}
+
+func TestConfiguredXCCLPlanConsistencyCanBeDisabled(t *testing.T) {
+	disabled := false
+	plans := []xcclTargetPlan{
+		{Target: Target{Name: "node-a"}, XPUCount: 8},
+		{Target: Target{Name: "node-b"}, XPUCount: 4},
+	}
+	if err := validateConfiguredXCCLPlanConsistency(spec.CheckXCCLConfig{ValidateTopology: &disabled}, plans); err != nil {
+		t.Fatalf("disabled topology validation must allow a forced run: %v", err)
 	}
 }
 
@@ -396,11 +754,58 @@ func TestValidateXCCLConfigRejectsManagedEnvironmentOverride(t *testing.T) {
 		Iterations:   20,
 		Timeout:      120,
 		DataType:     "float",
+		MachineClass: "vc",
 		EnableXDR:    &enableXDR,
 		Environment:  map[string]string{"BKCL_RDMA_NICS": "wrong0"},
 	})
 	if err == nil || !strings.Contains(err.Error(), "managed by envinit") {
 		t.Fatalf("expected managed environment error, got %v", err)
+	}
+}
+
+func TestValidateXCCLConfigAllowsTunableBKCLOverrides(t *testing.T) {
+	tempDir := t.TempDir()
+	mpichArchive := filepath.Join(tempDir, "mpich.tar.gz")
+	xcclArchive := filepath.Join(tempDir, "xccl.tar.gz")
+	for _, path := range []string{mpichArchive, xcclArchive} {
+		if err := os.WriteFile(path, []byte("test"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := spec.CheckXCCLConfig{
+		MPICHArchive: mpichArchive, XCCLArchive: xcclArchive,
+		WorkRoot: "/tmp/envinit-xccl-check", XPUHome: "/usr/local/xpu",
+		Test: "all_reduce", MinBytes: "1m", MaxBytes: "2g", StepFactor: 2,
+		Iterations: 20, Timeout: 120, DataType: "fp16",
+		Environment: map[string]string{"BKCL_DEBUG": "1", "BKCL_FLAT_RING": "0", "BCCL_ERROR_FILE": "/tmp/bccl.%h.%p.log"},
+	}
+	if err := validateXCCLConfig(cfg); err != nil {
+		t.Fatalf("tunable BKCL environment override should validate: %v", err)
+	}
+	plan := xcclTargetPlan{RDMANICOrder: []string{"eth1"}}
+	env := xcclManagedRankEnvironment(cfg, plan, true)
+	if env["BKCL_DEBUG"] != "1" || env["BKCL_FLAT_RING"] != "0" || env["BCCL_ERROR_FILE"] != "/tmp/bccl.%h.%p.log" {
+		t.Fatalf("environment overrides were not applied last: %#v", env)
+	}
+}
+
+func TestSingleHostEnvironmentDoesNotInheritMultiHostScriptVariables(t *testing.T) {
+	cfg := spec.CheckXCCLConfig{
+		Timeout: 120,
+		Environment: map[string]string{
+			"BKCL_FLAT_RING": "0",
+			"BKCL_DEBUG":     "1",
+			"CUSTOM_FLAG":    "single-ok",
+		},
+	}
+	env := xcclManagedRankEnvironment(cfg, xcclTargetPlan{RDMANICOrder: []string{"eth1"}}, false)
+	for _, key := range []string{"BKCL_FLAT_RING", "BKCL_DEBUG"} {
+		if _, ok := env[key]; ok {
+			t.Fatalf("single-host environment unexpectedly contains multi-host variable %s: %#v", key, env)
+		}
+	}
+	if env["CUSTOM_FLAG"] != "single-ok" {
+		t.Fatalf("single-host custom environment was lost: %#v", env)
 	}
 }
 
@@ -426,7 +831,7 @@ func TestGeneratedXCCLShellIsPortableSyntax(t *testing.T) {
 	checkCfg := spec.CheckConfig{SSH: spec.CheckSSHConfig{User: "root", Options: []string{"-p", "22"}}}
 	workDir := "/tmp/envinit-xccl-check/run"
 	scripts := map[string]string{
-		"rank":           xcclRankScript(cfg, plan, workDir),
+		"rank":           xcclRankScript(cfg, plan, workDir, true),
 		"ssh-wrapper":    xcclSSHWrapper(checkCfg, workDir),
 		"install-multi":  xcclInstallRuntimeCommand(cfg, workDir, true),
 		"install-single": xcclInstallRuntimeCommand(cfg, workDir, false),

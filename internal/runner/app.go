@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"envinit/internal/spec"
+	"envinit/internal/xpuvariant"
 )
 
 const (
@@ -33,8 +34,8 @@ const (
 const (
 	xreCardModelP800 = "P800"
 	xreCardModelP900 = "P900"
-	p800PartNumberVC = "B00100300110112"
-	p800PartNumberVD = "B00100300110312"
+	p800PartNumberVC = xpuvariant.PartNumberVC
+	p800PartNumberVD = xpuvariant.PartNumberVD
 )
 
 var stageOrder = []string{

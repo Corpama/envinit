@@ -351,8 +351,8 @@ func TestParseXCCLSize(t *testing.T) {
 }
 
 func TestXCCLTUIUsesSelectedSizeRowForFinalThresholdEvaluation(t *testing.T) {
-	cfg := spec.CheckXCCLConfig{Test: "all_reduce_perf", DataType: "float32", MinBusBandwidthGBs: 60}
-	tracker := &xcclLiveTracker{cfg: cfg, hosts: []string{"node1", "node2"}, ranks: 16, topology: "PIX"}
+	cfg := spec.CheckXCCLConfig{Test: "all_reduce_perf", DataType: "float32", EvaluationMode: "manual", MinBusBandwidthGBs: 60}
+	tracker := &xcclLiveTracker{cfg: cfg, hosts: []string{"node1", "node2"}, orderingMode: "physical", orderingReason: "physical rail order already matches across hosts", ranks: 16, topology: "PIX"}
 	selected := xcclPerformanceRow{SizeBytes: 134217728, Count: 33554432, DataType: "float32", Operation: "sum", Mode: "in-place", TimeUS: 2200, AlgGBs: 58, BusGBs: 55}
 	evaluation := xcclEvaluation{Status: "FAIL", Selected: selected, Hosts: tracker.hosts, Topology: tracker.topology}
 
@@ -365,7 +365,7 @@ func TestXCCLTUIUsesSelectedSizeRowForFinalThresholdEvaluation(t *testing.T) {
 			t.Fatalf("selected XCCL result cells missing %q: %#v", want, selectedItem.Cells)
 		}
 	}
-	for _, want := range []string{"Test: all_reduce_perf", "Hosts: node1,node2", "Ranks: 16", "Topology: PIX", "Minimum bus bandwidth: 60.00 GB/s"} {
+	for _, want := range []string{"Test: all_reduce_perf", "Layout: full_ring", "Requested ordering: auto", "Resolved ordering: physical", "Ordering reason: physical rail order already matches across hosts", "Hosts: node1,node2", "Ranks: 16 (auto)", "Topology: PIX", "Evaluation: manual(>=60.00GB/s)"} {
 		if !strings.Contains(selectedItem.Detail, want) {
 			t.Fatalf("selected XCCL detail missing %q:\n%s", want, selectedItem.Detail)
 		}

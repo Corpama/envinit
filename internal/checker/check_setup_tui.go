@@ -2,6 +2,7 @@ package checker
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -43,6 +44,14 @@ type checkWizardModel struct {
 	accepted      bool
 	canceled      bool
 }
+
+const (
+	checkWizardPageHosts = iota
+	checkWizardPageChecks
+	checkWizardPageParameters
+	checkWizardPageEnvironment
+	checkWizardPageReview
+)
 
 func RunCheckWizard(records []spec.MachineRecord, bundle spec.Bundle, runPing, runBandwidth, runXCCL bool) (CheckWizardSelection, error) {
 	model := newCheckWizardModel(records, bundle, runPing, runBandwidth, runXCCL)
@@ -100,11 +109,15 @@ func (m checkWizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.canceled = true
 			return m, tea.Quit
 		case "esc", "b", "B":
-			if m.page == 0 {
+			if m.page == checkWizardPageHosts {
 				m.canceled = true
 				return m, tea.Quit
 			}
-			m.page--
+			if m.page == checkWizardPageReview && !m.runXCCL {
+				m.page = checkWizardPageParameters
+			} else {
+				m.page--
+			}
 			m.cursor = 0
 			m.notice = ""
 		case "up", "k":
@@ -118,18 +131,18 @@ func (m checkWizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "right", "l":
 			m.adjustCurrent(1)
 		case "a", "A":
-			if m.page == 0 {
+			if m.page == checkWizardPageHosts {
 				all := m.selectedHostCount() != len(m.selectedHosts)
 				for index := range m.selectedHosts {
 					m.selectedHosts[index] = all
 				}
 			}
 		case "e", "E":
-			if m.page == 2 && m.currentParamEditable() {
+			if m.page == checkWizardPageParameters && m.currentParamEditable() {
 				m.startEditor()
 			}
 		case "enter":
-			if m.page == 3 {
+			if m.page == checkWizardPageReview {
 				if err := m.validate(); err != nil {
 					m.notice = err.Error()
 					break
@@ -141,7 +154,14 @@ func (m checkWizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.notice = err.Error()
 				break
 			}
-			m.page++
+			if m.page == checkWizardPageHosts {
+				m.applySelectedHostScope()
+			}
+			if m.page == checkWizardPageParameters && !m.runXCCL {
+				m.page = checkWizardPageReview
+			} else {
+				m.page++
+			}
 			m.cursor = 0
 			m.notice = ""
 		}
@@ -180,7 +200,7 @@ func (m checkWizardModel) updateEditor(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m checkWizardModel) View() string {
 	width := maxIntMain(40, m.width)
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render("envinit check setup")
-	steps := []string{"1 Hosts", "2 Checks", "3 Parameters", "4 Review"}
+	steps := []string{"1 Hosts", "2 Checks", "3 Parameters", "4 Environment", "5 Review"}
 	for index := range steps {
 		if index == m.page {
 			steps[index] = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("45")).Render("[" + steps[index] + "]")
@@ -188,21 +208,25 @@ func (m checkWizardModel) View() string {
 	}
 	var body string
 	switch m.page {
-	case 0:
+	case checkWizardPageHosts:
 		body = m.renderHosts(width)
-	case 1:
+	case checkWizardPageChecks:
 		body = m.renderChecks(width)
-	case 2:
+	case checkWizardPageParameters:
 		body = m.renderParameters(width)
+	case checkWizardPageEnvironment:
+		body = m.renderEnvironment(width)
 	default:
 		body = m.renderReview(width)
 	}
 	footer := "Up/Down select | Space toggle | Enter continue | b back | q exit"
-	if m.page == 0 {
+	if m.page == checkWizardPageHosts {
 		footer = "Up/Down select | Space toggle | a all/none | Enter continue | q exit"
-	} else if m.page == 2 {
-		footer = "Up/Down select | Space toggle | Left/Right choose | e edit | Enter review | b back | q exit"
-	} else if m.page == 3 {
+	} else if m.page == checkWizardPageParameters {
+		footer = "Up/Down select | Space toggle | Left/Right choose | e edit | Enter environment | b back | q exit"
+	} else if m.page == checkWizardPageEnvironment {
+		footer = "Up/Down scroll environment | Enter review | b back | q exit"
+	} else if m.page == checkWizardPageReview {
 		footer = "Enter run | b back | q exit"
 	}
 	if m.editing {
@@ -238,16 +262,13 @@ func (m checkWizardModel) renderHosts(width int) string {
 }
 
 func (m checkWizardModel) renderChecks(width int) string {
-	rows := []struct {
-		name, description string
-		enabled           bool
-	}{
-		{"Ping", "RoCE IPv4, MTU and full cross-matrix reachability", m.runPing},
-		{"Bandwidth", "ib_write_bw using Verbs and/or RDMA-CM", m.runBandwidth},
-		{"XCCL", "XPU collective communication performance", m.runXCCL},
-	}
+	rows := m.checkRows()
 	var b strings.Builder
-	b.WriteString("Choose one or more checks. Bundle values are used as defaults.\n\n")
+	if m.selectedHostCount() == 1 {
+		b.WriteString("Single-host mode supports XCCL only. Ping and Bandwidth require at least two hosts.\n\n")
+	} else {
+		b.WriteString("Choose one or more checks. Bundle values are used as defaults.\n\n")
+	}
 	for index, row := range rows {
 		cursor := " "
 		if index == m.cursor {
@@ -260,6 +281,22 @@ func (m checkWizardModel) renderChecks(width int) string {
 		fmt.Fprintf(&b, "%s %s %-12s %s\n", cursor, mark, row.name, row.description)
 	}
 	return b.String()
+}
+
+type wizardCheckRow struct {
+	key, name, description string
+	enabled                bool
+}
+
+func (m checkWizardModel) checkRows() []wizardCheckRow {
+	if m.selectedHostCount() == 1 {
+		return []wizardCheckRow{{"xccl", "XCCL", "XPU collective communication performance", m.runXCCL}}
+	}
+	return []wizardCheckRow{
+		{"ping", "Ping", "RoCE IPv4, MTU and full cross-matrix reachability", m.runPing},
+		{"bandwidth", "Bandwidth", "ib_write_bw using Verbs and/or RDMA-CM", m.runBandwidth},
+		{"xccl", "XCCL", "XPU collective communication performance", m.runXCCL},
+	}
 }
 
 type wizardParamRow struct {
@@ -298,6 +335,35 @@ func (m checkWizardModel) parameterRows() []wizardParamRow {
 		}
 	}
 	if m.runXCCL {
+		multiHost := m.selectedHostCount() > 1
+		scope := "single_host"
+		if multiHost {
+			scope = "multi_host"
+			rows = append(rows,
+				wizardParamRow{"xccl_scope", "XCCL / execution scope", scope, false, false},
+				wizardParamRow{"xccl_layout", "XCCL / multi-host layout", normalizedXCCLLayout(m.bundle.Check.XCCL.Layout), false, true},
+				wizardParamRow{"xccl_xpu_ordering", "XCCL / XPU ordering", xcclXPUOrderingLabel(m.bundle.Check.XCCL), false, true})
+		} else {
+			rows = append(rows, wizardParamRow{"xccl_scope", "XCCL / execution scope", scope, false, false})
+		}
+		evaluationValue := xcclWizardEvaluationLabel(m.bundle.Check.XCCL, multiHost)
+		evaluationCycle := multiHost
+		rows = append(rows,
+			wizardParamRow{"xccl_ranks", "XCCL / MPI ranks (0=auto)", strconv.Itoa(m.bundle.Check.XCCL.Ranks), false, false},
+			wizardParamRow{"xccl_evaluation", "XCCL / evaluation mode", evaluationValue, false, evaluationCycle})
+		if multiHost {
+			if normalizedXCCLLayout(m.bundle.Check.XCCL.Layout) == "full_ring" && normalizedXCCLEvaluationMode(m.bundle.Check.XCCL.EvaluationMode) == "auto" {
+				rows = append(rows, wizardParamRow{"xccl_machine", "XCCL / full-ring machine class", xcclMachineClassLabel(m.bundle.Check.XCCL.MachineClass), false, true})
+			}
+			if normalizedXCCLLayout(m.bundle.Check.XCCL.Layout) == "same_index" {
+				rows = append(rows,
+					wizardParamRow{"xccl_split_step", "XCCL / same-index split step", strconv.Itoa(m.bundle.Check.XCCL.SplitStep), false, false},
+					wizardParamRow{"xccl_split_op", "XCCL / same-index split operation", strconv.Itoa(m.bundle.Check.XCCL.SplitOperation), false, false})
+			}
+		}
+		if normalizedXCCLEvaluationMode(m.bundle.Check.XCCL.EvaluationMode) == "manual" {
+			rows = append(rows, wizardParamRow{"xccl_min_bus", "XCCL / manual minimum bus BW GB/s", strconv.FormatFloat(m.bundle.Check.XCCL.MinBusBandwidthGBs, 'f', -1, 64), false, false})
+		}
 		rows = append(rows,
 			wizardParamRow{"xccl_test", "XCCL / collective", m.bundle.Check.XCCL.Test, false, true},
 			wizardParamRow{"xccl_min", "XCCL / minimum bytes", m.bundle.Check.XCCL.MinBytes, false, false},
@@ -309,8 +375,10 @@ func (m checkWizardModel) parameterRows() []wizardParamRow {
 			wizardParamRow{"xccl_timeout", "XCCL / timeout seconds", strconv.Itoa(m.bundle.Check.XCCL.Timeout), false, false},
 			wizardParamRow{"xccl_xdr", "XCCL / XDR", boolLabel(boolPointerValue(m.bundle.Check.XCCL.EnableXDR)), true, false},
 			wizardParamRow{"xccl_supernode", "XCCL / supernode profile", boolLabel(m.bundle.Check.XCCL.Supernode), true, false},
-			wizardParamRow{"xccl_socket", "XCCL / socket interface (-=auto)", valueOrDash(m.bundle.Check.XCCL.SocketInterface), false, false},
-			wizardParamRow{"xccl_min_bus", "XCCL / minimum bus BW GB/s", strconv.FormatFloat(m.bundle.Check.XCCL.MinBusBandwidthGBs, 'f', -1, 64), false, false})
+			wizardParamRow{"xccl_socket", "XCCL / socket interface (-=first RDMA)", valueOrDash(m.bundle.Check.XCCL.SocketInterface), false, false})
+		if multiHost {
+			rows = append(rows, wizardParamRow{"xccl_validate_topology", "XCCL / cross-host topology validation", boolLabel(m.bundle.Check.XCCL.TopologyValidationEnabled()), true, false})
+		}
 	}
 	return rows
 }
@@ -334,6 +402,51 @@ func (m checkWizardModel) renderParameters(width int) string {
 		fmt.Fprintf(&b, "%s %-38s %s\n", cursor, row.label, row.value)
 	}
 	b.WriteString("\nSpace toggles booleans; Left/Right cycles modes; e edits the selected value.")
+	return b.String()
+}
+
+func (m checkWizardModel) environmentRows() []wizardParamRow {
+	if !m.runXCCL {
+		return nil
+	}
+	cfg := effectiveXCCLConfig(m.bundle.Check.XCCL, m.selectedHostCount() > 1)
+	env := xcclPreviewRankEnvironment(cfg, m.selectedHostCount() > 1)
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	rows := make([]wizardParamRow, 0, len(keys))
+	for _, key := range keys {
+		rows = append(rows, wizardParamRow{"env_" + key, key, env[key], false, false})
+	}
+	return rows
+}
+
+func (m checkWizardModel) renderEnvironment(width int) string {
+	rows := m.environmentRows()
+	var b strings.Builder
+	if len(rows) == 0 {
+		return "No XCCL environment is configured for this run."
+	}
+	visible := maxIntMain(3, m.height-9)
+	start := 0
+	if len(rows) > visible {
+		start = minIntMain(len(rows)-visible, maxIntMain(0, m.cursor-visible/2))
+	}
+	end := minIntMain(len(rows), start+visible)
+	scope := "single_host"
+	if m.selectedHostCount() > 1 {
+		scope = "multi_host"
+	}
+	fmt.Fprintf(&b, "XCCL rank environment. scope=%s; per-host topology values are resolved before launch.  rows %d-%d/%d\n\n", scope, start+1, end, len(rows))
+	for index := start; index < end; index++ {
+		cursor := " "
+		if index == m.cursor {
+			cursor = ">"
+		}
+		fmt.Fprintf(&b, "%s %-34s %s\n", cursor, rows[index].label, truncateWizard(rows[index].value, maxIntMain(20, width-40)))
+	}
 	return b.String()
 }
 
@@ -368,7 +481,22 @@ func (m checkWizardModel) renderReview(width int) string {
 		fmt.Fprintf(&b, "[x] Bandwidth  modes=%s paths/mode=%d %s size=%d QPs=%s parallel=%v threshold=%s memory=%s\n", strings.Join(modes, ","), paths, runValue, m.bundle.Check.Bandwidth.MessageSize, qps, m.bundle.Check.Bandwidth.Parallel, bandwidthThresholdReview(m.bundle.Check.Bandwidth), bandwidthMemoryLabel(m.bundle.Check.Bandwidth))
 	}
 	if m.runXCCL {
-		fmt.Fprintf(&b, "[x] XCCL       collective=%s range=%s..%s step=%d warmup=%d iterations=%d dtype=%s XDR=%v supernode=%v\n", m.bundle.Check.XCCL.Test, m.bundle.Check.XCCL.MinBytes, m.bundle.Check.XCCL.MaxBytes, m.bundle.Check.XCCL.StepFactor, m.bundle.Check.XCCL.WarmupIterations, m.bundle.Check.XCCL.Iterations, m.bundle.Check.XCCL.DataType, boolPointerValue(m.bundle.Check.XCCL.EnableXDR), m.bundle.Check.XCCL.Supernode)
+		multiHost := len(selected) > 1
+		xcclConfig := effectiveXCCLConfig(m.bundle.Check.XCCL, multiHost)
+		ranks := "auto"
+		if m.bundle.Check.XCCL.Ranks > 0 {
+			ranks = strconv.Itoa(m.bundle.Check.XCCL.Ranks) + " (manual)"
+		}
+		scope := "single_host"
+		if multiHost {
+			scope = "multi_host"
+		}
+		fmt.Fprintf(&b, "[x] XCCL       scope=%s layout=%s ordering=%s ranks=%s collective=%s range=%s..%s iterations=%d dtype=%s evaluation=%s XDR=%v", scope, normalizedXCCLLayout(xcclConfig.Layout), xcclXPUOrderingLabel(xcclConfig), ranks, xcclConfig.Test, xcclConfig.MinBytes, xcclConfig.MaxBytes, xcclConfig.Iterations, xcclConfig.DataType, xcclEvaluationReview(xcclConfig), boolPointerValue(xcclConfig.EnableXDR))
+		if multiHost {
+			fmt.Fprintf(&b, " topology-validation=%v", xcclConfig.TopologyValidationEnabled())
+		}
+		b.WriteByte('\n')
+		fmt.Fprintf(&b, "    Environment: %d variables; see the Environment page for common and per-host-resolved values.\n", len(m.environmentRows()))
 	}
 	b.WriteString("\nPress Enter to build the execution plan and start read-only discovery/testing.")
 	return b.String()
@@ -385,12 +513,14 @@ func (m *checkWizardModel) moveCursor(delta int) {
 
 func (m checkWizardModel) rowCount() int {
 	switch m.page {
-	case 0:
+	case checkWizardPageHosts:
 		return len(m.records)
-	case 1:
-		return 3
-	case 2:
+	case checkWizardPageChecks:
+		return len(m.checkRows())
+	case checkWizardPageParameters:
 		return len(m.parameterRows())
+	case checkWizardPageEnvironment:
+		return len(m.environmentRows())
 	default:
 		return 1
 	}
@@ -398,20 +528,24 @@ func (m checkWizardModel) rowCount() int {
 
 func (m *checkWizardModel) toggleCurrent() {
 	switch m.page {
-	case 0:
+	case checkWizardPageHosts:
 		if m.cursor < len(m.selectedHosts) {
 			m.selectedHosts[m.cursor] = !m.selectedHosts[m.cursor]
 		}
-	case 1:
-		switch m.cursor {
-		case 0:
+	case checkWizardPageChecks:
+		rows := m.checkRows()
+		if m.cursor >= len(rows) {
+			return
+		}
+		switch rows[m.cursor].key {
+		case "ping":
 			m.runPing = !m.runPing
-		case 1:
+		case "bandwidth":
 			m.runBandwidth = !m.runBandwidth
-		case 2:
+		case "xccl":
 			m.runXCCL = !m.runXCCL
 		}
-	case 2:
+	case checkWizardPageParameters:
 		rows := m.parameterRows()
 		if m.cursor >= len(rows) {
 			return
@@ -426,6 +560,9 @@ func (m *checkWizardModel) toggleCurrent() {
 		case "xccl_xdr":
 			value := !boolPointerValue(m.bundle.Check.XCCL.EnableXDR)
 			m.bundle.Check.XCCL.EnableXDR = &value
+		case "xccl_validate_topology":
+			value := !m.bundle.Check.XCCL.TopologyValidationEnabled()
+			m.bundle.Check.XCCL.ValidateTopology = &value
 		case "xccl_supernode":
 			m.bundle.Check.XCCL.Supernode = !m.bundle.Check.XCCL.Supernode
 		}
@@ -433,7 +570,7 @@ func (m *checkWizardModel) toggleCurrent() {
 }
 
 func (m *checkWizardModel) adjustCurrent(delta int) {
-	if m.page != 2 {
+	if m.page != checkWizardPageParameters {
 		return
 	}
 	rows := m.parameterRows()
@@ -446,6 +583,25 @@ func (m *checkWizardModel) adjustCurrent(delta int) {
 		return
 	}
 	switch row.key {
+	case "xccl_layout":
+		values := []string{"full_ring", "same_index"}
+		index := stringIndex(values, normalizedXCCLLayout(m.bundle.Check.XCCL.Layout))
+		m.bundle.Check.XCCL.Layout = values[(index+delta+len(values))%len(values)]
+	case "xccl_xpu_ordering":
+		values := []string{"auto", "rail_aligned", "physical"}
+		index := stringIndex(values, normalizedXCCLXPUOrdering(m.bundle.Check.XCCL.XPUOrdering))
+		m.bundle.Check.XCCL.XPUOrdering = values[(index+delta+len(values))%len(values)]
+	case "xccl_machine":
+		values := []string{"auto", "vc", "vd"}
+		index := stringIndex(values, normalizedXCCLMachineClass(m.bundle.Check.XCCL.MachineClass))
+		m.bundle.Check.XCCL.MachineClass = values[(index+delta+len(values))%len(values)]
+	case "xccl_evaluation":
+		values := []string{"auto", "manual", "disabled"}
+		index := stringIndex(values, normalizedXCCLEvaluationMode(m.bundle.Check.XCCL.EvaluationMode))
+		m.bundle.Check.XCCL.EvaluationMode = values[(index+delta+len(values))%len(values)]
+		if m.bundle.Check.XCCL.EvaluationMode == "manual" && m.bundle.Check.XCCL.MinBusBandwidthGBs <= 0 {
+			m.bundle.Check.XCCL.MinBusBandwidthGBs = 1
+		}
 	case "bw_run_mode":
 		m.bundle.Check.Bandwidth.RunByDuration = !m.bundle.Check.Bandwidth.RunByDuration
 	case "bw_memory":
@@ -580,6 +736,12 @@ func (m *checkWizardModel) applyEditedValue() error {
 			return fmt.Errorf("XCCL minimum bytes is required")
 		}
 		m.bundle.Check.XCCL.MinBytes = value
+	case "xccl_ranks":
+		n, err := positive("XCCL MPI ranks", true)
+		if err != nil {
+			return err
+		}
+		m.bundle.Check.XCCL.Ranks = n
 	case "xccl_max":
 		if value == "" {
 			return fmt.Errorf("XCCL maximum bytes is required")
@@ -614,6 +776,18 @@ func (m *checkWizardModel) applyEditedValue() error {
 			return err
 		}
 		m.bundle.Check.XCCL.Timeout = n
+	case "xccl_split_step":
+		n, err := positive("XCCL split step", false)
+		if err != nil {
+			return err
+		}
+		m.bundle.Check.XCCL.SplitStep = n
+	case "xccl_split_op":
+		n, err := positive("XCCL split operation", true)
+		if err != nil {
+			return err
+		}
+		m.bundle.Check.XCCL.SplitOperation = n
 	case "xccl_socket":
 		if value == "-" || strings.EqualFold(value, "auto") {
 			value = ""
@@ -630,16 +804,29 @@ func (m *checkWizardModel) applyEditedValue() error {
 }
 
 func (m checkWizardModel) validatePage() error {
-	if m.page == 0 && m.selectedHostCount() == 0 {
+	if m.page == checkWizardPageHosts && m.selectedHostCount() == 0 {
 		return fmt.Errorf("select at least one host")
 	}
-	if m.page == 1 && !m.runPing && !m.runBandwidth && !m.runXCCL {
+	if m.page == checkWizardPageChecks && !m.runPing && !m.runBandwidth && !m.runXCCL {
 		return fmt.Errorf("select at least one check")
 	}
-	if m.page == 2 && m.runBandwidth && !m.verbs && !m.rdmaCM {
+	if m.page == checkWizardPageParameters && m.runBandwidth && !m.verbs && !m.rdmaCM {
 		return fmt.Errorf("Bandwidth requires Verbs, RDMA-CM, or both")
 	}
+	if m.page == checkWizardPageParameters && m.runXCCL && m.selectedHostCount() > 1 && normalizedXCCLEvaluationMode(m.bundle.Check.XCCL.EvaluationMode) == "auto" && m.bundle.Check.XCCL.Test != "all_reduce" {
+		return fmt.Errorf("XCCL automatic evaluation is defined only for all_reduce; choose manual or disabled for %s", m.bundle.Check.XCCL.Test)
+	}
 	return nil
+}
+
+func (m *checkWizardModel) applySelectedHostScope() {
+	if m.selectedHostCount() != 1 {
+		return
+	}
+	m.runPing = false
+	m.runBandwidth = false
+	m.runXCCL = true
+	m.bundle.Check.XCCL.EvaluationMode = "disabled"
 }
 
 func (m checkWizardModel) validate() error {
@@ -700,6 +887,50 @@ func boolLabel(value bool) string {
 
 func boolPointerValue(value *bool) bool {
 	return value != nil && *value
+}
+
+func xcclEvaluationReview(config spec.CheckXCCLConfig) string {
+	switch normalizedXCCLEvaluationMode(config.EvaluationMode) {
+	case "auto":
+		baseline, required := xcclAutomaticEvaluationRule(config)
+		if normalizedXCCLLayout(config.Layout) == "full_ring" {
+			if normalizedXCCLMachineClass(config.MachineClass) == "auto" {
+				return "auto(detect VC/VD per host; weakest-link)"
+			}
+			return fmt.Sprintf("auto(%s %.0fGB/s >%.0f%%)", strings.ToUpper(normalizedXCCLMachineClass(config.MachineClass)), baseline, required*100)
+		}
+		return fmt.Sprintf("auto(%.0fGB/s >%.0f%%)", baseline, required*100)
+	case "manual":
+		return fmt.Sprintf("manual(>=%.2fGB/s)", config.MinBusBandwidthGBs)
+	default:
+		return "disabled"
+	}
+}
+
+func xcclXPUOrderingLabel(config spec.CheckXCCLConfig) string {
+	configured := normalizedXCCLXPUOrdering(config.XPUOrdering)
+	if configured != "auto" {
+		return configured
+	}
+	if normalizedXCCLLayout(config.Layout) == "same_index" {
+		return "auto (physical for same_index)"
+	}
+	return "auto (physical first; rail fallback)"
+}
+
+func xcclWizardEvaluationLabel(config spec.CheckXCCLConfig, multiHost bool) string {
+	if !multiHost {
+		return "disabled"
+	}
+	return normalizedXCCLEvaluationMode(config.EvaluationMode)
+}
+
+func xcclMachineClassLabel(value string) string {
+	normalized := normalizedXCCLMachineClass(value)
+	if normalized == "auto" {
+		return "AUTO (detect per host)"
+	}
+	return strings.ToUpper(normalized)
 }
 
 func bandwidthRunModeLabel(config spec.CheckBandwidthConfig) string {

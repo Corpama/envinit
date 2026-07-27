@@ -147,6 +147,7 @@ func emptyRDMARecord(record spec.RDMARecord) bool {
 		strings.TrimSpace(record.MAC) == "" &&
 		strings.TrimSpace(record.IP) == "" &&
 		strings.TrimSpace(record.Prefix) == "" &&
+		strings.TrimSpace(record.RailID) == "" &&
 		strings.TrimSpace(record.Gateway) == "" &&
 		strings.TrimSpace(record.Table) == "" &&
 		strings.TrimSpace(record.RouteCIDR) == ""
@@ -187,6 +188,8 @@ func assignRDMAField(record *spec.MachineRecord, key string, value string) bool 
 		item.MAC = value
 	case "prefix":
 		item.Prefix = value
+	case "rail", "rail_id":
+		item.RailID = value
 	case "gateway":
 		item.Gateway = value
 	case "iface", "name", "dev":

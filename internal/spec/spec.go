@@ -327,11 +327,23 @@ type CheckXCCLConfig struct {
 	Iterations         int               `json:"iterations"`
 	DataType           string            `json:"data_type"`
 	Timeout            int               `json:"timeout"`
+	Layout             string            `json:"layout"`
+	XPUOrdering        string            `json:"xpu_ordering"`
+	MachineClass       string            `json:"machine_class"`
+	Ranks              int               `json:"ranks"`
+	SplitStep          int               `json:"split_step"`
+	SplitOperation     int               `json:"split_operation"`
+	EvaluationMode     string            `json:"evaluation_mode"`
 	EnableXDR          *bool             `json:"enable_xdr,omitempty"`
+	ValidateTopology   *bool             `json:"validate_topology,omitempty"`
 	Supernode          bool              `json:"supernode"`
 	SocketInterface    string            `json:"socket_interface"`
 	MinBusBandwidthGBs float64           `json:"min_bus_bandwidth_gbs"`
 	Environment        map[string]string `json:"environment"`
+}
+
+func (c CheckXCCLConfig) TopologyValidationEnabled() bool {
+	return c.ValidateTopology == nil || *c.ValidateTopology
 }
 
 type CheckRDMAGroup struct {
@@ -375,6 +387,7 @@ type RDMARecord struct {
 	MAC       string
 	IP        string
 	Prefix    string
+	RailID    string
 	Gateway   string
 	Table     string
 	RouteCIDR string
@@ -509,22 +522,19 @@ func (b *Bundle) ApplyDefaults() {
 		b.Check.XCCL.Test = "all_reduce"
 	}
 	if b.Check.XCCL.MinBytes == "" {
-		b.Check.XCCL.MinBytes = "1024"
+		b.Check.XCCL.MinBytes = "1m"
 	}
 	if b.Check.XCCL.MaxBytes == "" {
-		b.Check.XCCL.MaxBytes = "256m"
+		b.Check.XCCL.MaxBytes = "2g"
 	}
 	if b.Check.XCCL.StepFactor == 0 {
 		b.Check.XCCL.StepFactor = 2
-	}
-	if b.Check.XCCL.WarmupIterations == 0 {
-		b.Check.XCCL.WarmupIterations = 5
 	}
 	if b.Check.XCCL.Iterations == 0 {
 		b.Check.XCCL.Iterations = 20
 	}
 	if b.Check.XCCL.DataType == "" {
-		b.Check.XCCL.DataType = "float"
+		b.Check.XCCL.DataType = "fp16"
 	}
 	if b.Check.XCCL.Timeout == 0 {
 		b.Check.XCCL.Timeout = 120
@@ -532,6 +542,22 @@ func (b *Bundle) ApplyDefaults() {
 	if b.Check.XCCL.EnableXDR == nil {
 		enabled := true
 		b.Check.XCCL.EnableXDR = &enabled
+	}
+	if b.Check.XCCL.ValidateTopology == nil {
+		enabled := true
+		b.Check.XCCL.ValidateTopology = &enabled
+	}
+	if b.Check.XCCL.Layout == "" {
+		b.Check.XCCL.Layout = "full_ring"
+	}
+	if b.Check.XCCL.XPUOrdering == "" {
+		b.Check.XCCL.XPUOrdering = "auto"
+	}
+	if b.Check.XCCL.SplitStep == 0 {
+		b.Check.XCCL.SplitStep = 8
+	}
+	if b.Check.XCCL.EvaluationMode == "" {
+		b.Check.XCCL.EvaluationMode = "auto"
 	}
 	if b.Check.XCCL.Environment == nil {
 		b.Check.XCCL.Environment = map[string]string{}

@@ -265,7 +265,7 @@ func TestUpdateDelimitedInventoryRDMAExpandsFullTemplateLayoutAtomically(t *test
 	var header []string
 	header = append(header, "host_id", "mgmt_ip")
 	for idx := 1; idx <= 4; idx++ {
-		for _, field := range []string{"name", "ip", "prefix", "gateway", "mac", "table", "route_cidr"} {
+		for _, field := range []string{"name", "ip", "prefix", "gateway", "mac", "table", "route_cidr", "rail_id"} {
 			header = append(header, fmt.Sprintf("rdma%d_%s", idx, field))
 		}
 	}
@@ -275,7 +275,7 @@ func TestUpdateDelimitedInventoryRDMAExpandsFullTemplateLayoutAtomically(t *test
 	}
 	target := Target{Input: "node1", Name: "node1", Address: "192.168.32.11"}
 	for idx := 1; idx <= 8; idx++ {
-		target.RDMA = append(target.RDMA, spec.RDMARecord{Name: fmt.Sprintf("eth%d", idx), IP: fmt.Sprintf("25.16.%d.2", idx), Prefix: "28", MAC: fmt.Sprintf("00:11:22:33:44:%02d", idx)})
+		target.RDMA = append(target.RDMA, spec.RDMARecord{Name: fmt.Sprintf("eth%d", idx), IP: fmt.Sprintf("25.16.%d.2", idx), Prefix: "28", MAC: fmt.Sprintf("00:11:22:33:44:%02d", idx), RailID: fmt.Sprintf("fabric-port-%d", idx)})
 	}
 	before, after, err := updateDelimitedInventoryRDMAWithChange(path, []Target{target})
 	if err != nil {
@@ -288,7 +288,7 @@ func TestUpdateDelimitedInventoryRDMAExpandsFullTemplateLayoutAtomically(t *test
 	if err != nil {
 		t.Fatalf("read inventory: %v", err)
 	}
-	for _, field := range []string{"rdma8_name", "rdma8_ip", "rdma8_prefix", "rdma8_gateway", "rdma8_mac", "rdma8_table", "rdma8_route_cidr"} {
+	for _, field := range []string{"rdma8_name", "rdma8_ip", "rdma8_prefix", "rdma8_gateway", "rdma8_mac", "rdma8_table", "rdma8_route_cidr", "rdma8_rail_id", "fabric-port-8"} {
 		if !strings.Contains(string(data), field) {
 			t.Fatalf("missing expanded field %s:\n%s", field, data)
 		}

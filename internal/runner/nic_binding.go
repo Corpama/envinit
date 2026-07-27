@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -24,6 +25,13 @@ type interfaceBinding struct {
 	NeedsReview bool
 	Reason      string
 	Confidence  string
+}
+
+type pendingInterfaceRename struct {
+	current string
+	target  string
+	temp    string
+	wasUp   bool
 }
 
 type netDevice struct {
@@ -349,44 +357,107 @@ func (a *App) renameRDMATemporarily(bindings []interfaceBinding) error {
 }
 
 func (a *App) renameInterfacesTemporarily(bindings []interfaceBinding) error {
-	type pendingRename struct {
-		current string
-		target  string
-		temp    string
-	}
-	var pending []pendingRename
+	var pending []pendingInterfaceRename
 	reservedTemps := map[string]bool{}
+	currentNames := map[string]bool{}
+	for _, binding := range bindings {
+		current := strings.TrimSpace(binding.CurrentName)
+		target := strings.TrimSpace(binding.Name)
+		if current != "" && target != "" && current != target {
+			currentNames[current] = true
+		}
+	}
 	for _, binding := range bindings {
 		current := strings.TrimSpace(binding.CurrentName)
 		target := strings.TrimSpace(binding.Name)
 		if current == "" || target == "" || current == target {
 			continue
 		}
+		// A target may legitimately be the current primary name of another NIC
+		// participating in the same swap. Any other primary-name occupant would
+		// make the second phase fail after interfaces have already been moved.
+		if a.interfaceExists(target) && !currentNames[target] {
+			return fmt.Errorf("cannot rename interface %s to %s: target primary name is already in use by an interface outside this rename set", current, target)
+		}
 		temp := a.availableTempInterfaceName(len(pending), reservedTemps)
 		reservedTemps[temp] = true
-		pending = append(pending, pendingRename{
+		pending = append(pending, pendingInterfaceRename{
 			current: current,
 			target:  target,
 			temp:    temp,
+			wasUp:   a.interfaceAdministrativelyUp(current),
 		})
 	}
 	if len(pending) == 0 {
 		return nil
 	}
+	var movedToTemp []pendingInterfaceRename
 	for _, item := range pending {
 		if err := a.runCmd("", nil, "ip", "link", "set", "dev", item.current, "down"); err != nil {
-			return err
+			return a.renameFailureWithRollback(fmt.Errorf("bring interface %s down before rename: %w", item.current, err), movedToTemp, nil)
 		}
 		if err := a.runCmd("", nil, "ip", "link", "set", "dev", item.current, "name", item.temp); err != nil {
-			return err
+			if item.wasUp {
+				_ = a.runCmdAllowFailure("", nil, "ip", "link", "set", "dev", item.current, "up")
+			}
+			return a.renameFailureWithRollback(fmt.Errorf("move interface %s to temporary name %s: %w", item.current, item.temp, err), movedToTemp, nil)
 		}
+		movedToTemp = append(movedToTemp, item)
 	}
+	var movedToTarget []pendingInterfaceRename
 	for _, item := range pending {
+		// Linux keeps predictable names as alternate names. This is especially
+		// visible when Apply renames a NIC and a later Apply changes it back: the
+		// requested target can still be an altname on the very same link, and a
+		// normal RTM_SETLINK rename then fails with EEXIST. Removing a missing
+		// altname is harmless and deliberately best-effort for older iproute2.
+		_ = a.runCmdAllowFailure("", nil, "ip", "link", "property", "del", "dev", item.temp, "altname", item.target)
 		if err := a.runCmd("", nil, "ip", "link", "set", "dev", item.temp, "name", item.target); err != nil {
-			return err
+			return a.renameFailureWithRollback(fmt.Errorf("move temporary interface %s to target name %s: %w", item.temp, item.target, err), movedToTemp, movedToTarget)
 		}
+		movedToTarget = append(movedToTarget, item)
 	}
 	return nil
+}
+
+// renameFailureWithRollback restores the pre-rename primary names after a
+// partially completed two-phase rename. Without this, one RTNETLINK failure
+// leaves interfaces under ei-tmp* names and can strand their network config.
+func (a *App) renameFailureWithRollback(cause error, movedToTemp, movedToTarget []pendingInterfaceRename) error {
+	var rollbackErrs []error
+	for idx := len(movedToTarget) - 1; idx >= 0; idx-- {
+		item := movedToTarget[idx]
+		_ = a.runCmdAllowFailure("", nil, "ip", "link", "set", "dev", item.target, "down")
+		if err := a.runCmd("", nil, "ip", "link", "set", "dev", item.target, "name", item.temp); err != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("restore target %s to temporary name %s: %w", item.target, item.temp, err))
+		}
+	}
+	for idx := len(movedToTemp) - 1; idx >= 0; idx-- {
+		item := movedToTemp[idx]
+		_ = a.runCmdAllowFailure("", nil, "ip", "link", "property", "del", "dev", item.temp, "altname", item.current)
+		if err := a.runCmd("", nil, "ip", "link", "set", "dev", item.temp, "name", item.current); err != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("restore temporary interface %s to original name %s: %w", item.temp, item.current, err))
+			continue
+		}
+		if item.wasUp {
+			if err := a.runCmd("", nil, "ip", "link", "set", "dev", item.current, "up"); err != nil {
+				rollbackErrs = append(rollbackErrs, fmt.Errorf("bring restored interface %s up: %w", item.current, err))
+			}
+		}
+	}
+	if len(rollbackErrs) == 0 {
+		return fmt.Errorf("%w; original interface names were restored", cause)
+	}
+	return fmt.Errorf("%w; automatic rename rollback was incomplete: %v", cause, errors.Join(rollbackErrs...))
+}
+
+func (a *App) interfaceAdministrativelyUp(iface string) bool {
+	data, err := os.ReadFile(a.targetPath(filepath.Join("/sys/class/net", iface, "flags")))
+	if err != nil {
+		return false
+	}
+	flags, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(string(data), "0x")), 16, 64)
+	return err == nil && flags&1 != 0
 }
 
 func (a *App) availableTempInterfaceName(idx int, reserved map[string]bool) string {
