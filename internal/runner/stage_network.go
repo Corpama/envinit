@@ -20,6 +20,9 @@ func (a *App) runNetworkStage() error {
 	if err != nil {
 		return err
 	}
+	if err := a.relocateLegacyNetworkBackups(); err != nil {
+		return err
+	}
 	if a.Bundle.BackupExistingNetplan() {
 		if err := a.disableExistingNetplan(); err != nil {
 			return err
@@ -72,6 +75,9 @@ func (a *App) runNetworkManagerStage() error {
 	if err := a.ensureExplicitNetworkBackendService(); err != nil {
 		return err
 	}
+	if err := a.relocateLegacyNetworkBackups(); err != nil {
+		return err
+	}
 	if a.Bundle.BackupExistingNetwork() {
 		if err := a.disableExistingIfcfg(); err != nil {
 			return err
@@ -114,6 +120,9 @@ func (a *App) runLegacyNetworkStage() error {
 		return err
 	}
 	if err := a.ensureExplicitNetworkBackendService(); err != nil {
+		return err
+	}
+	if err := a.relocateLegacyNetworkBackups(); err != nil {
 		return err
 	}
 	if a.Bundle.BackupExistingNetwork() {
@@ -482,9 +491,7 @@ func (a *App) ensureLegacyRDMASelectedLink() error {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(legacy), err)
 	}
 	if _, err := os.Lstat(legacy); err == nil {
-		backup := fmt.Sprintf("%s.bak.%s", legacy, a.applyProgressNow().Format("20060102_150405"))
-		a.logf("backup %s -> %s", legacyRDMASelectedFile, backup)
-		if err := os.Rename(legacy, backup); err != nil {
+		if err := a.moveToBackup(legacy); err != nil {
 			return fmt.Errorf("backup legacy RDMA selected interface file: %w", err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {

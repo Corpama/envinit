@@ -21,6 +21,7 @@ const (
 	managementUdevFile     = "/etc/udev/rules.d/70-kunlun-management-net.rules"
 	rdmaUdevFile           = "/etc/udev/rules.d/71-kunlun-rdma-net.rules"
 	rdmaSelectedFile       = "/var/lib/envinit/selected_interfaces"
+	defaultBackupRoot      = "/var/lib/envinit/backups"
 	legacyRDMASelectedFile = "/etc/rdma/rdma_conf/selected_interfaces"
 	sysctlFile             = "/etc/sysctl.conf"
 	grubFile               = "/etc/default/grub"

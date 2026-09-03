@@ -500,8 +500,27 @@ func TestRDMAModeDefaultsToFull(t *testing.T) {
 		Defaults: Defaults{},
 	}
 	b.ApplyDefaults()
+	if b.Defaults.BackupRoot != "/var/lib/envinit/backups" {
+		t.Fatalf("unexpected default backup root %q", b.Defaults.BackupRoot)
+	}
 	if !b.RDMAExists() || !b.RDMAConfigureIPRoute() {
 		t.Fatal("expected blank rdma_mode to default to full")
+	}
+}
+
+func TestValidateRejectsRelativeBackupRoot(t *testing.T) {
+	b := Bundle{Defaults: Defaults{BackupRoot: "backups"}}
+	b.ApplyDefaults()
+	if err := b.Validate(); err == nil || !strings.Contains(err.Error(), "defaults.backup_root") {
+		t.Fatalf("expected relative backup root validation error, got %v", err)
+	}
+}
+
+func TestValidateRejectsBackupRootInsideActiveNetworkDirectory(t *testing.T) {
+	b := Bundle{Defaults: Defaults{BackupRoot: "/etc/sysconfig/network-scripts/backups"}}
+	b.ApplyDefaults()
+	if err := b.Validate(); err == nil || !strings.Contains(err.Error(), "active configuration directory") {
+		t.Fatalf("expected active configuration directory validation error, got %v", err)
 	}
 }
 

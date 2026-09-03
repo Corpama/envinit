@@ -28,6 +28,7 @@ type Bundle struct {
 }
 
 type Defaults struct {
+	BackupRoot                 string                 `json:"backup_root"`
 	MgmtBondName               string                 `json:"mgmt_bond_name"`
 	MgmtInterfaces             []string               `json:"mgmt_interfaces"`
 	MgmtPrefix                 int                    `json:"mgmt_prefix"`
@@ -427,6 +428,9 @@ type RDMAConfig struct {
 
 func (b *Bundle) ApplyDefaults() {
 	b.Platform.ApplyDefaults()
+	if strings.TrimSpace(b.Defaults.BackupRoot) == "" {
+		b.Defaults.BackupRoot = "/var/lib/envinit/backups"
+	}
 	if b.Defaults.MgmtBondName == "" {
 		b.Defaults.MgmtBondName = "bond0"
 	}
@@ -574,6 +578,23 @@ func (b *Bundle) ApplyDefaults() {
 func (b Bundle) Validate() error {
 	if err := b.Platform.Validate(); err != nil {
 		return err
+	}
+	if backupRoot := strings.TrimSpace(b.Defaults.BackupRoot); backupRoot == "" || !filepath.IsAbs(backupRoot) {
+		return fmt.Errorf("defaults.backup_root %q must be an absolute path", b.Defaults.BackupRoot)
+	} else if filepath.Clean(backupRoot) == string(filepath.Separator) {
+		return fmt.Errorf("defaults.backup_root must not be the filesystem root")
+	} else {
+		for _, activeConfigDir := range []string{
+			"/etc/netplan",
+			"/etc/sysconfig/network-scripts",
+			"/etc/apt/sources.list.d",
+			"/etc/yum.repos.d",
+		} {
+			rel, err := filepath.Rel(activeConfigDir, backupRoot)
+			if err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))) {
+				return fmt.Errorf("defaults.backup_root %q must not be inside active configuration directory %s", b.Defaults.BackupRoot, activeConfigDir)
+			}
+		}
 	}
 	switch normalizeRDMAMode(b.Defaults.RDMAMode) {
 	case RDMAModeFull, RDMAModeNamesOnly, RDMAModeOff:

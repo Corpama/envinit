@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -20,6 +21,8 @@ type treeEntry struct {
 	isDir bool
 	size  int64
 }
+
+var legacySiblingBackupPattern = regexp.MustCompile(`\.bak\.\d{8}_\d{6}(?:\.\d+)?$`)
 
 func resolveTargetPath(root string, systemPath string) string {
 	if root == "/" || root == "" {
@@ -135,6 +138,32 @@ func (a *App) disableExistingIfcfg() error {
 	return a.backupExistingTargets(targets)
 }
 
+func (a *App) relocateLegacyNetworkBackups() error {
+	patterns := []string{
+		filepath.Join(a.targetPath(netplanDir), "*.bak.*"),
+		filepath.Join(a.targetPath(networkScriptsDir), "ifcfg-*.bak.*"),
+		filepath.Join(a.targetPath(networkScriptsDir), "route-*.bak.*"),
+		filepath.Join(a.targetPath(networkScriptsDir), "rule-*.bak.*"),
+	}
+	seen := map[string]bool{}
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return fmt.Errorf("scan legacy network backups %s: %w", pattern, err)
+		}
+		for _, match := range matches {
+			if seen[match] || !legacySiblingBackupPattern.MatchString(filepath.Base(match)) {
+				continue
+			}
+			seen[match] = true
+			if err := a.moveToBackup(match); err != nil {
+				return fmt.Errorf("relocate legacy network backup %s: %w", match, err)
+			}
+		}
+	}
+	return nil
+}
+
 func (a *App) ifcfgBackupTargets() []string {
 	targets := []string{}
 	if a.configureManagementNetwork() {
@@ -172,19 +201,89 @@ func (a *App) backupExistingTargets(targets []string) error {
 }
 
 func (a *App) moveToBackup(path string) error {
-	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
 		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect backup source %s: %w", path, err)
 	}
 	now := a.now
 	if now == nil {
 		now = time.Now
 	}
-	backup := fmt.Sprintf("%s.bak.%s", path, now().Format("20060102_150405"))
+	backup, err := a.nextBackupPath(path, now())
+	if err != nil {
+		return err
+	}
+	if info.IsDir() && pathContains(path, backup) {
+		return fmt.Errorf("backup root must not be inside directory being backed up: %s -> %s", path, backup)
+	}
 	a.logf("backup %s -> %s", path, backup)
 	if a.DryRun {
 		return nil
 	}
-	return os.Rename(path, backup)
+	if err := os.MkdirAll(filepath.Dir(backup), 0o700); err != nil {
+		return fmt.Errorf("create backup directory for %s: %w", path, err)
+	}
+	if err := os.Rename(path, backup); err != nil {
+		return fmt.Errorf("move %s to backup %s (backup_root must be on the same filesystem): %w", path, backup, err)
+	}
+	return nil
+}
+
+func (a *App) nextBackupPath(path string, at time.Time) (string, error) {
+	rel, err := a.backupRelativePath(path)
+	if err != nil {
+		return "", err
+	}
+	backupRoot := strings.TrimSpace(a.Bundle.Defaults.BackupRoot)
+	if backupRoot == "" {
+		backupRoot = defaultBackupRoot
+	}
+	base := filepath.Join(a.targetPath(backupRoot), at.Format("20060102_150405"), rel)
+	for suffix := 0; ; suffix++ {
+		candidate := base
+		if suffix > 0 {
+			candidate = fmt.Sprintf("%s.%d", base, suffix)
+		}
+		if _, err := os.Lstat(candidate); errors.Is(err, fs.ErrNotExist) {
+			return candidate, nil
+		} else if err != nil {
+			return "", fmt.Errorf("inspect backup target %s: %w", candidate, err)
+		}
+	}
+}
+
+func (a *App) backupRelativePath(path string) (string, error) {
+	cleanPath := filepath.Clean(path)
+	if a.Root != "" && a.Root != "/" {
+		cleanRoot := filepath.Clean(a.Root)
+		rel, err := filepath.Rel(cleanRoot, cleanPath)
+		if err != nil {
+			return "", fmt.Errorf("resolve backup source %s relative to root %s: %w", path, a.Root, err)
+		}
+		if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return "", fmt.Errorf("backup source %s is outside alternate root %s", path, a.Root)
+		}
+		return rel, nil
+	}
+	if !filepath.IsAbs(cleanPath) {
+		return "", fmt.Errorf("backup source %s must be an absolute path", path)
+	}
+	rel := strings.TrimPrefix(cleanPath, string(os.PathSeparator))
+	if rel == "" {
+		return "", fmt.Errorf("refuse to back up filesystem root")
+	}
+	return rel, nil
+}
+
+func pathContains(parent string, child string) bool {
+	rel, err := filepath.Rel(filepath.Clean(parent), filepath.Clean(child))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
 }
 
 func (a *App) writeManagedFile(systemPath string, content string, mode fs.FileMode) error {

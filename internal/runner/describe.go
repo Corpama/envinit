@@ -84,9 +84,9 @@ func (a *App) describeStage(stage string) ([]string, error) {
 		case "network":
 			return a.describeLegacyNetworkStage(), nil
 		}
-		lines := []string{}
+		lines := []string{fmt.Sprintf("relocate legacy sibling network backups under %s", a.Bundle.Defaults.BackupRoot)}
 		if a.Bundle.BackupExistingNetplan() {
-			lines = append(lines, "backup existing envinit-managed netplan files that will be rewritten")
+			lines = append(lines, fmt.Sprintf("backup existing envinit-managed netplan files that will be rewritten under %s", a.Bundle.Defaults.BackupRoot))
 		}
 		if !a.configureManagementNetwork() {
 			lines = append(lines, "skip management network configuration because mgmt_ip is empty or configure_management_network=false")
@@ -145,7 +145,7 @@ func (a *App) describeStage(stage string) ([]string, error) {
 				lines = append(lines, fmt.Sprintf("copy offline apt materials from %s to %s", a.Bundle.OfflineAPT.MaterialPath, a.Bundle.OfflineAPT.CopyTo))
 			}
 			if a.Bundle.DisableExistingAptSources() {
-				lines = append(lines, "backup existing apt source files except the envinit-managed offline source file")
+				lines = append(lines, fmt.Sprintf("backup existing apt source files except the envinit-managed offline source file under %s", a.Bundle.Defaults.BackupRoot))
 			}
 			lines = append(lines, fmt.Sprintf("write %s with offline apt entries: %s", a.Bundle.OfflineAPT.TargetFile, strings.Join(a.renderOfflineAPTEntries(), " ; ")))
 		}
@@ -326,8 +326,9 @@ func (a *App) describeStage(stage string) ([]string, error) {
 func (a *App) describeNetworkManagerStage() []string {
 	lines := []string{}
 	lines = append(lines, a.describeExplicitNetworkBackendServiceSwitch()...)
+	lines = append(lines, fmt.Sprintf("relocate legacy sibling network backups under %s", a.Bundle.Defaults.BackupRoot))
 	if a.Bundle.BackupExistingNetwork() {
-		lines = append(lines, "backup existing envinit-managed ifcfg, route, and rule files that will be rewritten")
+		lines = append(lines, fmt.Sprintf("backup existing envinit-managed ifcfg, route, and rule files that will be rewritten under %s", a.Bundle.Defaults.BackupRoot))
 	}
 	if !a.configureManagementNetwork() {
 		lines = append(lines, "skip management network configuration because mgmt_ip is empty or configure_management_network=false")
@@ -374,8 +375,9 @@ func (a *App) describeNetworkManagerStage() []string {
 func (a *App) describeLegacyNetworkStage() []string {
 	lines := []string{}
 	lines = append(lines, a.describeExplicitNetworkBackendServiceSwitch()...)
+	lines = append(lines, fmt.Sprintf("relocate legacy sibling network backups under %s", a.Bundle.Defaults.BackupRoot))
 	if a.Bundle.BackupExistingNetwork() {
-		lines = append(lines, "backup existing envinit-managed ifcfg, route, and rule files that will be rewritten")
+		lines = append(lines, fmt.Sprintf("backup existing envinit-managed ifcfg, route, and rule files that will be rewritten under %s", a.Bundle.Defaults.BackupRoot))
 	}
 	if !a.configureManagementNetwork() {
 		lines = append(lines, "skip management network configuration because mgmt_ip is empty or configure_management_network=false")
@@ -446,7 +448,7 @@ func (a *App) describeYumStage() ([]string, error) {
 			lines = append(lines, fmt.Sprintf("copy offline yum repo materials from %s to %s", repo.MaterialPath, repo.CopyTo))
 		}
 		if a.Bundle.DisableExistingRepos() {
-			lines = append(lines, "backup existing yum repo files except the envinit-managed offline repo file")
+			lines = append(lines, fmt.Sprintf("backup existing yum repo files except the envinit-managed offline repo file under %s", a.Bundle.Defaults.BackupRoot))
 		}
 		lines = append(lines, fmt.Sprintf("write %s with offline yum repo entries: %s", repo.TargetFile, strings.Join(a.renderOfflineRepoEntries(repo), " ; ")))
 	}

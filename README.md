@@ -724,6 +724,7 @@ ipmitool power soft
 | `/var/lib/envinit/selected_interfaces` | `network` / `udev` | 人工确认后的管理网和 RDMA 物理口绑定，供后续运行和启动时复用 |
 | `/etc/rdma/rdma_conf/selected_interfaces` | `network` / `udev` | 指向 `/var/lib/envinit/selected_interfaces` 的兼容软链接，不再单独维护第二份选择数据 |
 | `/var/lib/envinit/mst-devices.json` | `mlxconfig` | 已确认的 `/dev/mst/*_pciconf*` 设备列表；后续运行优先复用，设备状态不一致时重新确认 |
+| `/var/lib/envinit/backups/<时间>/<原绝对路径>` 或 `defaults.backup_root` 指定位置 | 所有可能覆盖既有文件的 stage | 统一保存自动备份并保留原路径层级；不再在活动配置文件旁生成 `.bak.<时间>` |
 | `/opt/kunlun-apt-repo`、`/opt/kunlun-rpm-repo` 或 bundle 的 `copy_to` | `software` | 从交付目录复制到本机的离线软件源 |
 | `/etc/apt/sources.list.d/kunlun-offline.list` 或 `/etc/yum.repos.d/kunlun-offline.repo` | `software` | envinit 管理的本地软件源配置；是否禁用其他源由 `platform_options` 控制 |
 | `/opt/kunlun` 或 `artifacts.work_dir` | `ofed`、`xre`、`xdr`、`firmware` | 安装包解压和执行工作目录，不是 apply checkpoint |
@@ -899,6 +900,7 @@ bundle 使用严格 JSON 字段校验：字段名拼写错误、已经删除的�
 
 | 字段 | 说明 |
 | --- | --- |
+| `backup_root` | 所有自动备份的统一根目录，默认 `/var/lib/envinit/backups`；必须使用绝对路径，且不能位于 netplan、network-scripts、APT 或 YUM 的活动配置目录中 |
 | `mgmt_bond_name` | 管理 bond 名，默认 `bond0` |
 | `mgmt_interfaces` | 默认管理口目标名列表；通常可省略，由规划表和自动发现/TUI 绑定生成 |
 | `mgmt_prefix`、`mgmt_gateway`、`mgmt_nameservers`、`mgmt_mtu` | 管理网默认值 |
@@ -994,6 +996,17 @@ Kylin V10 SP3 建议显式启用 yum 路径：
 | `kylin.disable_existing_repos` | Kylin yum 路径：是否备份并禁用已有 `.repo` 文件 |
 
 旧配置中的 `platform_options.redhat` 仍会作为兼容回退读取；新配置统一使用 `platform_options.kylin`。
+
+所有由 envinit 自动产生的备份统一写入 `defaults.backup_root`，默认目录结构如下：
+
+```text
+/var/lib/envinit/backups/20260903_164904/etc/netplan/00-kunlun-bond.yaml
+/var/lib/envinit/backups/20260903_164904/etc/sysconfig/network-scripts/ifcfg-xgbe8
+/var/lib/envinit/backups/20260903_164904/etc/apt/sources.list.d/example.list
+/var/lib/envinit/backups/20260903_164904/etc/yum.repos.d/example.repo
+```
+
+备份保留原绝对路径层级；同一秒内同一路径重复备份时追加 `.1`、`.2`，不会覆盖旧备份。备份使用原子移动，因此自定义 `backup_root` 必须与被备份内容位于同一文件系统；如果跨文件系统，工具会在保留原文件的前提下报错停止。升级后运行 `network` stage 时，工具还会把旧版本遗留的、严格匹配 `.bak.YYYYMMDD_HHMMSS` 格式的 netplan、ifcfg、route 和 rule 同目录备份迁入统一目录，避免 legacy `network` 把 `ifcfg-*.bak.*` 误识别为接口配置；其他人工命名的备份不会移动。
 
 ### 7.5 offline_apt / offline_repo 和 packages
 

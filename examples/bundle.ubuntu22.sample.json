@@ -1,5 +1,6 @@
 {
   "defaults": {
+    "backup_root": "/var/lib/envinit/backups",
     "configure_management_network": true,
     "apply_network_immediately": false,
     "mgmt_bond_name": "bond0",

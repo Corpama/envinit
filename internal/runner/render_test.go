@@ -268,12 +268,12 @@ func TestWriteIfcfgNetworkFilesUsesStaticBootprotoForIPBearingInterfaces(t *test
 	if !strings.Contains(string(slave), "BOOTPROTO=none\n") || !strings.Contains(string(slave), "MASTER=bond0\n") {
 		t.Fatalf("expected bond slave to use BOOTPROTO=none and MASTER=bond0, got:\n%s", slave)
 	}
-	matches, err := filepath.Glob(staleBond + ".bak.*")
-	if err != nil {
-		t.Fatalf("glob stale bond backups: %v", err)
+	backup := backupPathForTest(root, "20260630_120000", ifcfgPath("bond0"))
+	if _, err := os.Stat(backup); err != nil {
+		t.Fatalf("expected stale bond ifcfg backup at %s: %v", backup, err)
 	}
-	if len(matches) == 0 {
-		t.Fatalf("expected stale bond ifcfg to be backed up before writing new static config")
+	if matches, err := filepath.Glob(staleBond + ".bak.*"); err != nil || len(matches) != 0 {
+		t.Fatalf("did not expect backups beside active ifcfg files, got %v (err=%v)", matches, err)
 	}
 }
 
@@ -673,7 +673,7 @@ func TestConfigureXRECardP800VDBacksUpAndOverwritesKunlunConfig(t *testing.T) {
 	if string(got) != renderP800VDKunlunModprobe() {
 		t.Fatalf("unexpected updated kunlun config:\n%s", got)
 	}
-	backup := target + ".bak.20260601_102030"
+	backup := backupPathForTest(root, "20260601_102030", kunlunModprobeFile)
 	if _, err := os.Stat(backup); err != nil {
 		t.Fatalf("expected backup %s: %v", backup, err)
 	}
@@ -752,6 +752,9 @@ func TestEnsureSysctlSettingsDryRunDoesNotCreateDirectory(t *testing.T) {
 			RDMA: []spec.RDMAConfig{{Name: "ens11np0"}},
 		},
 		Output: ioDiscard{},
+		now: func() time.Time {
+			return time.Date(2026, 9, 3, 16, 15, 24, 0, time.UTC)
+		},
 	}
 	if err := app.ensureSysctlSettings(); err != nil {
 		t.Fatalf("ensure sysctl settings: %v", err)
@@ -2258,6 +2261,9 @@ func TestDisableExistingNetworkFilesBacksUpOnlyEnabledNetworkTargets(t *testing.
 			RDMA:         []spec.RDMAConfig{{Name: "xgbe1"}},
 		},
 		Output: ioDiscard{},
+		now: func() time.Time {
+			return time.Date(2026, 9, 3, 16, 15, 24, 0, time.UTC)
+		},
 	}
 	if err := app.disableExistingIfcfg(); err != nil {
 		t.Fatalf("disable ifcfg: %v", err)
@@ -2281,12 +2287,13 @@ func TestDisableExistingNetworkFilesBacksUpOnlyEnabledNetworkTargets(t *testing.
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("expected RDMA target config to be moved before rewrite at %s, stat err=%v", path, err)
 		}
-		matches, err := filepath.Glob(path + ".bak.*")
-		if err != nil {
-			t.Fatalf("glob RDMA backup: %v", err)
+		systemPath := "/" + strings.TrimPrefix(strings.TrimPrefix(path, root), "/")
+		backup := backupPathForTest(root, "20260903_161524", systemPath)
+		if _, err := os.Stat(backup); err != nil {
+			t.Fatalf("expected RDMA target backup for %s at %s: %v", path, backup, err)
 		}
-		if len(matches) != 1 {
-			t.Fatalf("expected one RDMA target backup for %s, got %v", path, matches)
+		if matches, err := filepath.Glob(path + ".bak.*"); err != nil || len(matches) != 0 {
+			t.Fatalf("did not expect RDMA backups beside active network files, got %v (err=%v)", matches, err)
 		}
 	}
 }
@@ -2322,6 +2329,9 @@ func TestDisableExistingNetworkFilesBacksUpOnlyManagementTargetsWhenRDMAIPDisabl
 			RDMA:         []spec.RDMAConfig{{Name: "xgbe1"}},
 		},
 		Output: ioDiscard{},
+		now: func() time.Time {
+			return time.Date(2026, 9, 3, 16, 18, 16, 0, time.UTC)
+		},
 	}
 	if err := app.disableExistingIfcfg(); err != nil {
 		t.Fatalf("disable ifcfg: %v", err)
@@ -2333,12 +2343,13 @@ func TestDisableExistingNetworkFilesBacksUpOnlyManagementTargetsWhenRDMAIPDisabl
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("expected management target config to be moved before rewrite at %s, stat err=%v", path, err)
 		}
-		matches, err := filepath.Glob(path + ".bak.*")
-		if err != nil {
-			t.Fatalf("glob management backup: %v", err)
+		systemPath := "/" + strings.TrimPrefix(strings.TrimPrefix(path, root), "/")
+		backup := backupPathForTest(root, "20260903_161816", systemPath)
+		if _, err := os.Stat(backup); err != nil {
+			t.Fatalf("expected management target backup for %s at %s: %v", path, backup, err)
 		}
-		if len(matches) != 1 {
-			t.Fatalf("expected one management target backup for %s, got %v", path, matches)
+		if matches, err := filepath.Glob(path + ".bak.*"); err != nil || len(matches) != 0 {
+			t.Fatalf("did not expect management backups beside active network files, got %v (err=%v)", matches, err)
 		}
 	}
 	for _, path := range []string{rdmaIfcfg, rdmaRoute, rdmaRule, rdmaNetplan} {
@@ -3839,6 +3850,10 @@ func assertRenderedLinesFit(t *testing.T, rendered string, width int) {
 
 func boolPtr(value bool) *bool {
 	return &value
+}
+
+func backupPathForTest(root string, timestamp string, systemPath string) string {
+	return filepath.Join(root, strings.TrimPrefix(defaultBackupRoot, "/"), timestamp, strings.TrimPrefix(systemPath, "/"))
 }
 
 func mustWriteCommandLogStub(t *testing.T, binDir string, name string, logPath string) {
