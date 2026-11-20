@@ -309,7 +309,7 @@ func (m checkWizardModel) parameterRows() []wizardParamRow {
 	if m.runPing {
 		rows = append(rows,
 			wizardParamRow{"ping_count", "Ping / packet count", strconv.Itoa(m.bundle.Check.RDMAPing.Count), false, false},
-			wizardParamRow{"ping_payload", "Ping / payload bytes", strconv.Itoa(m.bundle.Check.RDMAPing.PayloadSize), false, false},
+			wizardParamRow{"ping_payload", "Ping / payload bytes (auto allowed)", autoIntLabel(m.bundle.Check.RDMAPing.PayloadSize, m.bundle.Check.RDMAPing.PayloadAuto), false, false},
 			wizardParamRow{"ping_timeout", "Ping / timeout seconds", strconv.Itoa(m.bundle.Check.RDMAPing.Timeout), false, false})
 	}
 	if m.runBandwidth {
@@ -325,7 +325,7 @@ func (m checkWizardModel) parameterRows() []wizardParamRow {
 		rows = append(rows,
 			wizardParamRow{"bw_size", "Bandwidth / message bytes", strconv.Itoa(m.bundle.Check.Bandwidth.MessageSize), false, false},
 			wizardParamRow{"bw_qps", "Bandwidth / QPs (0=perftest default)", strconv.Itoa(m.bundle.Check.Bandwidth.BandwidthQPs), false, false},
-			wizardParamRow{"bw_gid", "Bandwidth / Verbs GID index", strconv.Itoa(m.bundle.Check.Bandwidth.GIDIndex), false, false},
+			wizardParamRow{"bw_gid", "Bandwidth / Verbs GID index", autoIntLabel(m.bundle.Check.Bandwidth.GIDIndex, m.bundle.Check.Bandwidth.GIDIndexAuto), false, false},
 			wizardParamRow{"bw_parallel", "Bandwidth / parallel batches", boolLabel(m.bundle.Check.Bandwidth.Parallel), true, false},
 			wizardParamRow{"bw_port", "Bandwidth / base port", strconv.Itoa(m.bundle.Check.Bandwidth.BasePort), false, false},
 			wizardParamRow{"bw_memory", "Bandwidth / memory backend", bandwidthMemoryLabel(m.bundle.Check.Bandwidth), false, true},
@@ -375,7 +375,8 @@ func (m checkWizardModel) parameterRows() []wizardParamRow {
 			wizardParamRow{"xccl_timeout", "XCCL / timeout seconds", strconv.Itoa(m.bundle.Check.XCCL.Timeout), false, false},
 			wizardParamRow{"xccl_xdr", "XCCL / XDR", boolLabel(boolPointerValue(m.bundle.Check.XCCL.EnableXDR)), true, false},
 			wizardParamRow{"xccl_supernode", "XCCL / supernode profile", boolLabel(m.bundle.Check.XCCL.Supernode), true, false},
-			wizardParamRow{"xccl_socket", "XCCL / socket interface (-=first RDMA)", valueOrDash(m.bundle.Check.XCCL.SocketInterface), false, false})
+			wizardParamRow{"xccl_socket", "XCCL / BKCL socket interface (-=mgmt)", valueOrDash(m.bundle.Check.XCCL.SocketInterface), false, false},
+			wizardParamRow{"xccl_mpi_interface", "XCCL / MPI interface (-=mgmt)", valueOrDash(m.bundle.Check.XCCL.MPIInterface), false, false})
 		if multiHost {
 			rows = append(rows, wizardParamRow{"xccl_validate_topology", "XCCL / cross-host topology validation", boolLabel(m.bundle.Check.XCCL.TopologyValidationEnabled()), true, false})
 		}
@@ -678,11 +679,16 @@ func (m *checkWizardModel) applyEditedValue() error {
 		}
 		m.bundle.Check.RDMAPing.Count = n
 	case "ping_payload":
+		if strings.EqualFold(value, "auto") {
+			m.bundle.Check.RDMAPing.PayloadAuto = true
+			break
+		}
 		n, err := positive("ping payload", false)
 		if err != nil {
 			return err
 		}
 		m.bundle.Check.RDMAPing.PayloadSize = n
+		m.bundle.Check.RDMAPing.PayloadAuto = false
 	case "ping_timeout":
 		n, err := positive("ping timeout", false)
 		if err != nil {
@@ -714,11 +720,17 @@ func (m *checkWizardModel) applyEditedValue() error {
 		}
 		m.bundle.Check.Bandwidth.BandwidthQPs = n
 	case "bw_gid":
+		if strings.EqualFold(value, "auto") {
+			m.bundle.Check.Bandwidth.GIDIndexAuto = true
+			break
+		}
 		n, err := positive("bandwidth GID index", true)
 		if err != nil {
 			return err
 		}
 		m.bundle.Check.Bandwidth.GIDIndex = n
+		m.bundle.Check.Bandwidth.GIDIndexAuto = false
+		m.bundle.Check.Bandwidth.GIDIndexSet = true
 	case "bw_port":
 		n, err := positive("bandwidth base port", false)
 		if err != nil || n > 65535 {
@@ -793,6 +805,11 @@ func (m *checkWizardModel) applyEditedValue() error {
 			value = ""
 		}
 		m.bundle.Check.XCCL.SocketInterface = value
+	case "xccl_mpi_interface":
+		if value == "-" || strings.EqualFold(value, "auto") {
+			value = ""
+		}
+		m.bundle.Check.XCCL.MPIInterface = value
 	case "xccl_min_bus":
 		n, err := nonNegativeFloat("XCCL minimum bus bandwidth")
 		if err != nil {

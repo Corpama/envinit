@@ -2,6 +2,8 @@
 
 状态：已实现。公共判断模块位于 `internal/nicdetect`，apply 和 discover 分别负责本地与远端事实采集。
 
+交接补充（2026-10-22）：这里的“已实现”不表示通过双系统、交换机及重启实机验收。角色与插线的讨论、主动探测实现差异和部分 MAC 绑定待验证事项见 [会话网络规划记录](session-network-planning.md)。
+
 ## 1. 目标与边界
 
 `apply` 和 `discover` 使用同一套网卡判断引擎，避免对同一台机器产生不同的管理网/RDMA 结论。两者的数据采集方式不同，但统一转换成相同的网卡事实模型：
@@ -17,16 +19,16 @@
 
 远端发现必须区分两个概念：
 
-- **inventory 身份**：最终需要更新的 `host_id`、`hostname` 或既有 `mgmt_ip` 对应行。
+- **inventory 身份**：最终需要更新的 `hostname` 或既有 `mgmt_ip` 对应行；旧 `host_id` 仅作为兼容输入。
 - **控制地址**：本次执行 SSH/SCP 时实际可达的 IP 或主机名。
 
 `--hosts` 支持以下解析方式：
 
-- `192.168.32.11`：用该地址 SSH，读取远端静态 hostname，再匹配 inventory 的 `hostname`，其次匹配 `host_id`；没有匹配行时以 hostname 自动新增一行。
-- `node1`：兼容已有行为；先匹配 inventory，有 `mgmt_ip` 时用它连接，没有时尝试直接连接 `node1`。
-- `node1=192.168.32.11`：显式把控制地址绑定到 inventory 身份；左侧可以指定已有行，也可以声明要新增的 `host_id`。
+- `192.168.32.11`：用该地址 SSH，读取远端静态 hostname，再匹配 inventory 的 `hostname`；没有匹配行时以 hostname 自动新增一行。
+- `node1`：先匹配 inventory 的 `hostname`，有 `mgmt_ip` 时用它连接，没有时尝试直接连接 `node1`。
+- `node1=192.168.32.11`：显式把控制地址绑定到 inventory 的 `hostname`；左侧可以指定已有行，也可以声明要新增的 hostname。
 
-直接地址得到的 hostname 无匹配时，以它同时作为新行的 `host_id` 和 `hostname`；匹配多行时必须失败，并要求使用显式映射。显式映射优先于远端 hostname；两者不一致时输出警告，但写回只能命中左侧指定行。控制地址在一次 discover 中固定不变，选出的新 `mgmt_ip` 只进入最终 inventory，不用于中途切换 SSH 连接。
+直接地址得到的 hostname 无匹配时，以它作为新行的 `hostname`；匹配多行时必须失败，并要求使用显式映射。显式映射优先于远端 hostname；两者不一致时输出警告，但写回只能命中左侧指定行。控制地址在一次 discover 中固定不变，选出的新 `mgmt_ip` 只进入最终 inventory，不用于中途切换 SSH 连接。
 
 ## 2. 统一事实与规划模型
 
@@ -99,6 +101,14 @@ MTU、当前地址、当前速率和链路状态作为组特征，不作为必�
 - 一个接口同时承载控制地址并具有 GID 时，结果需要显示角色冲突，不能无条件让 RDMA 覆盖管理网。
 - `weak`、`ambiguous` 和 `conflict` 不能被非交互 `--yes` 静默接受。
 
+### 3.6 未知 MAC 的主动连通性探测
+
+apply 缺少可靠 MAC/IP 绑定时，对没有业务地址、路由、master 归属或其他槽位占用的 RDMA 物理口执行主动探测。探测使用规划源 IP 直接构造 ARP 和 ICMP 以太帧，接收时核对本地接口、网关源地址和 ICMP 请求标识，不依赖现有默认路由。
+
+探测会收集完整的“规划槽位 × 候选网口”结果，再求唯一的一对一映射；不采用第一个成功即绑定的顺序算法。ARP 和 ICMP 都成功且整体映射唯一时为 strong。仅 ARP 成功、多个完整映射、全部失败、链路未就绪或规划地址已经存在于本机时均为 ambiguous，并进入 TUI 逐口确认；已有地址会跳过主动探测并显示当前地址归属。无法形成唯一映射时，程序仍按 PCI/硬件顺序预填未占用物理网口作为待确认候选，并明确标记为“connectivity unverified”，绝不把该顺序推断升级为 strong/exact。未配置地址的候选口发生真实 IP/ARP 冲突和接口恢复失败仍属于阻断错误。
+
+探测不创建地址、路由或 VLAN 子接口。原本关闭的空闲口会临时拉起并持久化恢复记录，正常结束立即恢复；异常中断后下一次 apply 先核对 MAC、地址和 master 状态，再安全恢复或要求人工处理。
+
 ## 4. TUI 与人工覆盖
 
 TUI 使用统一的“逻辑槽位绑定物理网卡”模型，显示规划 IP、推荐网卡、置信度和不超过两三个要点的 `Why`：
@@ -146,6 +156,7 @@ rdma5_name,rdma5_ip,...,rdma8_name,rdma8_ip,...
 
 - name、IP、prefix、MAC 可以从机器读取后写入。
 - gateway、table、route CIDR 没有可靠来源时保持空白，由已有默认规则或后续规划补充。
+- discover Review 展示每个 RDMA 逻辑槽位的 inventory 原有 gateway，确认后逐口输出网卡、IP、原有 gateway 的核对提示。重新绑定槽位或更换 IP 时不会据此推断或改写 gateway，执行 apply 前需逐口确认。
 
 ### 5.2 apply 不扩容
 

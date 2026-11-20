@@ -38,6 +38,50 @@ func TestLoadCSV(t *testing.T) {
 	}
 }
 
+func TestLoadCSVCanonicalHostnameIsRequiredAndPreserved(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inventory.csv")
+	content := "hostname,mgmt_ip\nxpu11,10.101.9.11\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write csv: %v", err)
+	}
+	rows, err := Load(path, "")
+	if err != nil {
+		t.Fatalf("load csv: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Hostname != "xpu11" || rows[0].HostID != "" || rows[0].LegacySchema {
+		t.Fatalf("unexpected canonical record: %#v", rows)
+	}
+}
+
+func TestLoadCSVRejectsConflictingHostnameAliases(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inventory.csv")
+	content := "hostname,host_id,mgmt_ip\nxpu11,asset-11,10.101.9.11\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write csv: %v", err)
+	}
+	if _, err := Load(path, ""); err == nil {
+		t.Fatal("expected conflicting hostname aliases to fail")
+	}
+}
+
+func TestLoadCSVMarksDeprecatedHostIDAliasesAsLegacySchema(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inventory.csv")
+	content := "asset_tag,mgmt_ip\nxpu11,10.101.9.11\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write csv: %v", err)
+	}
+	rows, err := Load(path, "")
+	if err != nil {
+		t.Fatalf("load csv: %v", err)
+	}
+	if !rows[0].LegacySchema || rows[0].Hostname != "xpu11" {
+		t.Fatalf("deprecated alias was not marked legacy: %#v", rows[0])
+	}
+}
+
 func TestLoadCSVParsesDynamicRDMAColumns(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "inventory.csv")

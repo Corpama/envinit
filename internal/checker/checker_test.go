@@ -738,8 +738,9 @@ func TestRDMAPingItemsBuildCrossMatrix(t *testing.T) {
 		RDMA: []spec.RDMARecord{{Name: "ens11np0", IP: "10.247.1.11"}, {Name: "ens13np0", IP: "10.247.2.11"}},
 	}
 	destination := Target{
-		Name: "node2",
-		RDMA: []spec.RDMARecord{{IP: "10.247.1.12"}, {IP: "10.247.2.12"}},
+		Name:         "node2",
+		LegacySchema: true,
+		RDMA:         []spec.RDMARecord{{IP: "10.247.1.12"}, {IP: "10.247.2.12"}},
 	}
 	items, err := rdmaPingItems(bundle, source, destination)
 	if err != nil {
@@ -810,6 +811,43 @@ func TestRunRDMAPingRequiresRDMAIPs(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "rdma1_ip") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestResolveRDMAPingPayloadsUsesLowestEndpointMTU(t *testing.T) {
+	var commands []string
+	items := []rdmaPingItem{{SourceName: "ens1", DestinationName: "ens2"}}
+	opts := Options{
+		Bundle: spec.Bundle{},
+		CommandRunner: func(_ spec.CheckConfig, _ Target, command string) (string, error) {
+			commands = append(commands, command)
+			if strings.Contains(command, "ens1") {
+				return "9000\n", nil
+			}
+			return "4200\n", nil
+		},
+	}
+	if err := resolveRDMAPingPayloads(opts, Target{Name: "source"}, Target{Name: "destination"}, items); err != nil {
+		t.Fatalf("resolve payload: %v", err)
+	}
+	if items[0].PayloadSize != 4172 {
+		t.Fatalf("payload = %d, want 4172", items[0].PayloadSize)
+	}
+	if len(commands) != 2 {
+		t.Fatalf("MTU command count = %d, want 2: %#v", len(commands), commands)
+	}
+}
+
+func TestResolveRDMAPingPayloadsRejectsInvalidMTU(t *testing.T) {
+	items := []rdmaPingItem{{SourceName: "ens1", DestinationName: "ens2"}}
+	err := resolveRDMAPingPayloads(Options{
+		Bundle: spec.Bundle{},
+		CommandRunner: func(_ spec.CheckConfig, _ Target, _ string) (string, error) {
+			return "1500x\n", nil
+		},
+	}, Target{Name: "source"}, Target{Name: "destination"}, items)
+	if err == nil || !strings.Contains(err.Error(), "invalid MTU") {
+		t.Fatalf("expected invalid MTU error, got %v", err)
 	}
 }
 

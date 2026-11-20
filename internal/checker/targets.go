@@ -60,6 +60,14 @@ func resolveTarget(records []spec.MachineRecord, input string, requireInventoryM
 	}
 	for _, record := range records {
 		if matchesRecord(record, identity) {
+			if record.FromInventory {
+				record.RDMA = append([]spec.RDMARecord(nil), record.RDMA...)
+				for i := range record.RDMA {
+					if record.RDMA[i].Name == "" {
+						record.RDMA[i].Name = fmt.Sprintf("xgbe%d", i)
+					}
+				}
+			}
 			address := strings.TrimSpace(record.MgmtIP)
 			controlAddress := address
 			if explicit {
@@ -80,6 +88,7 @@ func resolveTarget(records []spec.MachineRecord, input string, requireInventoryM
 				ExpectedHostname:  firstNonEmpty(record.Hostname, record.HostID),
 				InventoryIdentity: firstNonEmpty(record.HostID, record.Hostname, record.MgmtIP),
 				InventoryMatched:  true,
+				LegacySchema:      record.LegacySchema || (!record.FromInventory && strings.TrimSpace(record.HostID) != ""),
 				ExplicitIdentity:  explicit,
 				ControlAddress:    controlAddress,
 				Address:           address,

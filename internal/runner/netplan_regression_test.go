@@ -66,6 +66,9 @@ func TestUbuntuNetplanFilesFromPlanning(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(binDir, "systemctl"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("write fake systemctl: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(binDir, "netplan"), []byte("#!/bin/sh\n[ \"$1\" = generate ] && [ \"$2\" = --root-dir ] && [ -d \"$3/etc/netplan\" ]\n"), 0o755); err != nil {
+		t.Fatalf("write fake netplan validator: %v", err)
+	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	for _, dev := range []struct {
 		name string
@@ -99,8 +102,10 @@ func TestUbuntuNetplanFilesFromPlanning(t *testing.T) {
 	}
 	app.DryRun = false
 	app.now = func() time.Time { return time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC) }
-	if err := app.runNetworkStage(); err != nil {
-		t.Fatalf("run netplan network stage: %v", err)
+	for attempt := 1; attempt <= 3; attempt++ {
+		if err := app.runNetworkStage(); err != nil {
+			t.Fatalf("run netplan network stage attempt %d: %v", attempt, err)
+		}
 	}
 
 	assertFileContainsAll(t, root, filepath.Join(netplanDir, "00-kunlun-bond.yaml"), []string{

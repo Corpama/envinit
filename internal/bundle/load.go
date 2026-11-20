@@ -26,6 +26,9 @@ func Load(path string) (spec.Bundle, error) {
 	if err := ensureJSONEOF(decoder); err != nil {
 		return spec.Bundle{}, err
 	}
+	for _, warning := range bundle.Warnings {
+		fmt.Fprintln(os.Stderr, "WARN", warning)
+	}
 	applyDetectedPlatformDefaults(&bundle, defaultPlatformDetector())
 	bundle.ApplyDefaults()
 	if err := bundle.Validate(); err != nil {

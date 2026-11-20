@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-func Run(opts Options) error {
+func Run(opts Options) (runErr error) {
 	baseContext := opts.Context
 	if baseContext == nil {
 		baseContext = context.Background()
@@ -46,6 +46,17 @@ func Run(opts Options) error {
 	if runXCCL {
 		tuiStages = append(tuiStages, checkTUIStageXCCL)
 	}
+	if tuiOutput != nil {
+		report, err := newCheckReport(append([]string{"Preflight"}, tuiStages...), opts.Hosts)
+		if err != nil {
+			return fmt.Errorf("prepare check report: %w", err)
+		}
+		defer report.close()
+		opts.aborts = newCheckAbortManager(tuiStages)
+		opts.checkTUI = startCheckTUI(os.Stdin, tuiOutput, append([]string{"Preflight"}, tuiStages...), checkCtx, cancelCheck, opts.aborts, report)
+		opts.Output = opts.checkTUI
+		defer func() { opts.checkTUI.Finish(runErr) }()
+	}
 	targets, err := ResolveTargets(opts.Records, opts.Hosts)
 	if err != nil {
 		return err
@@ -54,7 +65,19 @@ func Run(opts Options) error {
 		return errors.New("bandwidth and rdma-ping checks require at least two hosts; single-host mode is supported only for --check-stage xccl")
 	}
 	targets = markLocalTargets(targets)
+	if opts.checkTUI != nil {
+		hosts := make([]string, 0, len(targets))
+		for _, target := range targets {
+			hosts = append(hosts, target.Name)
+		}
+		opts.checkTUI.report.setHosts(hosts)
+	}
 	if !opts.DryRun {
+		if opts.CommandRunner == nil {
+			if err := preflightTargetConnectivity(checkCtx, opts.Bundle.Check, targets, opts.Output); err != nil {
+				return err
+			}
+		}
 		warnHostnameMismatches(opts, targets)
 	}
 	if runBandwidth && opts.Bundle.Check.Bandwidth.BandwidthQPs < 0 {
@@ -79,12 +102,10 @@ func Run(opts Options) error {
 			if err != nil {
 				return err
 			}
+			if err := resolveBandwidthGIDs(opts, targets, resolvedGroups); err != nil {
+				return err
+			}
 		}
-	}
-	if tuiOutput != nil {
-		opts.aborts = newCheckAbortManager(tuiStages)
-		opts.checkTUI = startCheckTUI(os.Stdin, tuiOutput, tuiStages, checkCtx, cancelCheck, opts.aborts)
-		opts.Output = opts.checkTUI
 	}
 	var failures []string
 	var bandwidthResults []Result
@@ -158,9 +179,6 @@ func Run(opts Options) error {
 		finalErr = checkCancellationError(opts)
 	} else if len(failures) > 0 {
 		finalErr = fmt.Errorf("check failed: %s", strings.Join(failures, "; "))
-	}
-	if opts.checkTUI != nil {
-		opts.checkTUI.Finish(finalErr)
 	}
 	return finalErr
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"envinit/internal/nicdetect"
 	"envinit/internal/spec"
 )
 
@@ -256,6 +257,12 @@ func TestAutoDiscoverClassifiesManagementGIDAndExpandsEightRDMANICs(t *testing.T
 		if record.Name == "eth0" {
 			t.Fatalf("management GID interface was classified as RDMA: %#v", updated[0].RDMA)
 		}
+	}
+	if count := strings.Count(output.String(), "WARN discover gateway node1 rdma"); count != 8 {
+		t.Fatalf("expected one gateway reminder per RDMA slot, got %d:\n%s", count, output.String())
+	}
+	if !strings.Contains(output.String(), "inventory_gateway=(not set in inventory)") {
+		t.Fatalf("missing explicit unset-gateway reminder:\n%s", output.String())
 	}
 }
 
@@ -535,8 +542,8 @@ func TestNetworkDiscoveryReviewCanRemapRDMASlots(t *testing.T) {
 		Name:    "xpu-03",
 		Address: "10.61.10.23",
 		RDMA: []spec.RDMARecord{
-			{Name: "rdma1"},
-			{Name: "rdma2"},
+			{Name: "rdma1", Gateway: "10.61.11.1"},
+			{Name: "rdma2", Gateway: "10.61.12.1"},
 		},
 	}}
 	mgmt := map[string][]discoveredIPv4Address{
@@ -557,6 +564,63 @@ func TestNetworkDiscoveryReviewCanRemapRDMASlots(t *testing.T) {
 	}
 	if got[0].RDMA[1].Name != "ens13f0np0" || got[0].RDMA[1].IP != "10.61.13.23" {
 		t.Fatalf("unexpected rdma2 mapping: %#v", got[0].RDMA[1])
+	}
+	if got[0].RDMA[0].Gateway != "10.61.11.1" || got[0].RDMA[1].Gateway != "10.61.12.1" {
+		t.Fatalf("original inventory gateways must remain attached to logical slots: %#v", got[0].RDMA)
+	}
+	view := newNetworkDiscoveryModel(review).View()
+	for _, want := range []string{"Gateway is not discovered", "Inventory gateway", "10.61.11.1", "10.61.12.1"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("review missing %q:\n%s", want, view)
+		}
+	}
+	var output strings.Builder
+	printDiscoverGatewayReminders(&output, got)
+	for _, want := range []string{
+		"check each rdmaN_gateway",
+		"rdma1 iface=ens11f0np0 ip=10.61.11.23 inventory_gateway=10.61.11.1",
+		"rdma2 iface=ens13f0np0 ip=10.61.13.23 inventory_gateway=10.61.12.1",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("gateway reminder missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestNetworkDiscoveryReviewPreservesOrDeletesUnmatchedPlannedSlots(t *testing.T) {
+	target := Target{
+		Name:    "node1",
+		Address: "192.168.32.11",
+		RDMA: []spec.RDMARecord{
+			{Name: "planned0", IP: "25.16.1.11", Prefix: "25", Gateway: "25.16.1.126", Table: "101"},
+			{Name: "planned1", IP: "25.16.2.11", Prefix: "25", Gateway: "25.16.2.126", Table: "102"},
+			{Name: "planned2", IP: "25.16.3.11", Prefix: "25", Gateway: "25.16.3.126", Table: "103"},
+		},
+	}
+	m := map[string][]discoveredIPv4Address{"node1": {{Iface: "eth0", IP: "192.168.32.11", Preferred: true}}}
+	r := map[string][]discoveredRDMAInterface{"node1": {{Name: "ens1", IP: "25.16.1.12", Prefix: 25}}}
+	review := newNetworkDiscoveryReview([]Target{target}, m, r)
+	review.Targets[0].RDMAChoices[0] = 0
+	kept := reviewTargets(review)
+	if len(kept[0].RDMA) != 3 || kept[0].RDMA[1].Gateway != "25.16.2.126" || kept[0].RDMA[2].Table != "103" {
+		t.Fatalf("unmatched planned slots were not preserved: %#v", kept[0].RDMA)
+	}
+	review.Targets[0].DeleteUnmatched = true
+	deleted := reviewTargets(review)
+	if len(deleted[0].RDMA) != 1 || deleted[0].RDMA[0].Name != "ens1" {
+		t.Fatalf("confirmed deletion did not remove trailing slots: %#v", deleted[0].RDMA)
+	}
+}
+
+func TestApplyDiscoveryDecisionKeepsInventoryGatewayBySlot(t *testing.T) {
+	target := Target{Name: "node1", RDMA: []spec.RDMARecord{{Gateway: "10.1.1.1"}, {Gateway: "10.2.2.1"}}}
+	decision := nicdetect.Decision{RDMA: []nicdetect.Binding{
+		{Slot: 0, NIC: nicdetect.Facts{Name: "eth1", Addresses: []nicdetect.Address{{IP: "10.1.1.2", Prefix: 24}}}},
+		{Slot: 1, NIC: nicdetect.Facts{Name: "eth2", Addresses: []nicdetect.Address{{IP: "10.2.2.2", Prefix: 24}}}},
+	}}
+	applyDiscoveryDecision(&target, decision)
+	if target.RDMA[0].Gateway != "10.1.1.1" || target.RDMA[1].Gateway != "10.2.2.1" {
+		t.Fatalf("original inventory gateways must remain attached to logical slots: %#v", target.RDMA)
 	}
 }
 

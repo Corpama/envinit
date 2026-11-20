@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"envinit/internal/spec"
@@ -20,6 +21,7 @@ type treeEntry struct {
 	path  string
 	isDir bool
 	size  int64
+	mode  fs.FileMode
 }
 
 var legacySiblingBackupPattern = regexp.MustCompile(`\.bak\.\d{8}_\d{6}(?:\.\d+)?$`)
@@ -45,13 +47,13 @@ func localInterfaceIndex(root string) (map[string]string, []string, error) {
 	localMACs := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
-		path := filepath.Join(dir, name, "address")
-		data, err := os.ReadFile(path)
-		if err != nil {
+		// Do not let a bond/team/bridge runtime MAC shadow the permanent MAC
+		// of one of its physical members during machine resolution.
+		if aggregateInterface(dir, name) {
 			continue
 		}
-		mac, err := spec.NormalizeMAC(strings.TrimSpace(string(data)))
-		if err != nil {
+		mac, ok := readSysfsInterfaceMAC(dir, name)
+		if !ok {
 			continue
 		}
 		if mac == "" {
@@ -64,13 +66,49 @@ func localInterfaceIndex(root string) (map[string]string, []string, error) {
 	return ifaceByMAC, localMACs, nil
 }
 
+func aggregateInterface(netDir, name string) bool {
+	for _, marker := range []string{"bonding", "bridge", "team"} {
+		if _, err := os.Stat(filepath.Join(netDir, name, marker)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// A bond can propagate its runtime MAC to every enslaved physical interface.
+// perm_address remains the stable identity of the physical NIC.
+func readSysfsInterfaceMAC(netDir, name string) (string, bool) {
+	// For an enslaved NIC, bonding exposes the original hardware address at
+	// /sys/class/net/<slave>/bonding_slave/perm_hwaddr. The ordinary address
+	// file may instead expose the bond's runtime MAC.
+	permHWAddr := filepath.Join(netDir, name, "bonding_slave", "perm_hwaddr")
+	if data, err := os.ReadFile(permHWAddr); err == nil {
+		if mac, err := spec.NormalizeMAC(strings.TrimSpace(string(data))); err == nil && mac != "" {
+			return mac, true
+		}
+	}
+	for _, filename := range []string{"perm_address", "address"} {
+		data, err := os.ReadFile(filepath.Join(netDir, name, filename))
+		if err != nil {
+			continue
+		}
+		mac, err := spec.NormalizeMAC(strings.TrimSpace(string(data)))
+		if err == nil && mac != "" {
+			return mac, true
+		}
+	}
+	return "", false
+}
+
 func (a *App) disableExistingNetplan() error {
 	targets := a.netplanBackupTargets()
 	if len(targets) == 0 {
 		a.logf("skip backing up existing netplan files because no netplan network files will be rewritten")
 		return nil
 	}
-	return a.backupExistingTargets(targets)
+	// Each changed file is backed up by writeManagedFile immediately before
+	// atomic replacement. Never remove live files ahead of rendering.
+	return nil
 }
 
 func (a *App) netplanBackupTargets() []string {
@@ -93,7 +131,7 @@ func (a *App) disableExistingAptSources() error {
 		filepath.Join(a.targetPath("/etc/apt/sources.list.d"), "*.list"),
 		filepath.Join(a.targetPath("/etc/apt/sources.list.d"), "*.sources"),
 	}
-	target := a.targetPath(a.Bundle.OfflineAPT.TargetFile)
+	target := a.targetPath(a.offlineRepoConfig().TargetFile)
 	for _, pattern := range patterns {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
@@ -135,7 +173,7 @@ func (a *App) disableExistingIfcfg() error {
 		a.logf("skip backing up existing ifcfg files because no ifcfg network files will be rewritten")
 		return nil
 	}
-	return a.backupExistingTargets(targets)
+	return nil
 }
 
 func (a *App) relocateLegacyNetworkBackups() error {
@@ -160,6 +198,28 @@ func (a *App) relocateLegacyNetworkBackups() error {
 				return fmt.Errorf("relocate legacy network backup %s: %w", match, err)
 			}
 		}
+	}
+	var unknown []string
+	for _, pattern := range []string{
+		filepath.Join(a.targetPath(netplanDir), "*.bak*"),
+		filepath.Join(a.targetPath(networkScriptsDir), "ifcfg-*.bak*"),
+		filepath.Join(a.targetPath(networkScriptsDir), "route-*.bak*"),
+		filepath.Join(a.targetPath(networkScriptsDir), "rule-*.bak*"),
+	} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return fmt.Errorf("scan possible network backups %s: %w", pattern, err)
+		}
+		for _, match := range matches {
+			if seen[match] || legacySiblingBackupPattern.MatchString(filepath.Base(match)) {
+				continue
+			}
+			unknown = append(unknown, match)
+		}
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		return fmt.Errorf("needs attention: possible network configuration backups may be loaded by the active backend; envinit did not move files outside its exact legacy backup convention: %s", strings.Join(unknown, ", "))
 	}
 	return nil
 }
@@ -221,14 +281,26 @@ func (a *App) moveToBackup(path string) error {
 	}
 	a.logf("backup %s -> %s", path, backup)
 	if a.DryRun {
+		a.managedFileRevision++
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(backup), 0o700); err != nil {
 		return fmt.Errorf("create backup directory for %s: %w", path, err)
 	}
 	if err := os.Rename(path, backup); err != nil {
-		return fmt.Errorf("move %s to backup %s (backup_root must be on the same filesystem): %w", path, backup, err)
+		if errors.Is(err, syscall.EXDEV) && info.Mode().IsRegular() {
+			if err := a.copyToBackup(path); err != nil {
+				return err
+			}
+			if err := os.Remove(path); err != nil {
+				return err
+			}
+			a.managedFileRevision++
+			return nil
+		}
+		return fmt.Errorf("move %s to backup %s: %w", path, backup, err)
 	}
+	a.managedFileRevision++
 	return nil
 }
 
@@ -287,6 +359,9 @@ func pathContains(parent string, child string) bool {
 }
 
 func (a *App) writeManagedFile(systemPath string, content string, mode fs.FileMode) error {
+	if err := a.journalNetworkWrite(systemPath, []byte(content)); err != nil {
+		return err
+	}
 	target := a.targetPath(systemPath)
 	if !a.DryRun {
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
@@ -295,20 +370,39 @@ func (a *App) writeManagedFile(systemPath string, content string, mode fs.FileMo
 	}
 	if existing, err := os.ReadFile(target); err == nil {
 		if bytes.Equal(existing, []byte(content)) {
+			info, err := os.Lstat(target)
+			if err != nil {
+				return err
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("refuse non-regular configuration %s", target)
+			}
+			if info.Mode().Perm() != mode.Perm() && !a.DryRun {
+				if err := os.Chmod(target, mode.Perm()); err != nil {
+					return err
+				}
+				a.managedFileRevision++
+			}
 			a.logf("unchanged %s", systemPath)
 			return nil
 		}
-		if err := a.moveToBackup(target); err != nil {
+		if err := a.copyToBackup(target); err != nil {
 			return err
 		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
 	}
 	a.logf("write %s", systemPath)
 	if a.DryRun {
+		// Treat the planned write as a change so callers also describe the
+		// reload/restart that would follow a real replacement.
+		a.managedFileRevision++
 		return nil
 	}
-	if err := os.WriteFile(target, []byte(content), mode); err != nil {
+	if err := atomicWriteFile(target, []byte(content), mode); err != nil {
 		return fmt.Errorf("write %s: %w", systemPath, err)
 	}
+	a.managedFileRevision++
 	return os.Chmod(target, mode)
 }
 
@@ -326,22 +420,88 @@ func (a *App) removeFileIfExists(path string) error {
 func (a *App) movePath(source string, target string) error {
 	sourcePath := a.targetPath(source)
 	targetPath := a.targetPath(target)
+	if filepath.Clean(sourcePath) == filepath.Clean(targetPath) {
+		a.logf("already satisfied: move %s -> %s", source, target)
+		return nil
+	}
 	a.logf("move %s -> %s", source, target)
 	if a.DryRun {
 		return nil
 	}
+	sourceInfo, err := os.Lstat(sourcePath)
+	if err != nil {
+		return fmt.Errorf("inspect move source %s: %w", source, err)
+	}
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(targetPath), err)
 	}
-	if _, err := os.Stat(targetPath); err == nil {
-		if err := a.moveToBackup(targetPath); err != nil {
+	rollback := ""
+	if targetInfo, err := os.Lstat(targetPath); err == nil {
+		if targetInfo.IsDir() {
+			if err := a.copyDirectoryToBackup(targetPath); err != nil {
+				return err
+			}
+		} else if targetInfo.Mode().IsRegular() {
+			if err := a.copyToBackup(targetPath); err != nil {
+				return err
+			}
+		} else {
+			return fmt.Errorf("refuse to replace non-regular move target %s", target)
+		}
+		rollback = filepath.Join(filepath.Dir(targetPath), fmt.Sprintf(".envinit-old-%d", time.Now().UnixNano()))
+		if err := os.Rename(targetPath, rollback); err != nil {
+			return fmt.Errorf("prepare move target %s: %w", target, err)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := placeMovedPath(sourcePath, targetPath, sourceInfo); err != nil {
+		if rollback != "" {
+			if restoreErr := os.Rename(rollback, targetPath); restoreErr != nil {
+				return fmt.Errorf("move %s to %s: %w; restore failed: %v", source, target, err, restoreErr)
+			}
+		}
+		return fmt.Errorf("move %s to %s: %w", source, target, err)
+	}
+	if rollback != "" {
+		if err := os.RemoveAll(rollback); err != nil {
 			return err
 		}
 	}
-	if err := os.Rename(sourcePath, targetPath); err != nil {
-		return fmt.Errorf("move %s to %s: %w", source, target, err)
-	}
 	return nil
+}
+
+func placeMovedPath(source, target string, info fs.FileInfo) error {
+	if err := os.Rename(source, target); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	if info.Mode().IsRegular() {
+		data, err := os.ReadFile(source)
+		if err != nil {
+			return err
+		}
+		if err := atomicWriteFile(target, data, info.Mode()); err != nil {
+			return err
+		}
+		return os.Remove(source)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("refuse cross-filesystem move of non-regular path %s", source)
+	}
+	staged, err := os.MkdirTemp(filepath.Dir(target), ".envinit-move-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(staged)
+	if err := copyDirectoryTree(source, staged); err != nil {
+		return err
+	}
+	if err := os.Rename(staged, target); err != nil {
+		return err
+	}
+	return os.RemoveAll(source)
 }
 
 func (a *App) removePath(path string) error {
@@ -392,7 +552,12 @@ func (a *App) copyMaterial(source string, target string) error {
 }
 
 func (a *App) copyDirWithBackup(source string, target string) error {
-	if _, err := os.Stat(target); err == nil {
+	exists := false
+	if info, err := os.Lstat(target); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("refuse to replace non-directory target %s with directory material", target)
+		}
+		exists = true
 		same, err := dirTreesEqual(source, target)
 		if err != nil {
 			return err
@@ -401,14 +566,52 @@ func (a *App) copyDirWithBackup(source string, target string) error {
 			a.logf("unchanged %s", target)
 			return nil
 		}
-		if err := a.moveToBackup(target); err != nil {
-			return err
-		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
 	}
 	a.logf("copy %s -> %s", source, target)
 	if a.DryRun {
 		return nil
 	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	staged, err := os.MkdirTemp(filepath.Dir(target), ".envinit-dir-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(staged)
+	if err := copyDirectoryTree(source, staged); err != nil {
+		return fmt.Errorf("stage directory %s: %w", source, err)
+	}
+	rollback := ""
+	if exists {
+		if err := a.copyDirectoryToBackup(target); err != nil {
+			return err
+		}
+		rollback = filepath.Join(filepath.Dir(target), ".envinit-old-"+filepath.Base(staged))
+		if err := os.Rename(target, rollback); err != nil {
+			return fmt.Errorf("prepare directory replacement %s: %w", target, err)
+		}
+	}
+	if err := os.Rename(staged, target); err != nil {
+		if rollback != "" {
+			if restoreErr := os.Rename(rollback, target); restoreErr != nil {
+				return fmt.Errorf("replace directory %s: %w; restore failed: %v", target, err, restoreErr)
+			}
+		}
+		return fmt.Errorf("replace directory %s: %w", target, err)
+	}
+	if rollback != "" {
+		if err := os.RemoveAll(rollback); err != nil {
+			return fmt.Errorf("remove replaced directory %s: %w", rollback, err)
+		}
+	}
+	a.managedFileRevision++
+	return nil
+}
+
+func copyDirectoryTree(source string, target string) error {
 	return filepath.WalkDir(source, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -422,35 +625,98 @@ func (a *App) copyDirWithBackup(source string, target string) error {
 			dest = filepath.Join(target, rel)
 		}
 		if d.IsDir() {
-			return os.MkdirAll(dest, 0o755)
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			if err := os.MkdirAll(dest, info.Mode().Perm()); err != nil {
+				return err
+			}
+			return os.Chmod(dest, info.Mode().Perm())
 		}
 		info, err := d.Info()
 		if err != nil {
 			return err
 		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("refuse non-regular material %s", path)
+		}
 		return copyFileContents(path, dest, info.Mode())
 	})
 }
 
+func (a *App) copyDirectoryToBackup(path string) error {
+	now := time.Now
+	if a.now != nil {
+		now = a.now
+	}
+	dest, err := a.nextBackupPath(path, now())
+	if err != nil {
+		return err
+	}
+	if pathContains(path, dest) {
+		return fmt.Errorf("backup root must not be inside directory being backed up: %s -> %s", path, dest)
+	}
+	a.logf("backup copy %s -> %s", path, dest)
+	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+		return err
+	}
+	staged, err := os.MkdirTemp(filepath.Dir(dest), ".envinit-backup-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(staged)
+	if err := copyDirectoryTree(path, staged); err != nil {
+		return err
+	}
+	return os.Rename(staged, dest)
+}
+
 func (a *App) copyFileWithBackup(source string, target string, mode fs.FileMode) error {
-	if _, err := os.Stat(target); err == nil {
+	if targetInfo, err := os.Lstat(target); err == nil {
+		if !targetInfo.Mode().IsRegular() {
+			return fmt.Errorf("refuse to replace non-regular target %s", target)
+		}
 		same, err := filesEqual(source, target)
 		if err != nil {
 			return err
 		}
 		if same {
 			a.logf("unchanged %s", target)
+			if a.DryRun {
+				return nil
+			}
+			info, err := os.Stat(target)
+			if err != nil {
+				return err
+			}
+			if info.Mode().Perm() != mode.Perm() {
+				if err := os.Chmod(target, mode.Perm()); err != nil {
+					return err
+				}
+				a.managedFileRevision++
+			}
 			return nil
 		}
-		if err := a.moveToBackup(target); err != nil {
+		if err := a.copyToBackup(target); err != nil {
 			return err
 		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
 	}
 	a.logf("copy %s -> %s", source, target)
 	if a.DryRun {
 		return nil
 	}
-	return copyFileContents(source, target, mode)
+	data, err := os.ReadFile(source)
+	if err != nil {
+		return err
+	}
+	if err := atomicWriteFile(target, data, mode); err != nil {
+		return err
+	}
+	a.managedFileRevision++
+	return nil
 }
 
 func copyFileContents(source string, target string, mode fs.FileMode) error {
@@ -470,7 +736,10 @@ func copyFileContents(source string, target string, mode fs.FileMode) error {
 	if _, err := io.Copy(out, in); err != nil {
 		return err
 	}
-	return out.Chmod(mode.Perm())
+	if err := out.Chmod(mode.Perm()); err != nil {
+		return err
+	}
+	return out.Sync()
 }
 
 func dirTreesEqual(source string, target string) (bool, error) {
@@ -494,6 +763,9 @@ func dirTreesEqual(source string, target string) (bool, error) {
 			return false, nil
 		}
 		if sourceEntry.isDir != targetEntry.isDir {
+			return false, nil
+		}
+		if sourceEntry.mode.Perm() != targetEntry.mode.Perm() {
 			return false, nil
 		}
 		if sourceEntry.isDir {
@@ -531,6 +803,7 @@ func collectTreeEntries(root string) (map[string]treeEntry, error) {
 			path:  path,
 			isDir: d.IsDir(),
 			size:  info.Size(),
+			mode:  info.Mode(),
 		}
 		return nil
 	})

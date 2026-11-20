@@ -6,9 +6,11 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -82,6 +84,7 @@ type checkTUIController struct {
 	retestRuns   map[string]func(context.Context)
 	retestActive map[string]bool
 	retestWG     sync.WaitGroup
+	report       *checkReport
 }
 
 type checkTUIStagesMsg struct{ Stages []string }
@@ -99,12 +102,12 @@ type checkTUITextMsg struct {
 type checkTUIActivateMsg struct{ Stage string }
 type checkTUIFinishMsg struct{ Error string }
 
-func startCheckTUI(input *os.File, output *os.File, stages []string, checkCtx context.Context, cancel context.CancelFunc, aborts *checkAbortManager) *checkTUIController {
+func startCheckTUI(input *os.File, output *os.File, stages []string, checkCtx context.Context, cancel context.CancelFunc, aborts *checkAbortManager, report *checkReport) *checkTUIController {
 	retestCtx, retestCancel := context.WithCancel(checkCtx)
 	controller := &checkTUIController{
 		done: make(chan struct{}), stages: append([]string(nil), stages...),
 		retestCtx: retestCtx, retestCancel: retestCancel,
-		retestRuns: map[string]func(context.Context){}, retestActive: map[string]bool{},
+		retestRuns: map[string]func(context.Context){}, retestActive: map[string]bool{}, report: report,
 	}
 	if len(stages) > 0 {
 		controller.currentStage = stages[0]
@@ -114,6 +117,8 @@ func startCheckTUI(input *os.File, output *os.File, stages []string, checkCtx co
 	model.abortItem = aborts.abortItem
 	model.abortStage = aborts.abortStage
 	model.retestItem = controller.requestRetest
+	model.exportArchive = controller.exportArchive
+	model.exportPath = defaultCheckReportPath(report.started)
 	controller.program = tea.NewProgram(
 		model,
 		tea.WithInput(input),
@@ -138,6 +143,7 @@ func (c *checkTUIController) SetResults(stage string, headers []string, items []
 		item.Cells = append([]string(nil), item.Cells...)
 		cloned[idx] = item
 	}
+	c.report.setResults(stage, headers, cloned)
 	c.program.Send(checkTUIResultsMsg{Stage: stage, Headers: append([]string(nil), headers...), Items: cloned})
 }
 
@@ -146,6 +152,7 @@ func (c *checkTUIController) Update(item checkTUIItem) {
 		return
 	}
 	item.Cells = append([]string(nil), item.Cells...)
+	c.report.update(item)
 	c.program.Send(checkTUIUpdateMsg{Item: item})
 }
 
@@ -190,6 +197,16 @@ func (c *checkTUIController) requestRetest(stage, id string) string {
 	return fmt.Sprintf("Retest started for the selected %s item; q exits and cancels an active retest", stage)
 }
 
+func (c *checkTUIController) exportArchive(path string) error {
+	c.retestMu.Lock()
+	active := len(c.retestActive)
+	c.retestMu.Unlock()
+	if active > 0 {
+		return fmt.Errorf("wait for %d active retest(s) before exporting", active)
+	}
+	return c.report.export(path)
+}
+
 func (c *checkTUIController) SetActiveStage(stage string) {
 	if c == nil || stage == "" {
 		return
@@ -205,6 +222,11 @@ func (c *checkTUIController) AppendLog(stage, text string) {
 	if c == nil || strings.TrimSpace(text) == "" {
 		return
 	}
+	logStage := stage
+	if strings.HasPrefix(strings.TrimSpace(text), "RETEST ") {
+		logStage = "retests"
+	}
+	_ = c.report.appendLog(logStage, text)
 	c.program.Send(checkTUITextMsg{Stage: stage, Tab: checkTUITabLogs, Text: strings.TrimRight(text, "\n")})
 }
 
@@ -212,6 +234,7 @@ func (c *checkTUIController) AppendCounterSummary(kind, text string) {
 	if c == nil || strings.TrimSpace(text) == "" {
 		return
 	}
+	c.report.appendCounter(text)
 	for _, stage := range c.counterStages(kind) {
 		c.program.Send(checkTUITextMsg{Stage: stage, Tab: checkTUITabCounters, Text: strings.TrimRight(text, "\n")})
 	}
@@ -221,6 +244,7 @@ func (c *checkTUIController) AppendCounterSummaryForStage(stage, text string) {
 	if c == nil || stage == "" || strings.TrimSpace(text) == "" {
 		return
 	}
+	c.report.appendCounter(text)
 	c.program.Send(checkTUITextMsg{Stage: stage, Tab: checkTUITabCounters, Text: strings.TrimRight(text, "\n")})
 }
 
@@ -259,6 +283,11 @@ func (c *checkTUIController) Write(p []byte) (int, error) {
 	}
 	c.mu.Unlock()
 	for _, chunk := range chunks {
+		if err := c.report.appendLog(stage, chunk); err != nil {
+			return 0, err
+		}
+	}
+	for _, chunk := range chunks {
 		if chunk != "" {
 			c.program.Send(checkTUITextMsg{Stage: stage, Tab: checkTUITabLogs, Text: chunk})
 		}
@@ -276,6 +305,7 @@ func (c *checkTUIController) flushPending() {
 	c.pending = ""
 	c.mu.Unlock()
 	if pending != "" {
+		_ = c.report.appendLog(stage, pending)
 		c.program.Send(checkTUITextMsg{Stage: stage, Tab: checkTUITabLogs, Text: pending})
 	}
 }
@@ -285,6 +315,7 @@ func (c *checkTUIController) Finish(err error) {
 		return
 	}
 	c.flushPending()
+	c.report.finish(err)
 	errorText := ""
 	if err != nil {
 		errorText = err.Error()
@@ -323,6 +354,10 @@ type checkTUIModel struct {
 	abortedStages    map[string]bool
 	lastEsc          time.Time
 	notice           string
+	exportEditing    bool
+	exportPath       string
+	exportArchive    func(string) error
+	pendingLogTop    bool
 }
 
 func newCheckTUIModel() checkTUIModel {
@@ -360,7 +395,54 @@ func (m checkTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendText(m.currentStage(), checkTUITabLogs, "FINAL ERROR: "+msg.Error)
 		}
 	case tea.KeyMsg:
-		switch msg.String() {
+		if m.exportEditing {
+			switch msg.String() {
+			case "esc":
+				m.exportEditing = false
+			case "enter":
+				if m.exportArchive == nil {
+					m.notice = "Export is unavailable"
+				} else if err := m.exportArchive(m.exportPath); err != nil {
+					m.notice = "Export failed: " + err.Error()
+				} else {
+					absolute, _ := filepath.Abs(m.exportPath)
+					m.exportPath = absolute
+					m.notice = "Exported: " + absolute
+					m.exportEditing = false
+				}
+			case "backspace", "ctrl+h":
+				if len(m.exportPath) > 0 {
+					_, size := utf8.DecodeLastRuneInString(m.exportPath)
+					m.exportPath = m.exportPath[:len(m.exportPath)-size]
+				}
+			case "ctrl+u":
+				m.exportPath = ""
+			default:
+				if msg.Type == tea.KeyRunes {
+					m.exportPath += string(msg.Runes)
+				}
+			}
+			return m, nil
+		}
+		key := msg.String()
+		if m.tab == checkTUITabLogs {
+			switch key {
+			case "G", "shift+g":
+				m.textOffset = m.maxTextOffset()
+				m.pendingLogTop = false
+				return m, nil
+			case "g":
+				if m.pendingLogTop {
+					m.textOffset = 0
+					m.pendingLogTop = false
+				} else {
+					m.pendingLogTop = true
+				}
+				return m, nil
+			}
+		}
+		m.pendingLogTop = false
+		switch key {
 		case "ctrl+c":
 			if !m.finished && m.cancelCheck != nil {
 				m.cancelCheck()
@@ -379,6 +461,13 @@ func (m checkTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			m.abortSelectedItem()
+		case "e", "E":
+			if m.finished {
+				m.exportEditing = true
+				m.notice = ""
+			} else {
+				m.notice = "Export is available when the check finishes"
+			}
 		case "esc":
 			if m.finished {
 				return m, tea.Quit
@@ -514,6 +603,17 @@ func (m checkTUIModel) View() string {
 				footer += " | p heatmap"
 			}
 		}
+	}
+	if m.exportEditing {
+		footer = "Export ZIP path: " + m.exportPath + "\nEnter: save | Ctrl+U: clear | Esc: cancel"
+	} else if m.tab == checkTUITabLogs {
+		if m.finished {
+			footer = "Raw Logs | PgUp/PgDown: page | gg: top | Shift+G: bottom | [/]: stage | Tab: tab | Enter/q: exit | e: export ZIP"
+		} else {
+			footer = "Raw Logs | PgUp/PgDown: page | gg: top | Shift+G: bottom | [/]: stage | Tab: tab | Esc: abort stage"
+		}
+	} else if m.finished {
+		footer += " | e: export ZIP"
 	}
 	if m.notice != "" {
 		footer = m.notice + "\n" + footer
@@ -749,8 +849,7 @@ func (m *checkTUIModel) moveTab(delta int) {
 
 func (m *checkTUIModel) moveVertical(delta int) {
 	if m.tab != checkTUITabResults {
-		lines := m.currentTextLines()
-		m.textOffset = minInt(maxInt(0, len(lines)-1), maxInt(0, m.textOffset+delta))
+		m.textOffset = minInt(m.maxTextOffset(), maxInt(0, m.textOffset+delta))
 		return
 	}
 	items := m.currentTable().Items
@@ -793,9 +892,12 @@ func (m *checkTUIModel) movePage(delta int) {
 		m.detailOffset = 0
 		return
 	}
-	lines := m.currentTextLines()
 	step := maxInt(3, m.contentHeight()-1)
-	m.textOffset = minInt(maxInt(0, len(lines)-1), maxInt(0, m.textOffset+delta*step))
+	m.textOffset = minInt(m.maxTextOffset(), maxInt(0, m.textOffset+delta*step))
+}
+
+func (m checkTUIModel) maxTextOffset() int {
+	return maxInt(0, len(m.currentTextLines())-m.contentHeight())
 }
 
 func (m *checkTUIModel) moveDetailPage(delta int) {
@@ -812,6 +914,7 @@ func (m *checkTUIModel) resetViewport() {
 	m.detailOpen = false
 	m.plotMode = false
 	m.plotModeIndex = 0
+	m.pendingLogTop = false
 }
 
 func (m checkTUIModel) renderResults(width int) string {
@@ -1302,7 +1405,7 @@ func (m checkTUIModel) renderTextPage(width int, lines []string, empty string) s
 	if len(lines) == 0 {
 		return lipgloss.NewStyle().Width(width).Render(empty)
 	}
-	start := minInt(m.textOffset, maxInt(0, len(lines)-1))
+	start := minInt(m.textOffset, maxInt(0, len(lines)-height))
 	end := minInt(len(lines), start+height)
 	visible := make([]string, 0, end-start)
 	for _, line := range lines[start:end] {

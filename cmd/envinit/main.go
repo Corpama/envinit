@@ -25,6 +25,16 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "config":
+		if err := runConfig(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+	case "__network-worker":
+		if err := runner.RunNetworkWorker(); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	case "plan":
 		if err := run(true, os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
@@ -234,6 +244,7 @@ func applyCheckOverrides(b *spec.Bundle, opts checkOverrideOptions) error {
 			return fmt.Errorf("--rdma-ping-mtu must be greater than 28")
 		}
 		b.Check.RDMAPing.PayloadSize = opts.rdmaPingMTU - 28
+		b.Check.RDMAPing.PayloadAuto = false
 	}
 	return nil
 }
@@ -285,7 +296,7 @@ func run(dryRun bool, args []string) error {
 	fs := flag.NewFlagSet("envinit", flag.ContinueOnError)
 	inventoryPath := fs.String("inventory", "", "Path to the inventory file (.csv/.tsv/.txt/.xlsx)")
 	bundlePath := fs.String("bundle", "", "Path to the offline installation bundle JSON")
-	host := fs.String("host", "", "host_id/hostname/mgmt_ip from the inventory; auto-detect the current machine when omitted")
+	host := fs.String("host", "", "hostname/mgmt_ip from the inventory (legacy host_id is accepted); auto-detect the current machine when omitted")
 	root := fs.String("root", "/", "Alternate filesystem root for testing, defaults to /")
 	sheet := fs.String("sheet", "", "Worksheet name for .xlsx inventories, defaults to the first sheet")
 	stagesRaw := fs.String("stages", "all", "Stages separated by commas or spaces: all,software,ofed,network,udev,xre,xdr,firmware,container,mlxconfig,sysctl,kernel,post")
@@ -826,12 +837,14 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `envinit
 
 Usage:
+	  env_init config [--project DIR] [--plain] [--check-only] [--yes]
   envinit plan  --inventory ./machines.xlsx --bundle ./bundle.json [--host xpu11] [--plain]
   envinit apply --inventory ./machines.xlsx --bundle ./bundle.json [--host xpu11] [--restart]
   envinit discover --inventory ./machines.csv --bundle ./bundle.json --hosts xpu11=192.168.32.11 [--yes]
   envinit check --inventory ./machines.csv --bundle ./bundle.json [--hosts xpu11,xpu12] [--check-stage bandwidth|rdma-ping|xccl|all]
 
 Notes:
+	  config Prepare editable bundle/inventory templates offline; blank planning values are allowed
   plan   Parse the inventory and preview planned actions in a stage-by-stage TUI; use --plain for text output
   apply  Write files and execute commands; root privileges are required; default all-stage runs resume from saved progress
   discover  Discover mgmt_ip plus rdmaN_name/rdmaN_ip for one or more hosts and write them back to CSV/TSV/TXT inventory

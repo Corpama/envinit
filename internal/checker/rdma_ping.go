@@ -43,6 +43,13 @@ func runRDMAPingChecks(opts Options, targets []Target) []string {
 					})
 					continue
 				}
+				if opts.Bundle.Check.RDMAPing.PayloadAuto {
+					if err := resolveRDMAPingPayloads(opts, pair[0], pair[1], items); err != nil {
+						plans = append(plans, pairPlan{source: pair[0], destination: pair[1], rowOffset: len(rows), err: err})
+						rows = append(rows, rdmaPingResultRow{Status: "FAIL", Source: pair[0].Name, Destination: pair[1].Name, SourceNIC: "-", DestinationNIC: "-", SourceIP: "-", Payload: "auto", Result: err.Error(), Failure: true})
+						continue
+					}
+				}
 				plans = append(plans, pairPlan{source: pair[0], destination: pair[1], items: items, rowOffset: len(rows)})
 				for _, item := range items {
 					rows = append(rows, rdmaPingRow(opts, pair[0], pair[1], item, "WAIT", nil))
@@ -203,7 +210,7 @@ func rdmaPingRow(opts Options, source Target, destination Target, item rdmaPingI
 		DestinationNIC: firstNonEmpty(item.DestinationName, rdmaNICLabel(destination, item.DestinationIndex)),
 		SourceIP:       item.SourceIP,
 		DestinationIP:  item.DestinationIP,
-		Payload:        strconv.Itoa(opts.Bundle.Check.RDMAPing.PayloadSize),
+		Payload:        strconv.Itoa(firstPositive(item.PayloadSize, opts.Bundle.Check.RDMAPing.PayloadSize)),
 		Result:         "-",
 	}
 	if status == "WAIT" || status == "RUNNING" {
@@ -334,7 +341,7 @@ func rdmaPingRawLogLine(row rdmaPingResultRow) string {
 
 func rdmaPingItems(bundle spec.Bundle, source Target, destination Target) ([]rdmaPingItem, error) {
 	maxItems := maxInt(len(source.RDMA), len(destination.RDMA))
-	if maxItems == 0 {
+	if maxItems == 0 && (source.LegacySchema || destination.LegacySchema) {
 		maxItems = len(bundle.Defaults.RDMAInterfaces)
 	}
 	sourceNames := make([]string, maxItems)
@@ -351,14 +358,14 @@ func rdmaPingItems(bundle spec.Bundle, source Target, destination Target) ([]rdm
 		if idx < len(destination.RDMA) {
 			destinationName = strings.TrimSpace(destination.RDMA[idx].Name)
 		}
-		if destinationName == "" && idx < len(bundle.Defaults.RDMAInterfaces) {
+		if destinationName == "" && destination.LegacySchema && idx < len(bundle.Defaults.RDMAInterfaces) {
 			destinationName = strings.TrimSpace(bundle.Defaults.RDMAInterfaces[idx].Name)
 		}
 		sourceName := ""
 		if idx < len(source.RDMA) {
 			sourceName = strings.TrimSpace(source.RDMA[idx].Name)
 		}
-		if sourceName == "" && idx < len(bundle.Defaults.RDMAInterfaces) {
+		if sourceName == "" && source.LegacySchema && idx < len(bundle.Defaults.RDMAInterfaces) {
 			sourceName = strings.TrimSpace(bundle.Defaults.RDMAInterfaces[idx].Name)
 		}
 		if sourceName == "" && idx < len(source.RDMA) {
@@ -401,6 +408,7 @@ func rdmaPingItems(bundle spec.Bundle, source Target, destination Target) ([]rdm
 				SourceIP:         sourceIPs[sourceIndex],
 				DestinationName:  destinationNames[destinationIndex],
 				DestinationIP:    destinationIP,
+				PayloadSize:      bundle.Check.RDMAPing.PayloadSize,
 			})
 		}
 	}
@@ -488,13 +496,62 @@ func compactTableCell(text string) string {
 }
 
 func rdmaPingArgs(cfg spec.CheckConfig, item rdmaPingItem) []string {
+	payload := item.PayloadSize
+	if payload <= 0 {
+		payload = cfg.RDMAPing.PayloadSize
+	}
 	return []string{
 		"ping",
 		"-c", strconv.Itoa(cfg.RDMAPing.Count),
 		"-W", strconv.Itoa(cfg.RDMAPing.Timeout),
 		"-M", "do",
-		"-s", strconv.Itoa(cfg.RDMAPing.PayloadSize),
+		"-s", strconv.Itoa(payload),
 		"-I", item.SourceName,
 		item.DestinationIP,
 	}
+}
+
+func resolveRDMAPingPayloads(opts Options, source, destination Target, items []rdmaPingItem) error {
+	mtuCache := map[string]int{}
+	readMTU := func(target Target, iface string) (int, error) {
+		key := target.Name + "\x00" + iface
+		if value, ok := mtuCache[key]; ok {
+			return value, nil
+		}
+		command := fmt.Sprintf("cat /sys/class/net/%s/mtu", shellQuote(iface))
+		output, err := runCheckCommand(opts, target, command)
+		if err != nil {
+			return 0, fmt.Errorf("read MTU for %s on %s: %w", iface, target.Name, err)
+		}
+		mtu, err := strconv.Atoi(strings.TrimSpace(output))
+		if err != nil || mtu <= 28 || mtu > 65535 {
+			return 0, fmt.Errorf("invalid MTU %q for %s on %s; expected an integer in 29..65535", strings.TrimSpace(output), iface, target.Name)
+		}
+		mtuCache[key] = mtu
+		return mtu, nil
+	}
+	for idx := range items {
+		sourceMTU, err := readMTU(source, items[idx].SourceName)
+		if err != nil {
+			return err
+		}
+		destinationMTU, err := readMTU(destination, items[idx].DestinationName)
+		if err != nil {
+			return err
+		}
+		items[idx].PayloadSize = minInt(sourceMTU, destinationMTU) - 28
+		if items[idx].PayloadSize <= 0 {
+			return fmt.Errorf("computed RDMA ping payload is invalid for %s -> %s", source.Name, destination.Name)
+		}
+	}
+	return nil
+}
+
+func firstPositive(values ...int) int {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
 }

@@ -12,7 +12,7 @@ func TestCheckConfigUnmarshalAcceptsNestedBandwidth(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{
 		"bandwidth": {"iterations": 77, "min_gbits": 380},
 		"rdma_ping": {"count": 4, "payload_size": 8972, "timeout": 3},
-		"ssh": {"user": "root", "options": ["-p", "22"]}
+		"ssh": {"user": "root", "port": 9527, "options": ["-o", "Port=22"]}
 	}`), &cfg); err != nil {
 		t.Fatalf("unmarshal nested check config: %v", err)
 	}
@@ -22,7 +22,7 @@ func TestCheckConfigUnmarshalAcceptsNestedBandwidth(t *testing.T) {
 	if cfg.RDMAPing.Count != 4 || cfg.RDMAPing.PayloadSize != 8972 || cfg.RDMAPing.Timeout != 3 {
 		t.Fatalf("unexpected nested RDMA ping config: %#v", cfg.RDMAPing)
 	}
-	if cfg.SSH.User != "root" || len(cfg.SSH.Options) != 2 {
+	if cfg.SSH.User != "root" || cfg.SSH.Port != 9527 || len(cfg.SSH.Options) != 2 {
 		t.Fatalf("unexpected nested SSH config: %#v", cfg.SSH)
 	}
 }
@@ -37,7 +37,8 @@ func TestCheckConfigUnmarshalAcceptsLegacyFlatBandwidth(t *testing.T) {
 		"rdma_ping_payload_size": 8972,
 		"rdma_ping_timeout": 3,
 		"ssh_user": "root",
-		"ssh_options": ["-p", "22"]
+		"ssh_port": 9527,
+		"ssh_options": ["-o", "Port=22"]
 	}`), &cfg); err != nil {
 		t.Fatalf("unmarshal legacy check config: %v", err)
 	}
@@ -50,20 +51,20 @@ func TestCheckConfigUnmarshalAcceptsLegacyFlatBandwidth(t *testing.T) {
 	if cfg.RDMAPing.Count != 4 || cfg.RDMAPing.PayloadSize != 8972 || cfg.RDMAPing.Timeout != 3 {
 		t.Fatalf("unexpected legacy RDMA ping config: %#v", cfg.RDMAPing)
 	}
-	if cfg.SSH.User != "root" || len(cfg.SSH.Options) != 2 {
+	if cfg.SSH.User != "root" || cfg.SSH.Port != 9527 || len(cfg.SSH.Options) != 2 {
 		t.Fatalf("unexpected legacy SSH config: %#v", cfg.SSH)
 	}
 }
 
-func TestCheckConfigNestedBandwidthTakesPrecedenceOverLegacyFields(t *testing.T) {
+func TestCheckConfigNestedFieldsMergeEqualLegacyValues(t *testing.T) {
 	var cfg CheckConfig
 	if err := json.Unmarshal([]byte(`{
-		"iterations": 99,
-		"min_gbits": 100,
+		"iterations": 77,
+		"min_gbits": 380,
 		"bandwidth": {"iterations": 77, "min_gbits": 380},
-		"rdma_ping_count": 9,
+		"rdma_ping_count": 4,
 		"rdma_ping": {"count": 4},
-		"ssh_user": "legacy",
+		"ssh_user": "nested",
 		"ssh": {"user": "nested"}
 	}`), &cfg); err != nil {
 		t.Fatalf("unmarshal mixed check config: %v", err)
@@ -118,6 +119,67 @@ func TestBandwidthMinGBitsDefaultsToAutoButExplicitZeroStaysDisabled(t *testing.
 	bundle.ApplyDefaults()
 	if got := bundle.Check.Bandwidth.MinGBitsMode(); got != "disabled" {
 		t.Fatalf("explicit zero mode = %q, want disabled", got)
+	}
+}
+
+func TestBandwidthGIDIndexSupportsAutoAndManualValues(t *testing.T) {
+	var auto CheckConfig
+	if err := json.Unmarshal([]byte(`{"bandwidth":{"gid_index":"auto"}}`), &auto); err != nil {
+		t.Fatalf("unmarshal gid auto: %v", err)
+	}
+	if !auto.Bandwidth.GIDIndexAuto || auto.Bandwidth.GIDIndex != 0 {
+		t.Fatalf("unexpected gid auto state: %#v", auto.Bandwidth)
+	}
+	encoded, err := json.Marshal(auto.Bandwidth)
+	if err != nil || !strings.Contains(string(encoded), `"gid_index":"auto"`) {
+		t.Fatalf("gid auto did not round-trip: %s (%v)", encoded, err)
+	}
+
+	var manual CheckConfig
+	if err := json.Unmarshal([]byte(`{"bandwidth":{"gid_index":0}}`), &manual); err != nil {
+		t.Fatalf("unmarshal gid zero: %v", err)
+	}
+	b := Bundle{Check: manual}
+	b.ApplyDefaults()
+	if b.Check.Bandwidth.GIDIndexAuto || b.Check.Bandwidth.GIDIndex != 0 {
+		t.Fatalf("explicit gid zero should remain manual: %#v", b.Check.Bandwidth)
+	}
+}
+
+func TestRDMAPingPayloadSupportsAutoAndRejectsInvalidValues(t *testing.T) {
+	var cfg CheckConfig
+	if err := json.Unmarshal([]byte(`{"rdma_ping":{"payload_size":"auto"}}`), &cfg); err != nil {
+		t.Fatalf("unmarshal payload auto: %v", err)
+	}
+	if !cfg.RDMAPing.PayloadAuto || cfg.RDMAPing.PayloadSize != 0 {
+		t.Fatalf("unexpected payload auto state: %#v", cfg.RDMAPing)
+	}
+	encoded, err := json.Marshal(cfg.RDMAPing)
+	if err != nil || !strings.Contains(string(encoded), `"payload_size":"auto"`) {
+		t.Fatalf("payload auto did not round-trip: %s (%v)", encoded, err)
+	}
+	for _, raw := range []string{`{"rdma_ping":{"payload_size":0}}`, `{"rdma_ping":{"payload_size":"fixed"}}`} {
+		if err := json.Unmarshal([]byte(raw), &CheckConfig{}); err == nil {
+			t.Fatalf("expected invalid payload value to fail: %s", raw)
+		}
+	}
+}
+
+func TestBundleLegacyOfflineAPTNormalizesToOfflineRepo(t *testing.T) {
+	var b Bundle
+	if err := json.Unmarshal([]byte(`{"offline_apt":{"enabled":true,"material_path":"/mnt/repo"}}`), &b); err != nil {
+		t.Fatalf("unmarshal legacy offline repo: %v", err)
+	}
+	if len(b.Warnings) == 0 || b.OfflineRepo.MaterialPath != "/mnt/repo" || !b.OfflineRepo.Enabled {
+		t.Fatalf("legacy offline repo was not normalized: %#v", b)
+	}
+	b.ApplyDefaults()
+	encoded, err := json.Marshal(b)
+	if err != nil {
+		t.Fatalf("marshal normalized bundle: %v", err)
+	}
+	if strings.Contains(string(encoded), `"offline_apt"`) || !strings.Contains(string(encoded), `"offline_repo"`) {
+		t.Fatalf("unexpected normalized bundle JSON: %s", encoded)
 	}
 }
 
@@ -186,7 +248,7 @@ func TestApplyDefaultsGeneratesOfflineAPTEntries(t *testing.T) {
 		},
 	}
 	b.ApplyDefaults()
-	want := "deb [trusted=yes] file:{{offline_apt_target}} ./"
+	want := "deb [trusted=yes] file:{{offline_apt_target}} jammy main"
 	if len(b.OfflineAPT.Entries) != 1 || b.OfflineAPT.Entries[0] != want {
 		t.Fatalf("unexpected offline apt entries: %#v", b.OfflineAPT.Entries)
 	}
@@ -524,6 +586,80 @@ func TestValidateRejectsBackupRootInsideActiveNetworkDirectory(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsBackupRootContainingActiveConfiguration(t *testing.T) {
+	b := Bundle{Defaults: Defaults{BackupRoot: "/etc"}}
+	b.ApplyDefaults()
+	if err := b.Validate(); err == nil || !strings.Contains(err.Error(), "active configuration directory") {
+		t.Fatalf("expected overlapping active configuration validation error, got %v", err)
+	}
+}
+
+func TestRDMAGatewayProbeDefaultsAndLimits(t *testing.T) {
+	b := Bundle{}
+	b.ApplyDefaults()
+	p := b.Defaults.RDMAGatewayProbe.Effective()
+	if !p.IsEnabled() || p.Attempts != 3 || p.TimeoutSeconds != 3 || p.LinkWaitSeconds != 5 {
+		t.Fatalf("unexpected probe defaults: %#v", p)
+	}
+	disabled := false
+	b.Defaults.RDMAGatewayProbe.Enabled = &disabled
+	if b.Defaults.RDMAGatewayProbe.IsEnabled() {
+		t.Fatal("expected gateway probe to be explicitly disableable")
+	}
+	b.Defaults.RDMAGatewayProbe.Attempts = 11
+	if err := b.Validate(); err == nil || !strings.Contains(err.Error(), "rdma_gateway_probe") {
+		t.Fatalf("expected probe limit validation error, got %v", err)
+	}
+}
+
+func TestValidateStageChecks(t *testing.T) {
+	b := Bundle{StageChecks: map[string]string{"OFED": "ofed_info -s"}}
+	b.ApplyDefaults()
+	if err := b.Validate(); err == nil || !strings.Contains(err.Error(), "stage_checks") {
+		t.Fatalf("expected normalized stage check key error, got %v", err)
+	}
+	b.StageChecks = map[string]string{"firmware": "  "}
+	if err := b.Validate(); err == nil || !strings.Contains(err.Error(), "must not be empty") {
+		t.Fatalf("expected empty stage check error, got %v", err)
+	}
+}
+
+func TestValidateCheckSSHPort(t *testing.T) {
+	for _, port := range []int{-1, 65536} {
+		b := Bundle{Check: CheckConfig{SSH: CheckSSHConfig{Port: port}}}
+		b.ApplyDefaults()
+		if err := b.Validate(); err == nil || !strings.Contains(err.Error(), "check.ssh.port") {
+			t.Fatalf("expected check.ssh.port error for port %d, got %v", port, err)
+		}
+	}
+	b := Bundle{Check: CheckConfig{SSH: CheckSSHConfig{Port: 9527}}}
+	b.ApplyDefaults()
+	if err := b.Validate(); err != nil {
+		t.Fatalf("expected port 9527 to pass validation: %v", err)
+	}
+}
+
+func TestValidateCheckSSHOptionsRejectBarePortFlags(t *testing.T) {
+	for _, options := range [][]string{
+		{"-p", "9527"},
+		{"-p9527"},
+		{"-P", "9527"},
+		{"-P9527"},
+	} {
+		b := Bundle{Check: CheckConfig{SSH: CheckSSHConfig{Options: options}}}
+		b.ApplyDefaults()
+		err := b.Validate()
+		if err == nil || !strings.Contains(err.Error(), "check.ssh.options") {
+			t.Fatalf("expected bare port flag rejection for %v, got %v", options, err)
+		}
+	}
+	b := Bundle{Check: CheckConfig{SSH: CheckSSHConfig{Options: []string{"-o", "Port=9527"}}}}
+	b.ApplyDefaults()
+	if err := b.Validate(); err != nil {
+		t.Fatalf("expected -o Port= form to pass validation: %v", err)
+	}
+}
+
 func TestRDMAModeNamesOnlyKeepsRDMAWithoutIPRoute(t *testing.T) {
 	b := Bundle{
 		Defaults: Defaults{
@@ -646,6 +782,24 @@ func TestResolveMachineInventoryCountOverridesBundleDefaults(t *testing.T) {
 	}
 	if cfg.RDMA[0].Name != "ens1" || cfg.RDMA[1].Name != "ens2" {
 		t.Fatalf("unexpected resolved RDMA interfaces: %#v", cfg.RDMA)
+	}
+}
+
+func TestResolveMachineUsesSlotTableWhenLegacyDefaultTableIsOmitted(t *testing.T) {
+	b := Bundle{Defaults: Defaults{
+		RDMAMode:       RDMAModeNamesOnly,
+		RDMAInterfaces: []RDMAInterfaceDefault{{Name: "default1"}, {Name: "default2", Table: 202}},
+	}}
+	b.ApplyDefaults()
+	cfg, err := ResolveMachine(b, MachineRecord{HostID: "node01", RDMA: []RDMARecord{{Name: "ens1"}, {Name: "ens2"}}}, nil)
+	if err != nil {
+		t.Fatalf("resolve machine: %v", err)
+	}
+	if got := cfg.RDMA[0].Table; got != 101 {
+		t.Fatalf("omitted legacy table should use slot default 101, got %d", got)
+	}
+	if got := cfg.RDMA[1].Table; got != 202 {
+		t.Fatalf("explicit legacy table should be preserved, got %d", got)
 	}
 }
 

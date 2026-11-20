@@ -120,6 +120,13 @@ func runXCCLCheck(opts Options, targets []Target, groupsByTarget resolvedRDMAGro
 		if !remoteTouched {
 			return
 		}
+		if runErr != nil {
+			dump := collectXCCLRuntimeLogs(opts, plans, workDir)
+			if strings.TrimSpace(dump) != "" {
+				fmt.Fprintln(opts.Output, "XCCL collected runtime logs:")
+				fmt.Fprintln(opts.Output, dump)
+			}
+		}
 		cleanupErr := cleanupXCCLTargets(opts, plans, workDir, marker, multiHost)
 		if cleanupErr == nil {
 			if multiHost {
@@ -199,26 +206,35 @@ func runXCCLCheck(opts Options, targets []Target, groupsByTarget resolvedRDMAGro
 	mpirunCommand := xcclTrackedMPIRunCommand(workDir, mpirunArgs)
 	fmt.Fprintf(opts.Output, "INFO xccl mpirun coordinator=%s ranks=%d: %s\n", coordinator.Name, totalRanks, mpirunCommand)
 	var liveWriter *lineCallbackWriter
-	var liveStdout io.Writer
+	logWriter := &lineCallbackWriter{callback: func(line string) {
+		if strings.TrimSpace(line) == "" {
+			return
+		}
+		if len(parseXCCLPerformanceRows(line)) > 0 {
+			return
+		}
+		fmt.Fprintln(opts.Output, line)
+	}}
+	var writers []io.Writer
 	if live != nil {
 		liveWriter = &lineCallbackWriter{callback: live.ConsumeLine}
-		liveStdout = liveWriter
+		writers = append(writers, liveWriter)
 	}
-	output, err := runCheckCommandStreaming(opts, coordinator, mpirunCommand, liveStdout, nil)
-	if opts.checkTUI != nil && strings.TrimSpace(output) != "" {
-		opts.checkTUI.AppendLog(checkTUIStageXCCL, strings.TrimRight(output, "\n"))
-	}
+	writers = append(writers, logWriter)
+	liveStdout := io.MultiWriter(writers...)
+	liveStderr := &lineCallbackWriter{callback: func(line string) {
+		if strings.TrimSpace(line) == "" {
+			return
+		}
+		fmt.Fprintln(opts.Output, "XCCL stderr: "+line)
+	}}
+	output, err := runCheckCommandStreaming(opts, coordinator, mpirunCommand, liveStdout, liveStderr)
 	if liveWriter != nil {
 		liveWriter.Flush()
-	} else if strings.TrimSpace(output) != "" {
-		fmt.Fprintln(opts.Output, "XCCL raw output:")
-		fmt.Fprintln(opts.Output, strings.TrimRight(output, "\n"))
 	}
+	logWriter.Flush()
+	liveStderr.Flush()
 	if err != nil {
-		if live != nil && strings.TrimSpace(output) != "" {
-			fmt.Fprintln(opts.Output, "XCCL failure output:")
-			fmt.Fprintln(opts.Output, strings.TrimRight(output, "\n"))
-		}
 		return fmt.Errorf("run XCCL %s on %d ranks: %w", cfg.Test, totalRanks, err)
 	}
 	rows := parseXCCLPerformanceRows(output)
@@ -300,6 +316,7 @@ func validateXCCLConfig(cfg spec.CheckXCCLConfig) error {
 		"PATH": true, "LD_LIBRARY_PATH": true, "XPU_HOME": true, "XPU_VISIBLE_DEVICES": true, "CUDA_VISIBLE_DEVICES": true,
 		"BKCL_TIMEOUT": true, "BKCL_ENABLE_XDR": true,
 		"BKCL_RDMA_NICS": true, "BKCL_FORCE_RDMA_NICS_ORDER": true, "BKCL_SOCKET_IFNAME": true,
+		"MPIR_CVAR_CH3_INTERFACE_HOSTNAME": true, "MPICH_INTERFACE_HOSTNAME": true,
 		"BKCL_SWITCH_TOPO": true, "BKCL_RDMA_VERBS": true,
 	}
 	for key, value := range cfg.Environment {
@@ -513,11 +530,12 @@ func resolveXCCLTargetPlans(opts Options, targets []Target, groupsByTarget resol
 		alignXCCLPlansByRail(plans)
 	}
 	for idx := range plans {
-		socketInterface, err := resolveXCCLSocketInterface(opts, plans[idx].Target, plans[idx])
+		socketInterface, mpiIP, err := resolveXCCLControlInterfaces(opts, plans[idx].Target)
 		if err != nil {
 			return nil, err
 		}
 		plans[idx].SocketInterface = socketInterface
+		plans[idx].MPIInterfaceIP = mpiIP
 	}
 	return plans, nil
 }
@@ -706,7 +724,7 @@ func xcclPlanFromTopology(bundle spec.Bundle, target Target, groups []spec.Check
 		if iface == "" || device == "" || nic == "" {
 			return xcclTargetPlan{}, fmt.Errorf("resolve XCCL RDMA mapping for %s rdma%d: iface=%q ib_device=%q is incomplete or absent from xpu-smi topology NIC columns/mapping", target.Name, idx+1, iface, device)
 		}
-		candidates = append(candidates, xcclNICCandidate{iface: iface, device: device, nic: nic, rail: xcclRDMARail(bundle, target, idx)})
+		candidates = append(candidates, xcclNICCandidate{iface: iface, device: device, nic: nic, rail: xcclRDMARail(target, idx)})
 	}
 
 	xpuIndexes := make([]int, 0, len(topology.Links))
@@ -871,7 +889,7 @@ func minimumCostColumns(costs [][]int, unavailable int) ([]int, error) {
 	return assignment, nil
 }
 
-func xcclRDMARail(bundle spec.Bundle, target Target, index int) string {
+func xcclRDMARail(target Target, index int) string {
 	if index < 0 || index >= len(target.RDMA) {
 		return fmt.Sprintf("slot:rdma%d", index+1)
 	}
@@ -884,9 +902,6 @@ func xcclRDMARail(bundle spec.Bundle, target Target, index int) string {
 		return fmt.Sprintf("slot:rdma%d", index+1)
 	}
 	prefix := strings.TrimSpace(record.Prefix)
-	if prefix == "" && bundle.Defaults.RDMAPrefix > 0 {
-		prefix = strconv.Itoa(bundle.Defaults.RDMAPrefix)
-	}
 	if prefix == "" && ip.To4() != nil {
 		prefix = "24"
 	}
@@ -899,25 +914,81 @@ func xcclRDMARail(bundle spec.Bundle, target Target, index int) string {
 	return ip.String()
 }
 
-func resolveXCCLSocketInterface(opts Options, target Target, plan xcclTargetPlan) (string, error) {
-	if value := strings.TrimSpace(opts.Bundle.Check.XCCL.SocketInterface); value != "" {
-		command := fmt.Sprintf("test -d /sys/class/net/%s && printf '%%s\\n' %s", shellQuote(value), shellQuote(value))
-		output, err := runDiscoveryCommand(opts, target, command)
-		if err != nil {
-			return "", fmt.Errorf("verify XCCL socket interface %s on %s: %w", value, target.Name, err)
+func resolveXCCLControlInterfaces(opts Options, target Target) (string, string, error) {
+	output, err := runDiscoveryCommand(opts, target, "ip -o -4 addr show scope global")
+	if err != nil {
+		return "", "", fmt.Errorf("discover XCCL control interfaces on %s: %w", target.Name, err)
+	}
+	addresses := parseXCCLInterfaceAddresses(output)
+	mgmtIP := strings.TrimSpace(target.Address)
+	parsedMgmtIP := net.ParseIP(mgmtIP)
+	if parsedMgmtIP == nil || parsedMgmtIP.To4() == nil {
+		return "", "", fmt.Errorf("XCCL management address for %s must be an inventory IPv4 address, got %q", target.Name, mgmtIP)
+	}
+	mgmtIface := ""
+	for iface, ips := range addresses {
+		for _, ip := range ips {
+			if ip == mgmtIP {
+				if mgmtIface != "" && mgmtIface != iface {
+					return "", "", fmt.Errorf("XCCL management IP %s appears on multiple interfaces on %s", mgmtIP, target.Name)
+				}
+				mgmtIface = iface
+			}
 		}
-		return strings.TrimSpace(strings.SplitN(output, "\n", 2)[0]), nil
 	}
-	if len(plan.RDMANICs) == 0 || strings.TrimSpace(plan.RDMANICs[0]) == "" {
-		return "", fmt.Errorf("discover XCCL socket interface for %s: no participating RDMA interface is available", target.Name)
+	if mgmtIface == "" {
+		return "", "", fmt.Errorf("XCCL management IP %s is not assigned to a local interface on %s", mgmtIP, target.Name)
 	}
-	return strings.TrimSpace(plan.RDMANICs[0]), nil
+	socketIface := firstNonEmpty(strings.TrimSpace(opts.Bundle.Check.XCCL.SocketInterface), mgmtIface)
+	if len(addresses[socketIface]) == 0 {
+		return "", "", fmt.Errorf("XCCL BKCL socket interface %s has no global IPv4 address on %s", socketIface, target.Name)
+	}
+	mpiIface := firstNonEmpty(strings.TrimSpace(opts.Bundle.Check.XCCL.MPIInterface), mgmtIface)
+	mpiIPs := addresses[mpiIface]
+	if len(mpiIPs) == 0 {
+		return "", "", fmt.Errorf("XCCL MPI interface %s has no global IPv4 address on %s", mpiIface, target.Name)
+	}
+	mpiIP := mgmtIP
+	if mpiIface != mgmtIface {
+		if len(mpiIPs) != 1 {
+			return "", "", fmt.Errorf("XCCL MPI interface %s has %d IPv4 addresses on %s; choose an unambiguous interface", mpiIface, len(mpiIPs), target.Name)
+		}
+		mpiIP = mpiIPs[0]
+	}
+	return socketIface, mpiIP, nil
+}
+
+func parseXCCLInterfaceAddresses(output string) map[string][]string {
+	addresses := make(map[string][]string)
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[2] != "inet" {
+			continue
+		}
+		iface := strings.SplitN(strings.TrimSuffix(fields[1], ":"), "@", 2)[0]
+		ip := strings.SplitN(fields[3], "/", 2)[0]
+		parsedIP := net.ParseIP(ip)
+		if parsedIP == nil || parsedIP.To4() == nil {
+			continue
+		}
+		seen := false
+		for _, existing := range addresses[iface] {
+			if existing == ip {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			addresses[iface] = append(addresses[iface], ip)
+		}
+	}
+	return addresses
 }
 
 func printXCCLPlan(opts Options, plans []xcclTargetPlan) {
 	for _, plan := range plans {
-		fmt.Fprintf(opts.Output, "INFO xccl topology: %s xpus=%d xpu_order=%s socket_iface=%s unique_rdma_nics(%d)=%s rdma_nics(%d)=%s force_order(%d)=%s rail_order=%s mapping=%s\n",
-			plan.Target.Name, plan.XPUCount, xcclPlanVisibleDevices(plan), firstNonEmpty(plan.SocketInterface, "auto"), len(plan.RDMANICs), strings.Join(plan.RDMANICs, ","),
+		fmt.Fprintf(opts.Output, "INFO xccl topology: %s xpus=%d xpu_order=%s socket_iface=%s mpi_ip=%s unique_rdma_nics(%d)=%s rdma_nics(%d)=%s force_order(%d)=%s rail_order=%s mapping=%s\n",
+			plan.Target.Name, plan.XPUCount, xcclPlanVisibleDevices(plan), firstNonEmpty(plan.SocketInterface, "auto"), firstNonEmpty(plan.MPIInterfaceIP, "auto"), len(plan.RDMANICs), strings.Join(plan.RDMANICs, ","),
 			len(plan.RDMANICOrder), strings.Join(plan.RDMANICOrder, ","), len(plan.RDMANICOrder), strings.Join(plan.RDMANICOrder, ","), strings.Join(plan.RDMARailOrder, ","), strings.Join(plan.Mapping, ";"))
 		for _, mapping := range plan.Mapping {
 			if strings.HasSuffix(mapping, ",PIX)") {
@@ -952,7 +1023,12 @@ func printXCCLDryRun(opts Options, plans []xcclTargetPlan, coordinator Target, w
 }
 
 func xcclPrepareDirectoriesCommand(workDir string) string {
-	return fmt.Sprintf("umask 077; mkdir -p %s %s %s", shellQuote(filepath.Join(workDir, "incoming")), shellQuote(filepath.Join(workDir, "runtime")), shellQuote(filepath.Join(workDir, "ssh")))
+	return fmt.Sprintf("umask 077; mkdir -p %s %s %s %s %s",
+		shellQuote(filepath.Join(workDir, "incoming")),
+		shellQuote(filepath.Join(workDir, "runtime")),
+		shellQuote(filepath.Join(workDir, "ssh")),
+		shellQuote(filepath.Join(workDir, "logs")),
+		shellQuote(filepath.Join(workDir, "bccl-sockets")))
 }
 
 func xcclInstallRuntimeCommand(cfg spec.CheckXCCLConfig, workDir string, withSSHAuthorization bool) string {
@@ -999,12 +1075,13 @@ func xcclAuthorizeKeyCommand(workDir, marker string) string {
 }
 
 func xcclRankScript(cfg spec.CheckXCCLConfig, plan xcclTargetPlan, workDir string, multiHost bool) string {
-	env := xcclManagedRankEnvironment(cfg, plan, multiHost)
+	env := xcclManagedRankEnvironment(cfg, plan, workDir, multiHost)
 	keys := make([]string, 0, len(env))
 	for key := range env {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	logDir := xcclRuntimeSubdir(workDir, "logs")
 	lines := []string{
 		"#!/bin/sh",
 		"set -eu",
@@ -1012,6 +1089,14 @@ func xcclRankScript(cfg spec.CheckXCCLConfig, plan xcclTargetPlan, workDir strin
 		fmt.Sprintf("export XPU_HOME=%s", shellQuote(strings.TrimRight(cfg.XPUHome, "/"))),
 		fmt.Sprintf("if [ -n \"${PATH:-}\" ]; then export PATH=%s:\"$PATH\"; else export PATH=%s; fi", shellQuote(xcclMPICHPrefix+"/bin:"+strings.TrimRight(cfg.XPUHome, "/")+"/bin"), shellQuote(xcclMPICHPrefix+"/bin:"+strings.TrimRight(cfg.XPUHome, "/")+"/bin")),
 		fmt.Sprintf("if [ -n \"${LD_LIBRARY_PATH:-}\" ]; then export LD_LIBRARY_PATH=%s:\"$LD_LIBRARY_PATH\"; else export LD_LIBRARY_PATH=%s; fi", shellQuote(xcclLibraryPath(cfg, workDir)), shellQuote(xcclLibraryPath(cfg, workDir))),
+		fmt.Sprintf("logdir=%s", shellQuote(logDir)),
+		"mkdir -p \"$logdir\" 2>/dev/null || true",
+		"rank=${PMI_RANK:-${PMIX_RANK:-${OMPI_COMM_WORLD_RANK:-unknown}}}",
+		"host=${HOSTNAME:-}",
+		"if [ -z \"$host\" ]; then host=$(hostname 2>/dev/null || echo unknown); fi",
+		"start_msg=\"INFO xccl rank start host=$host pid=$$ rank=$rank pmi_rank=${PMI_RANK:-unset} pmix_rank=${PMIX_RANK:-unset}\"",
+		"echo \"$start_msg\" >> \"$logdir/rank-$host-$rank-$$.log\" 2>/dev/null || true",
+		"echo \"$start_msg\" >&2 || true",
 	}
 	for _, key := range keys {
 		lines = append(lines, fmt.Sprintf("export %s=%s", key, shellQuote(env[key])))
@@ -1020,14 +1105,22 @@ func xcclRankScript(cfg spec.CheckXCCLConfig, plan xcclTargetPlan, workDir strin
 	return strings.Join(lines, "\n") + "\n"
 }
 
-func xcclManagedRankEnvironment(cfg spec.CheckXCCLConfig, plan xcclTargetPlan, multiHost bool) map[string]string {
+func xcclManagedRankEnvironment(cfg spec.CheckXCCLConfig, plan xcclTargetPlan, workDir string, multiHost bool) map[string]string {
 	env := map[string]string{
 		"BKCL_TIMEOUT":               strconv.Itoa(cfg.Timeout),
 		"BKCL_RDMA_NICS":             strings.Join(plan.RDMANICOrder, ","),
 		"BKCL_FORCE_RDMA_NICS_ORDER": strings.Join(plan.RDMANICOrder, ","),
+		"BCCL_UNIX_SOCKET_PATH":      xcclRuntimeSubdir(workDir, "bccl-sockets"),
+		"BCCL_ERROR_FILE":            filepath.Join(xcclRuntimeSubdir(workDir, "logs"), "bccl-err.%h.%p.log"),
 	}
 	if plan.SocketInterface != "" {
 		env["BKCL_SOCKET_IFNAME"] = plan.SocketInterface
+	}
+	if plan.MPIInterfaceIP != "" {
+		env["MPIR_CVAR_CH3_INTERFACE_HOSTNAME"] = plan.MPIInterfaceIP
+		// The bundled ch3:sock library reads this legacy name directly when
+		// choosing the address advertised in each rank's businesscard.
+		env["MPICH_INTERFACE_HOSTNAME"] = plan.MPIInterfaceIP
 	}
 	if cfg.EnableXDR != nil && *cfg.EnableXDR {
 		env["BKCL_ENABLE_XDR"] = "1"
@@ -1052,6 +1145,9 @@ func xcclManagedRankEnvironment(cfg spec.CheckXCCLConfig, plan xcclTargetPlan, m
 		}
 	}
 	for key, value := range cfg.Environment {
+		if key == "BCCL_UNIX_SOCKET_PATH" || key == "BCCL_ERROR_FILE" {
+			continue
+		}
 		if !multiHost {
 			if _, multiHostOnly := multiHostDefaults[key]; multiHostOnly {
 				continue
@@ -1084,18 +1180,23 @@ func xcclMultiHostEnvironmentDefaults() map[string]string {
 		"BKCL_USE_RDMA":              "1",
 		"BKCL_FORCE_L3_RDMA":         "0",
 		"BCCL_TRACE_HANG_ENABLE":     "1",
-		"BCCL_UNIX_SOCKET_PATH":      "/var/bccl/sockets",
-		"BCCL_ERROR_FILE":            "/var/bccl/logs/err.%h.%p.log",
 	}
+}
+
+func xcclRuntimeSubdir(workDir, name string) string {
+	if strings.TrimSpace(workDir) == "" {
+		return filepath.Join("/tmp/envinit-xccl-check", name)
+	}
+	return filepath.Join(workDir, name)
 }
 
 func xcclPreviewRankEnvironment(cfg spec.CheckXCCLConfig, multiHost bool) map[string]string {
 	plan := xcclTargetPlan{XPUCount: 0}
-	env := xcclManagedRankEnvironment(cfg, plan, multiHost)
+	env := xcclManagedRankEnvironment(cfg, plan, "<run>", multiHost)
 	env["XPU_HOME"] = strings.TrimRight(cfg.XPUHome, "/")
 	env["PATH"] = xcclMPICHPrefix + "/bin:" + strings.TrimRight(cfg.XPUHome, "/") + "/bin:${PATH:-}"
 	env["LD_LIBRARY_PATH"] = "<run>/runtime/xccl_Linux_x86_64/so:" + xcclMPICHPrefix + "/lib:" + strings.TrimRight(cfg.XPUHome, "/") + "/so:...:${LD_LIBRARY_PATH:-}"
-	dynamicKeys := []string{"BKCL_RDMA_NICS", "BKCL_FORCE_RDMA_NICS_ORDER", "BKCL_SOCKET_IFNAME"}
+	dynamicKeys := []string{"BKCL_RDMA_NICS", "BKCL_FORCE_RDMA_NICS_ORDER", "BKCL_SOCKET_IFNAME", "MPIR_CVAR_CH3_INTERFACE_HOSTNAME", "MPICH_INTERFACE_HOSTNAME"}
 	if multiHost {
 		dynamicKeys = append(dynamicKeys, "CUDA_VISIBLE_DEVICES", "XPU_VISIBLE_DEVICES")
 	}
@@ -1109,7 +1210,7 @@ func xcclPreviewRankEnvironment(cfg spec.CheckXCCLConfig, multiHost bool) map[st
 
 func printXCCLRankEnvironments(opts Options, cfg spec.CheckXCCLConfig, plans []xcclTargetPlan, workDir string, multiHost bool) {
 	for _, plan := range plans {
-		env := xcclManagedRankEnvironment(cfg, plan, multiHost)
+		env := xcclManagedRankEnvironment(cfg, plan, workDir, multiHost)
 		env["XPU_HOME"] = strings.TrimRight(cfg.XPUHome, "/")
 		env["PATH"] = xcclMPICHPrefix + "/bin:" + strings.TrimRight(cfg.XPUHome, "/") + "/bin:${PATH:-}"
 		env["LD_LIBRARY_PATH"] = xcclLibraryPath(cfg, workDir) + ":${LD_LIBRARY_PATH:-}"
@@ -1169,6 +1270,9 @@ func xcclHostFile(plans []xcclTargetPlan) string {
 func xcclSSHWrapper(cfg spec.CheckConfig, workDir string) string {
 	args := []string{"ssh"}
 	args = append(args, cfg.SSH.Options...)
+	if cfg.SSH.Port > 0 && !sshOptionConfigured(args, "Port") {
+		args = append(args, "-o", "Port="+strconv.Itoa(cfg.SSH.Port))
+	}
 	args = append(args,
 		"-o", "BatchMode=yes",
 		"-o", "IdentitiesOnly=yes",
@@ -1258,6 +1362,31 @@ func cleanupXCCLTargets(opts Options, plans []xcclTargetPlan, workDir, marker st
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func collectXCCLRuntimeLogs(opts Options, plans []xcclTargetPlan, workDir string) string {
+	logDir := xcclRuntimeSubdir(workDir, "logs")
+	var sections []string
+	for _, plan := range plans {
+		command := fmt.Sprintf("set +e; dir=%s; if [ ! -d \"$dir\" ]; then printf 'missing log directory %%s\\n' \"$dir\"; exit 0; fi; files=$(find \"$dir\" -type f 2>/dev/null | sort); if [ -z \"$files\" ]; then printf 'no log files in %%s\\n' \"$dir\"; exit 0; fi; echo \"$files\" | while IFS= read -r file; do printf '----- %%s -----\\n' \"$file\"; tail -n 80 \"$file\" 2>/dev/null || true; printf '\\n'; done", shellQuote(logDir))
+		var output string
+		var err error
+		if opts.CommandRunner != nil {
+			output, err = opts.CommandRunner(opts.Bundle.Check, plan.Target, command)
+		} else {
+			output, err = runCommand(opts.Bundle.Check, plan.Target, command)
+		}
+		header := "host=" + plan.Target.Name
+		if err != nil {
+			sections = append(sections, header+"\n"+fmt.Sprintf("collect logs: %v", err))
+			continue
+		}
+		if strings.TrimSpace(output) == "" {
+			continue
+		}
+		sections = append(sections, header+"\n"+strings.TrimRight(output, "\n"))
+	}
+	return strings.Join(sections, "\n\n")
 }
 
 func xcclCleanupCommand(workDir, marker string, removeSSHAuthorization bool) string {

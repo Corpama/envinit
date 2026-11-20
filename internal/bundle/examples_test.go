@@ -13,21 +13,18 @@ func TestExampleProfileBundlesLoad(t *testing.T) {
 		osFamily       string
 		packageManager string
 		networkBackend string
-		forbiddenKey   string
 	}{
 		{
 			path:           "../../examples/bundle.ubuntu22.sample.json",
 			osFamily:       "ubuntu",
 			packageManager: "apt",
 			networkBackend: "netplan",
-			forbiddenKey:   "offline_repo",
 		},
 		{
 			path:           "../../examples/bundle.kylin10sp3.sample.json",
 			osFamily:       "kylin",
 			packageManager: "yum",
 			networkBackend: "auto",
-			forbiddenKey:   "offline_apt",
 		},
 	}
 	for _, tc := range cases {
@@ -45,9 +42,53 @@ func TestExampleProfileBundlesLoad(t *testing.T) {
 			if b.Platform.NetworkBackend != tc.networkBackend {
 				t.Fatalf("network_backend = %q, want %q", b.Platform.NetworkBackend, tc.networkBackend)
 			}
+			if len(b.Warnings) != 0 {
+				t.Fatalf("canonical example produced warnings: %v", b.Warnings)
+			}
+			if !b.Check.Bandwidth.GIDIndexAuto || !b.Check.RDMAPing.PayloadAuto {
+				t.Fatal("examples must use automatic GID selection and per-stream MTU payload")
+			}
+			wantTarget := "/etc/apt/sources.list.d/kunlun-offline.list"
+			wantEntry := "deb [trusted=yes] file:/opt/kunlun-apt-repo jammy main"
+			if tc.packageManager == "yum" {
+				wantTarget = "/etc/yum.repos.d/kunlun-offline.repo"
+				wantEntry = "baseurl=file:///opt/kunlun-rpm-repo"
+			}
+			repo := b.EffectiveOfflineRepo()
+			entries := strings.NewReplacer("{{offline_repo_target}}", repo.CopyTo, "{{offline_apt_target}}", repo.CopyTo).Replace(strings.Join(repo.Entries, "\n"))
+			if !repo.Enabled || repo.TargetFile != wantTarget || !strings.Contains(entries, wantEntry) {
+				t.Fatalf("unexpected offline repository defaults: %+v, rendered entries=%q", repo, entries)
+			}
 			raw := readExampleBundleJSON(t, tc.path)
-			if _, ok := raw[tc.forbiddenKey]; ok {
-				t.Fatalf("%s should not contain %s", tc.path, tc.forbiddenKey)
+			for _, key := range []string{"offline_apt", "platform_options"} {
+				if _, ok := raw[key]; ok {
+					t.Fatalf("%s should not contain %s", tc.path, key)
+				}
+			}
+			platform, ok := raw["platform"].(map[string]any)
+			if !ok {
+				t.Fatalf("%s should contain a platform object", tc.path)
+			}
+			for _, key := range []string{"kernel_headers_package", "kernel_headers_dir"} {
+				if _, ok := platform[key]; ok {
+					t.Fatalf("%s should not contain default platform.%s", tc.path, key)
+				}
+			}
+			if packages, ok := raw["packages"].([]any); ok {
+				for _, item := range packages {
+					if item == "linux-headers-{{uname_r}}" || item == "kernel-devel-{{uname_r}}" {
+						t.Fatalf("%s should rely on built-in kernel header prerequisites, found %v", tc.path, item)
+					}
+				}
+			}
+			defaults, ok := raw["defaults"].(map[string]any)
+			if !ok {
+				t.Fatal("example must contain defaults")
+			}
+			for _, key := range []string{"mgmt_bond_name", "mgmt_interfaces", "mgmt_prefix", "mgmt_gateway", "rdma_interfaces", "rdma_prefix", "rdma_route_cidr"} {
+				if _, ok := defaults[key]; ok {
+					t.Fatalf("%s should not contain deprecated defaults.%s", tc.path, key)
+				}
 			}
 			check, ok := raw["check"].(map[string]any)
 			if !ok {

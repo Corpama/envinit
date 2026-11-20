@@ -56,7 +56,9 @@ func (a *App) runPostStage() error {
 			return nil
 		}
 	}
-	return a.runCmd("", nil, "ipmitool", "power", powerAction.Action)
+	return a.executeRecorded("post/power", powerAction.Action, "", func() error {
+		return a.runCmd("", nil, "ipmitool", "power", powerAction.Action)
+	})
 }
 
 func (a *App) installPostPackages() error {
@@ -136,12 +138,22 @@ func (a *App) runPostTask(idx int, task spec.PostTask) error {
 		if err := requirePostTaskFields(idx, task, "command"); err != nil {
 			return err
 		}
-		return a.runCmd("", nil, "bash", "-lc", strings.TrimSpace(task.Command))
+		return a.executeRecorded(fmt.Sprintf("post/cmd/%d", idx), task, task.CheckCommand, func() error {
+			return a.runCmd("", nil, "bash", "-lc", strings.TrimSpace(task.Command))
+		})
 	case "mv":
 		if err := requirePostTaskFields(idx, task, "source", "target"); err != nil {
 			return err
 		}
-		return a.movePath(strings.TrimSpace(task.Source), strings.TrimSpace(task.Target))
+		source, target := strings.TrimSpace(task.Source), strings.TrimSpace(task.Target)
+		if _, err := os.Stat(a.targetPath(source)); errors.Is(err, fs.ErrNotExist) {
+			if _, targetErr := os.Stat(a.targetPath(target)); targetErr == nil {
+				a.logf("already satisfied: move %s -> %s", source, target)
+				return nil
+			}
+			return fmt.Errorf("move source %s and target %s are both absent", source, target)
+		}
+		return a.movePath(source, target)
 	case "rm":
 		if err := requirePostTaskFields(idx, task, "path"); err != nil {
 			return err
@@ -227,6 +239,7 @@ func normalizePowerAction(raw string) string {
 }
 
 func (a *App) ensurePostBootService() error {
+	before := a.managedFileRevision
 	script, err := a.renderPostBootScriptWithExistingCustom()
 	if err != nil {
 		return err
@@ -237,13 +250,57 @@ func (a *App) ensurePostBootService() error {
 	if err := a.writeManagedFile(postBootService, renderPostBootService(), 0o644); err != nil {
 		return err
 	}
-	if err := a.runCmd("", nil, "systemctl", "daemon-reload"); err != nil {
+	changed := a.managedFileRevision != before
+	// A replacement card can retain the logical interface name and produce
+	// identical script text. Include physical identity in the service state.
+	identity, err := a.postBootPhysicalFingerprint(script)
+	if err != nil {
 		return err
 	}
-	if err := a.runCmd("", nil, "systemctl", "enable", filepath.Base(postBootService)); err != nil {
-		return err
+	identityPath := "/var/lib/envinit/post-boot-physical.sha256"
+	savedIdentity, readErr := os.ReadFile(a.targetPath(identityPath))
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return readErr
 	}
-	return a.runCmd("", nil, "systemctl", "restart", filepath.Base(postBootService))
+	physicalChanged := strings.TrimSpace(string(savedIdentity)) != identity
+	if changed {
+		if err := a.runCmd("", nil, "systemctl", "daemon-reload"); err != nil {
+			return err
+		}
+	}
+	unit := filepath.Base(postBootService)
+	if a.DryRun {
+		if err := a.runCmd("", nil, "systemctl", "enable", unit); err != nil {
+			return err
+		}
+		return a.runCmd("", nil, "systemctl", "restart", unit)
+	}
+	if _, err := a.captureCmd("", nil, "systemctl", "is-enabled", "--quiet", unit); err != nil {
+		if err := a.runCmd("", nil, "systemctl", "enable", unit); err != nil {
+			return err
+		}
+	}
+	if changed || physicalChanged {
+		if err := a.runCmd("", nil, "systemctl", "restart", unit); err != nil {
+			return err
+		}
+		return atomicWriteFile(a.targetPath(identityPath), []byte(identity+"\n"), 0o600)
+	}
+	if _, err := a.captureCmd("", nil, "systemctl", "is-active", "--quiet", unit); err != nil {
+		return a.runCmd("", nil, "systemctl", "start", unit)
+	}
+	a.logf("post-boot service already satisfied")
+	return nil
+}
+
+func (a *App) postBootPhysicalFingerprint(script string) (string, error) {
+	var b strings.Builder
+	b.WriteString(script)
+	for _, item := range a.Machine.RDMA {
+		mac, _ := a.readMAC(item.Name)
+		fmt.Fprintf(&b, "\n%s %s %s", item.Name, mac, a.interfacePCI(item.Name))
+	}
+	return contentDigest([]byte(b.String())), nil
 }
 
 func (a *App) renderPostBootScriptWithExistingCustom() (string, error) {

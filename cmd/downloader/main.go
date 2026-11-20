@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -34,6 +35,47 @@ var (
 	manifestJSON    = ""
 	manifestJSONB64 = ""
 )
+
+const (
+	// httpDialTimeout / httpTLSTimeout / httpResponseHeaderTimeout bound the
+	// connection setup so an unreachable or silent endpoint fails fast instead
+	// of hanging forever.
+	httpDialTimeout           = 15 * time.Second
+	httpTLSTimeout            = 15 * time.Second
+	httpResponseHeaderTimeout = 30 * time.Second
+	httpControlTimeout        = 60 * time.Second
+	downloadStallTimeout      = 60 * time.Second
+)
+
+func newHTTPTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   httpDialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   httpTLSTimeout,
+		ResponseHeaderTimeout: httpResponseHeaderTimeout,
+		ExpectContinueTimeout: 5 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+	}
+}
+
+// controlHTTPClient bounds the whole request/response for short AList control
+// calls (login, resolve, list). A stalled body cannot hang these.
+func controlHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout:   httpControlTimeout,
+		Transport: newHTTPTransport(),
+	}
+}
+
+// downloadHTTPClient has no overall Timeout because large materials can take a
+// long time legitimately; instead the connection-setup timeouts above plus the
+// per-read stall watchdog (stallReader) bound any silent hang.
+func downloadHTTPClient() *http.Client {
+	return &http.Client{Transport: newHTTPTransport()}
+}
 
 type releaseManifest struct {
 	Version  string            `json:"version"`
@@ -232,6 +274,11 @@ func runManifestMode(opts runOptions, rawManifest string) error {
 		printProfiles(opts.Stdout, manifest)
 		return nil
 	}
+	if opts.Stdin != nil {
+		if _, ok := opts.Stdin.(*bufio.Reader); !ok {
+			opts.Stdin = bufio.NewReader(opts.Stdin)
+		}
+	}
 	profile, err := selectProfile(manifest, opts.Profile, opts.Stdin, opts.Stdout)
 	if err != nil {
 		return err
@@ -240,13 +287,42 @@ func runManifestMode(opts runOptions, rawManifest string) error {
 	if outputDir == "" {
 		outputDir = "."
 	}
+	unlock, err := lockDeliveryProject(outputDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	paths, state, err := prepareProject(outputDir, manifest, profile)
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(opts.Stdout, "Downloading env_tool %s profile %s\n", valueOrDefault(manifest.Version, releaseVersion), profile.ID)
 	token, err := loginAList()
 	if err != nil {
 		return err
 	}
-	assets := profileDownloadAssets(manifest, profile)
+	if err := downloadProjectTemplates(paths, profile, token); err != nil {
+		return err
+	}
+	if err := seedPlanningTemplates(paths); err != nil {
+		return err
+	}
+	state.Status = "downloading"
+	if err := writeProjectState(paths, state); err != nil {
+		return err
+	}
+	assets := append([]manifestAsset{}, profile.Assets...)
+	if strings.TrimSpace(manifest.Base.Path) != "" {
+		assets = append([]manifestAsset{manifest.Base}, assets...)
+	}
 	for _, asset := range assets {
+		name := asset.Name
+		if name == "" {
+			name = filepath.Base(asset.Path)
+		}
+		if protectedProjectPath(filepath.ToSlash(filepath.Clean(name))) {
+			return fmt.Errorf("asset %q targets protected project configuration", name)
+		}
 		if err := downloadManifestAsset(outputDir, asset, token); err != nil {
 			return err
 		}
@@ -255,6 +331,10 @@ func runManifestMode(opts runOptions, rawManifest string) error {
 		if err := downloadProfileMaterials(outputDir, profile, token, opts.Jobs, opts.Stdout); err != nil {
 			return err
 		}
+	}
+	state.Status = "ready"
+	if err := writeProjectState(paths, state); err != nil {
+		return err
 	}
 	fmt.Fprintf(opts.Stdout, "Profile %s is ready under %s\n", profile.ID, outputDir)
 	return nil
@@ -298,6 +378,9 @@ func selectProfile(manifest releaseManifest, requested string, stdin io.Reader, 
 	if stdin == nil {
 		return manifestProfile{}, errors.New("--profile is required when stdin is not available")
 	}
+	if stdinIsNonInteractiveFile(stdin) {
+		return manifestProfile{}, errors.New("--profile is required in non-interactive mode; stdin is not a terminal, so no profile prompt can be answered")
+	}
 	fmt.Fprintln(stdout, "请选择本次交付系统：")
 	for idx, profile := range manifest.Profiles {
 		label := profile.ID
@@ -312,14 +395,15 @@ func selectProfile(manifest releaseManifest, requested string, stdin io.Reader, 
 	}
 	fmt.Fprint(stdout, "请输入序号或 profile ID: ")
 
-	scanner := bufio.NewScanner(stdin)
-	if !scanner.Scan() {
-		if err := scanner.Err(); err != nil {
-			return manifestProfile{}, fmt.Errorf("read profile selection: %w", err)
-		}
-		return manifestProfile{}, errors.New("profile selection is required")
+	reader, ok := stdin.(*bufio.Reader)
+	if !ok {
+		reader = bufio.NewReader(stdin)
 	}
-	choice := strings.TrimSpace(scanner.Text())
+	line, err := reader.ReadString('\n')
+	if err != nil && (err != io.EOF || strings.TrimSpace(line) == "") {
+		return manifestProfile{}, fmt.Errorf("read profile selection: %w", err)
+	}
+	choice := strings.TrimSpace(line)
 	for idx, profile := range manifest.Profiles {
 		if choice == profile.ID || choice == fmt.Sprintf("%d", idx+1) {
 			return profile, nil
@@ -869,6 +953,11 @@ func extractDeliveryTar(archivePath, outputDir string, compressed bool) error {
 		if skip {
 			continue
 		}
+		// Planning is user-owned. Templates are downloaded separately; archives
+		// must never replace saved configuration or downloader recovery records.
+		if protectedProjectPath(rel) {
+			continue
+		}
 		target := filepath.Join(root, filepath.FromSlash(rel))
 		if err := ensurePathUnderRoot(root, target); err != nil {
 			return err
@@ -1021,7 +1110,7 @@ func postJSON(path, token string, body any, output any) error {
 		request.Header.Set("Authorization", token)
 	}
 
-	response, err := http.DefaultClient.Do(request)
+	response, err := controlHTTPClient().Do(request)
 	if err != nil {
 		return fmt.Errorf("call AList API: %w", err)
 	}
@@ -1052,7 +1141,7 @@ func downloadFileWithProgress(output, url string, reportProgress bool, onExistin
 		return fmt.Errorf("inspect existing output: %w", err)
 	}
 
-	client := &http.Client{Timeout: 0}
+	client := downloadHTTPClient()
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("create download request: %w", err)
@@ -1109,9 +1198,16 @@ func downloadFileWithProgress(output, url string, reportProgress bool, onExistin
 	defer file.Close()
 
 	start := time.Now()
-	reader := downloadBody
+	reader := &stallReader{
+		inner:   downloadBody,
+		timeout: downloadStallTimeout,
+		cancel:  func() { resp.Body.Close() },
+	}
 	written, err := io.Copy(file, reader)
 	if err != nil {
+		if reader.stalled() {
+			return fmt.Errorf("download stalled: no data received for %s (received %d bytes); check network path to the storage endpoint", downloadStallTimeout, written)
+		}
 		return fmt.Errorf("write output: %w", err)
 	}
 	if err := file.Close(); err != nil {
@@ -1183,3 +1279,46 @@ func verifySHA256(path, expected string) error {
 	}
 	return nil
 }
+
+// stallReader aborts a download when no bytes arrive within timeout. Each Read
+// runs in a goroutine watched by a timer, so a connection that opens but then
+// goes silent fails fast instead of hanging inside io.Copy forever.
+type stallReader struct {
+	inner      io.Reader
+	timeout    time.Duration
+	cancel     func()
+	timedOut   bool
+	cancelOnce sync.Once
+}
+
+type readResult struct {
+	n   int
+	err error
+}
+
+func (r *stallReader) Read(p []byte) (int, error) {
+	if r.timeout <= 0 {
+		return r.inner.Read(p)
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		n, err := r.inner.Read(p)
+		done <- readResult{n: n, err: err}
+	}()
+	timer := time.NewTimer(r.timeout)
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		return res.n, res.err
+	case <-timer.C:
+		r.timedOut = true
+		if r.cancel != nil {
+			r.cancelOnce.Do(r.cancel)
+		}
+		// Reap the blocked Read so the goroutine and buffer are not leaked.
+		<-done
+		return 0, fmt.Errorf("download stalled after %s with no data", r.timeout)
+	}
+}
+
+func (r *stallReader) stalled() bool { return r.timedOut }

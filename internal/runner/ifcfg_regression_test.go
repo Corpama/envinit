@@ -113,13 +113,15 @@ func runKylinCentOSNetworkFilesFromPlanning(t *testing.T, backend string) string
 	}
 	app.DryRun = false
 	app.now = func() time.Time { return time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC) }
-	if backend == "networkmanager" {
-		if err := app.runNetworkManagerStage(); err != nil {
-			t.Fatalf("run networkmanager stage: %v", err)
-		}
-	} else {
-		if err := app.runLegacyNetworkStage(); err != nil {
-			t.Fatalf("run legacy network stage: %v", err)
+	for attempt := 1; attempt <= 3; attempt++ {
+		if backend == "networkmanager" {
+			if err := app.runNetworkManagerStage(); err != nil {
+				t.Fatalf("run networkmanager stage attempt %d: %v", attempt, err)
+			}
+		} else {
+			if err := app.runLegacyNetworkStage(); err != nil {
+				t.Fatalf("run legacy network stage attempt %d: %v", attempt, err)
+			}
 		}
 	}
 	return root

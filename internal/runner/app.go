@@ -69,7 +69,7 @@ type App struct {
 	DryRun                  bool
 	InteractiveDryRunReview bool
 	Stages                  map[string]bool
-	Output                  io.Writer
+	Output                  io.Writer `json:"-"`
 	HostSpecified           bool
 	ResumeApply             bool
 	ResetApplyProgress      bool
@@ -82,6 +82,11 @@ type App struct {
 	runStageOverride           func(string) error
 	applySourceRecord          spec.MachineRecord
 	hasApplySourceRecord       bool
+	managedFileRevision        uint64
+	currentStageTimeout        time.Duration
+	networkTransaction         *networkTransaction
+	networkWorker              bool
+	applyUnlock                func()
 }
 
 func New(bundle spec.Bundle, records []spec.MachineRecord, host string, root string, dryRun bool, stages map[string]bool, out io.Writer) (*App, error) {
@@ -136,6 +141,20 @@ func (a *App) Apply() error {
 		if err := requireApplyTTY(); err != nil {
 			return err
 		}
+		unlock, err := acquireExecutionLock(a.targetPath("/var/lib/envinit/apply.lock"))
+		if err != nil {
+			return err
+		}
+		a.applyUnlock = unlock
+		defer func() {
+			if a.applyUnlock != nil {
+				a.applyUnlock()
+				a.applyUnlock = nil
+			}
+		}()
+		if err := a.recoverInterruptedProbe(); err != nil {
+			return err
+		}
 	}
 	if err := a.ensureHostname(); err != nil {
 		return err
@@ -184,6 +203,9 @@ func requireApplyTTY() error {
 
 func (a *App) runStage(stage string) error {
 	a.logf("==> stage: %s", stage)
+	previousTimeout := a.currentStageTimeout
+	a.currentStageTimeout = a.Bundle.ApplyTimeouts.StageTimeout(stage)
+	defer func() { a.currentStageTimeout = previousTimeout }()
 	switch stage {
 	case "network":
 		return a.runNetworkStage()
@@ -192,13 +214,13 @@ func (a *App) runStage(stage string) error {
 	case "software":
 		return a.runAPTStage()
 	case "ofed":
-		return a.runOFEDStage()
+		return a.runVendorStage("ofed", a.Bundle.Artifacts.OFEDArchive, a.runOFEDStage)
 	case "xre":
-		return a.runXREStage()
+		return a.runVendorStage("xre", a.Bundle.Artifacts.XREInstaller, a.runXREStage)
 	case "xdr":
-		return a.runXDRStage()
+		return a.runVendorStage("xdr", a.Bundle.Artifacts.XDRArchive, a.runXDRStage)
 	case "firmware":
-		return a.runFirmwareStage()
+		return a.runVendorStage("firmware", a.Bundle.Artifacts.FirmwareArchive, a.runFirmwareStage)
 	case "container":
 		return a.runContainerStage()
 	case "mlxconfig":

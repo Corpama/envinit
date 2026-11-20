@@ -7,27 +7,102 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Bundle struct {
-	Defaults        Defaults         `json:"defaults"`
-	Platform        PlatformConfig   `json:"platform"`
-	PlatformOptions PlatformOptions  `json:"platform_options"`
-	OfflineAPT      OfflineAPTConfig `json:"offline_apt"`
-	OfflineRepo     OfflineAPTConfig `json:"offline_repo"`
-	Packages        []string         `json:"packages"`
-	Artifacts       Artifacts        `json:"artifacts"`
-	XRE             XREConfig        `json:"xre"`
-	MlxConfig       MlxConfig        `json:"mlxconfig"`
-	Check           CheckConfig      `json:"check"`
-	PostPackages    []string         `json:"post_packages"`
-	PostTasks       []PostTask       `json:"post_tasks"`
-	PostPowerAction PostPowerAction  `json:"post_power_action"`
+	Warnings        []string          `json:"-"`
+	StageChecks     map[string]string `json:"stage_checks,omitempty"`
+	ApplyTimeouts   ApplyTimeouts     `json:"apply_timeouts"`
+	Defaults        Defaults          `json:"defaults"`
+	Platform        PlatformConfig    `json:"platform"`
+	PlatformOptions PlatformOptions   `json:"platform_options"`
+	OfflineAPT      OfflineAPTConfig  `json:"offline_apt"`
+	OfflineRepo     OfflineAPTConfig  `json:"offline_repo"`
+	Packages        []string          `json:"packages"`
+	Artifacts       Artifacts         `json:"artifacts"`
+	XRE             XREConfig         `json:"xre"`
+	MlxConfig       MlxConfig         `json:"mlxconfig"`
+	Check           CheckConfig       `json:"check"`
+	PostPackages    []string          `json:"post_packages"`
+	PostTasks       []PostTask        `json:"post_tasks"`
+	PostPowerAction PostPowerAction   `json:"post_power_action"`
+}
+
+// ApplyTimeouts bounds how long a single command inside each apply stage may run
+// before envinit terminates it. Values are in seconds; 0 means no timeout, which
+// is the default for long vendor operations (ofed/xre/xdr/firmware) and the
+// user-controlled post stage. DefaultSeconds applies to any stage not listed in
+// Stages.
+type ApplyTimeouts struct {
+	DefaultSeconds int            `json:"default_seconds"`
+	Stages         map[string]int `json:"stages,omitempty"`
+}
+
+// applyTimeoutStages enumerates every stage that carries an explicit default so
+// ApplyDefaults can prefill a complete, self-documenting table.
+var applyTimeoutStageDefaults = map[string]int{
+	"software":  360,
+	"ofed":      0,
+	"network":   360,
+	"xre":       0,
+	"xdr":       0,
+	"firmware":  0,
+	"container": 360,
+	"mlxconfig": 360,
+	"sysctl":    360,
+	"kernel":    360,
+	"post":      0,
+	"udev":      360,
+}
+
+const defaultApplyStageTimeoutSeconds = 360
+
+// applyDefaults prefills a complete stage table so a delivered bundle documents
+// every adjustable timeout. Explicitly provided values are preserved.
+func (t *ApplyTimeouts) applyDefaults() {
+	if t.DefaultSeconds == 0 {
+		t.DefaultSeconds = defaultApplyStageTimeoutSeconds
+	}
+	if t.Stages == nil {
+		t.Stages = map[string]int{}
+	}
+	for stage, seconds := range applyTimeoutStageDefaults {
+		if _, ok := t.Stages[stage]; !ok {
+			t.Stages[stage] = seconds
+		}
+	}
+}
+
+// StageTimeout returns the configured per-command timeout for a stage. A zero
+// duration means no timeout. Unknown stages fall back to DefaultSeconds.
+func (t ApplyTimeouts) StageTimeout(stage string) time.Duration {
+	if seconds, ok := t.Stages[stage]; ok {
+		return time.Duration(seconds) * time.Second
+	}
+	return time.Duration(t.DefaultSeconds) * time.Second
+}
+
+func (t ApplyTimeouts) validate() error {
+	if t.DefaultSeconds < 0 {
+		return fmt.Errorf("apply_timeouts.default_seconds must not be negative")
+	}
+	for stage, seconds := range t.Stages {
+		if _, ok := applyTimeoutStageDefaults[stage]; !ok {
+			return fmt.Errorf("apply_timeouts.stages contains unknown stage %q", stage)
+		}
+		if seconds < 0 {
+			return fmt.Errorf("apply_timeouts.stages.%s must not be negative", stage)
+		}
+	}
+	return nil
 }
 
 type Defaults struct {
+	RDMAGatewayProbe           RDMAGatewayProbeConfig `json:"rdma_gateway_probe"`
 	BackupRoot                 string                 `json:"backup_root"`
 	MgmtBondName               string                 `json:"mgmt_bond_name"`
 	MgmtInterfaces             []string               `json:"mgmt_interfaces"`
@@ -52,6 +127,31 @@ type Defaults struct {
 	DisableExistingAptSources  bool                   `json:"disable_existing_apt_sources"`
 	DisableExistingRepos       bool                   `json:"disable_existing_repos"`
 	RDMAInterfaces             []RDMAInterfaceDefault `json:"rdma_interfaces"`
+}
+
+type RDMAGatewayProbeConfig struct {
+	Enabled         *bool `json:"enabled,omitempty"`
+	Attempts        int   `json:"attempts,omitempty"`
+	TimeoutSeconds  int   `json:"timeout_seconds,omitempty"`
+	LinkWaitSeconds int   `json:"link_wait_seconds,omitempty"`
+}
+
+// IsEnabled defaults to true because gateway probing provides useful
+// connectivity and conflict evidence. It remains supplemental evidence and
+// cannot establish a physical port mapping when several NICs share the same
+// subnet and gateway; set enabled to false to disable it.
+func (p RDMAGatewayProbeConfig) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
+func (p RDMAGatewayProbeConfig) Effective() RDMAGatewayProbeConfig {
+	if p.Attempts == 0 {
+		p.Attempts = 3
+	}
+	if p.TimeoutSeconds == 0 {
+		p.TimeoutSeconds = 3
+	}
+	if p.LinkWaitSeconds == 0 {
+		p.LinkWaitSeconds = 5
+	}
+	return p
 }
 
 const (
@@ -128,6 +228,8 @@ type CheckBandwidthConfig struct {
 	Duration      int              `json:"duration"`
 	RunByDuration bool             `json:"run_by_duration,omitempty"`
 	GIDIndex      int              `json:"gid_index"`
+	GIDIndexAuto  bool             `json:"-"`
+	GIDIndexSet   bool             `json:"-"`
 	Iterations    int              `json:"iterations"`
 	BandwidthQPs  int              `json:"bandwidth_qps"`
 	MessageSize   int              `json:"message_size"`
@@ -158,6 +260,18 @@ func (c *CheckBandwidthConfig) UnmarshalJSON(data []byte) error {
 		}
 	}
 	minimum, hasMinimum := raw["min_gbits"]
+	gidAuto := false
+	if gid, ok := raw["gid_index"]; ok && strings.TrimSpace(string(gid)) == "null" {
+		return errors.New("check.bandwidth.gid_index must be \"auto\" or a non-negative integer")
+	}
+	if gid, ok := raw["gid_index"]; ok && len(gid) > 0 && gid[0] == '"' {
+		var mode string
+		if err := json.Unmarshal(gid, &mode); err != nil || !strings.EqualFold(strings.TrimSpace(mode), "auto") {
+			return fmt.Errorf("check.bandwidth.gid_index must be \"auto\" or a non-negative integer")
+		}
+		gidAuto = true
+		raw["gid_index"] = json.RawMessage("0")
+	}
 	auto := false
 	if hasMinimum && strings.TrimSpace(string(minimum)) == "null" {
 		return errors.New("check.bandwidth.min_gbits must be \"auto\", 0, or a positive number")
@@ -184,7 +298,12 @@ func (c *CheckBandwidthConfig) UnmarshalJSON(data []byte) error {
 	if decoded.MinGBits < 0 {
 		return errors.New("check.bandwidth.min_gbits must be \"auto\", 0, or a positive number")
 	}
+	if decoded.GIDIndex < 0 {
+		return errors.New("check.bandwidth.gid_index must be \"auto\" or a non-negative integer")
+	}
 	*c = CheckBandwidthConfig(decoded)
+	c.GIDIndexAuto = gidAuto
+	_, c.GIDIndexSet = raw["gid_index"]
 	c.MinGBitsAuto = auto
 	c.MinGBitsSet = hasMinimum
 	return nil
@@ -203,6 +322,9 @@ func (c CheckBandwidthConfig) MarshalJSON() ([]byte, error) {
 	if c.MinGBitsAuto {
 		fields["min_gbits"] = json.RawMessage(`"auto"`)
 	}
+	if c.GIDIndexAuto {
+		fields["gid_index"] = json.RawMessage(`"auto"`)
+	}
 	return json.Marshal(fields)
 }
 
@@ -217,22 +339,88 @@ func (c CheckBandwidthConfig) MinGBitsMode() string {
 }
 
 type CheckRDMAPingConfig struct {
-	Count       int `json:"count"`
-	PayloadSize int `json:"payload_size"`
-	Timeout     int `json:"timeout"`
+	Count       int  `json:"count"`
+	PayloadSize int  `json:"payload_size"`
+	PayloadAuto bool `json:"-"`
+	Timeout     int  `json:"timeout"`
+}
+
+func (c *CheckRDMAPingConfig) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Count       int             `json:"count"`
+		PayloadSize json.RawMessage `json:"payload_size"`
+		Timeout     int             `json:"timeout"`
+	}
+	if err := decodeStrictJSON(data, &raw); err != nil {
+		return err
+	}
+	*c = CheckRDMAPingConfig{}
+	c.Count, c.Timeout = raw.Count, raw.Timeout
+	if len(raw.PayloadSize) == 0 {
+		return nil
+	}
+	if string(raw.PayloadSize) == "null" {
+		return errors.New("check.rdma_ping.payload_size must be \"auto\" or a positive integer")
+	}
+	if raw.PayloadSize[0] == '"' {
+		var mode string
+		if err := json.Unmarshal(raw.PayloadSize, &mode); err != nil || !strings.EqualFold(strings.TrimSpace(mode), "auto") {
+			return errors.New("check.rdma_ping.payload_size must be \"auto\" or a positive integer")
+		}
+		c.PayloadAuto = true
+		return nil
+	}
+	if err := json.Unmarshal(raw.PayloadSize, &c.PayloadSize); err != nil || c.PayloadSize <= 0 {
+		return errors.New("check.rdma_ping.payload_size must be \"auto\" or a positive integer")
+	}
+	return nil
+}
+
+func (c CheckRDMAPingConfig) MarshalJSON() ([]byte, error) {
+	value := any(c.PayloadSize)
+	if c.PayloadAuto {
+		value = "auto"
+	}
+	return json.Marshal(struct {
+		Count       int `json:"count"`
+		PayloadSize any `json:"payload_size"`
+		Timeout     int `json:"timeout"`
+	}{c.Count, value, c.Timeout})
 }
 
 type CheckSSHConfig struct {
 	User    string   `json:"user"`
+	Port    int      `json:"port,omitempty"`
 	Options []string `json:"options"`
 }
 
-func (c *CheckConfig) UnmarshalJSON(data []byte) error {
-	type checkConfigAlias CheckConfig
-	var decoded checkConfigAlias
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
+// validate rejects the classic ssh/scp port-flag mix-up early, because the
+// same options are passed to both ssh (lowercase -p) and scp (uppercase -P),
+// so a bare port flag cannot work for both at once.
+func (c CheckSSHConfig) validate() error {
+	if c.Port < 0 || c.Port > 65535 {
+		return fmt.Errorf("check.ssh.port must be between 1 and 65535, got %d", c.Port)
 	}
+	for _, option := range c.Options {
+		if isBarePortFlag(option) {
+			return fmt.Errorf("check.ssh.options entry %q is not supported: the port flag differs between ssh (-p) and scp (-P) and these options are passed to both; set check.ssh.port or use \"-o Port=<port>\" instead", option)
+		}
+	}
+	return nil
+}
+
+// isBarePortFlag reports whether an ssh options token is a bare -p/-P port
+// flag rather than an option both ssh and scp understand.
+func isBarePortFlag(option string) bool {
+	option = strings.TrimSpace(option)
+	if len(option) < 2 || option[0] != '-' || option[1] == '-' {
+		return false
+	}
+	return option[1] == 'p' || option[1] == 'P'
+}
+
+func (c *CheckConfig) UnmarshalJSON(data []byte) error {
+	var decoded CheckConfig
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -243,68 +431,56 @@ func (c *CheckConfig) UnmarshalJSON(data []byte) error {
 		"message_size": true, "report_gbits": true, "mmap_device": true, "min_gbits": true,
 		"parallel": true, "base_port": true, "rdma_groups": true,
 		"rdma_ping_count": true, "rdma_ping_payload_size": true, "rdma_ping_timeout": true,
-		"ssh_user": true, "ssh_options": true,
+		"ssh_user": true, "ssh_options": true, "ssh_port": true,
 	}
 	for key := range raw {
 		if !allowed[key] {
 			return fmt.Errorf("json: unknown field %q", key)
 		}
 	}
-	for key, target := range map[string]any{
-		"bandwidth": &decoded.Bandwidth,
-		"rdma_ping": &decoded.RDMAPing,
-		"ssh":       &decoded.SSH,
-		"xccl":      &decoded.XCCL,
+	for _, group := range []struct {
+		name, legacyPrefix string
+		fields             []string
+		target             any
+	}{
+		{"bandwidth", "", []string{"duration", "run_by_duration", "gid_index", "iterations", "bandwidth_qps", "message_size", "report_gbits", "mmap_device", "min_gbits", "parallel", "base_port", "rdma_groups"}, &decoded.Bandwidth},
+		{"rdma_ping", "rdma_ping_", []string{"count", "payload_size", "timeout"}, &decoded.RDMAPing},
+		{"ssh", "ssh_", []string{"user", "port", "options"}, &decoded.SSH},
+		{"xccl", "", nil, &decoded.XCCL},
 	} {
-		value, ok := raw[key]
-		if !ok {
-			continue
-		}
-		if err := decodeStrictJSON(value, target); err != nil {
-			return err
-		}
-	}
-	if _, nested := raw["bandwidth"]; !nested {
-		legacyFields := map[string]json.RawMessage{}
-		for _, key := range []string{"duration", "gid_index", "iterations", "bandwidth_qps", "message_size", "report_gbits", "mmap_device", "min_gbits", "parallel", "base_port", "rdma_groups"} {
-			if value, ok := raw[key]; ok {
-				legacyFields[key] = value
+		values := map[string]json.RawMessage{}
+		if nested, ok := raw[group.name]; ok {
+			if group.fields == nil {
+				if err := decodeStrictJSON(nested, group.target); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := json.Unmarshal(nested, &values); err != nil {
+				return err
+			}
+			if values == nil {
+				values = map[string]json.RawMessage{}
 			}
 		}
-		legacyData, err := json.Marshal(legacyFields)
+		for _, field := range group.fields {
+			old := group.legacyPrefix + field
+			if value, ok := raw[old]; ok {
+				if current, exists := values[field]; exists && !equalJSON(current, value) {
+					return fmt.Errorf("conflicting check.%s.%s and check.%s", group.name, field, old)
+				}
+				values[field] = value
+			}
+		}
+		encoded, err := json.Marshal(values)
 		if err != nil {
 			return err
 		}
-		var legacy CheckBandwidthConfig
-		if err := json.Unmarshal(legacyData, &legacy); err != nil {
+		if err := decodeStrictJSON(encoded, group.target); err != nil {
 			return err
 		}
-		decoded.Bandwidth = legacy
 	}
-	var legacy struct {
-		RDMAPingCount       int      `json:"rdma_ping_count"`
-		RDMAPingPayloadSize int      `json:"rdma_ping_payload_size"`
-		RDMAPingTimeout     int      `json:"rdma_ping_timeout"`
-		SSHUser             string   `json:"ssh_user"`
-		SSHOptions          []string `json:"ssh_options"`
-	}
-	if err := json.Unmarshal(data, &legacy); err != nil {
-		return err
-	}
-	if _, nested := raw["rdma_ping"]; !nested {
-		decoded.RDMAPing = CheckRDMAPingConfig{
-			Count:       legacy.RDMAPingCount,
-			PayloadSize: legacy.RDMAPingPayloadSize,
-			Timeout:     legacy.RDMAPingTimeout,
-		}
-	}
-	if _, nested := raw["ssh"]; !nested {
-		decoded.SSH = CheckSSHConfig{
-			User:    legacy.SSHUser,
-			Options: legacy.SSHOptions,
-		}
-	}
-	*c = CheckConfig(decoded)
+	*c = decoded
 	return nil
 }
 
@@ -339,6 +515,7 @@ type CheckXCCLConfig struct {
 	ValidateTopology   *bool             `json:"validate_topology,omitempty"`
 	Supernode          bool              `json:"supernode"`
 	SocketInterface    string            `json:"socket_interface"`
+	MPIInterface       string            `json:"mpi_interface"`
 	MinBusBandwidthGBs float64           `json:"min_bus_bandwidth_gbs"`
 	Environment        map[string]string `json:"environment"`
 }
@@ -349,18 +526,21 @@ func (c CheckXCCLConfig) TopologyValidationEnabled() bool {
 
 type CheckRDMAGroup struct {
 	IBDevice         string            `json:"ib_device"`
+	IBPort           int               `json:"ib_port,omitempty"`
+	GIDIndex         *int              `json:"-"`
 	XPUOffsets       []string          `json:"xpu_offsets"`
 	XPUTopologyLinks map[string]string `json:"-"`
 }
 
 type PostTask struct {
-	Name    string `json:"name,omitempty"`
-	Type    string `json:"type"`
-	Source  string `json:"source,omitempty"`
-	Target  string `json:"target,omitempty"`
-	Path    string `json:"path,omitempty"`
-	Command string `json:"command,omitempty"`
-	Mode    string `json:"mode,omitempty"`
+	CheckCommand string `json:"check_command,omitempty"`
+	Name         string `json:"name,omitempty"`
+	Type         string `json:"type"`
+	Source       string `json:"source,omitempty"`
+	Target       string `json:"target,omitempty"`
+	Path         string `json:"path,omitempty"`
+	Command      string `json:"command,omitempty"`
+	Mode         string `json:"mode,omitempty"`
 }
 
 type PostPowerAction struct {
@@ -371,6 +551,10 @@ type PostPowerAction struct {
 type MachineRecord struct {
 	HostID         string
 	Hostname       string
+	LegacySchema   bool
+	FromInventory  bool
+	MgmtMode       string
+	MgmtTargetName string
 	MgmtIP         string
 	MgmtPrefix     string
 	MgmtGateway    string
@@ -395,26 +579,34 @@ type RDMARecord struct {
 }
 
 type MachineConfig struct {
-	HostID        string
-	Hostname      string
-	MgmtBondName  string
-	MgmtIP        string
-	MgmtPrefix    int
-	MgmtGateway   string
-	MgmtIfaces    []string
-	MgmtMACs      []string
-	MgmtDNS       []string
-	MgmtMTU       int
-	BondMode      string
-	BondLACPRate  string
-	BondXmitHash  string
-	BondMII       int
-	BondPrimary   string
-	RDMAMTU       int
-	RouteCIDR     string
-	RoutePriority int
-	RDMA          []RDMAConfig
+	HostID         string
+	Hostname       string
+	MgmtMode       string
+	MgmtTargetName string
+	MgmtBondName   string
+	MgmtIP         string
+	MgmtPrefix     int
+	MgmtGateway    string
+	MgmtIfaces     []string
+	MgmtMACs       []string
+	MgmtDNS        []string
+	MgmtMTU        int
+	BondMode       string
+	BondLACPRate   string
+	BondXmitHash   string
+	BondMII        int
+	BondPrimary    string
+	RDMAMTU        int
+	RouteCIDR      string
+	RoutePriority  int
+	RDMA           []RDMAConfig
 }
+
+const (
+	MgmtModeSingle = "single"
+	MgmtModeBond   = "bond"
+	MgmtModeAuto   = "auto"
+)
 
 type RDMAConfig struct {
 	Name      string
@@ -428,14 +620,13 @@ type RDMAConfig struct {
 
 func (b *Bundle) ApplyDefaults() {
 	b.Platform.ApplyDefaults()
+	b.ApplyTimeouts.applyDefaults()
+	legacyOffline := reflect.DeepEqual(b.OfflineRepo, OfflineAPTConfig{}) && !reflect.DeepEqual(b.OfflineAPT, OfflineAPTConfig{})
+	if legacyOffline {
+		b.OfflineRepo = b.OfflineAPT
+	}
 	if strings.TrimSpace(b.Defaults.BackupRoot) == "" {
 		b.Defaults.BackupRoot = "/var/lib/envinit/backups"
-	}
-	if b.Defaults.MgmtBondName == "" {
-		b.Defaults.MgmtBondName = "bond0"
-	}
-	if b.Defaults.MgmtPrefix == 0 {
-		b.Defaults.MgmtPrefix = 26
 	}
 	if b.Defaults.MgmtMTU == 0 {
 		b.Defaults.MgmtMTU = 1500
@@ -452,9 +643,6 @@ func (b *Bundle) ApplyDefaults() {
 	if strings.EqualFold(b.Defaults.BondMode, "active-backup") && b.Defaults.BondMIIMonitorInterval == 0 {
 		b.Defaults.BondMIIMonitorInterval = 100
 	}
-	if b.Defaults.RDMAPrefix == 0 {
-		b.Defaults.RDMAPrefix = 24
-	}
 	if b.Defaults.RDMAMTU == 0 {
 		b.Defaults.RDMAMTU = 9000
 	}
@@ -462,15 +650,6 @@ func (b *Bundle) ApplyDefaults() {
 		b.Defaults.RoutePriority = 32761
 	}
 	b.Defaults.RDMAMode = normalizeRDMAMode(b.Defaults.RDMAMode)
-	if b.OfflineAPT.TargetFile == "" {
-		b.OfflineAPT.TargetFile = "/etc/apt/sources.list.d/kunlun-offline.list"
-	}
-	if b.OfflineAPT.CopyTo == "" && strings.TrimSpace(b.OfflineAPT.MaterialPath) != "" {
-		b.OfflineAPT.CopyTo = "/opt/" + strings.Trim(filepath.Base(strings.TrimSpace(b.OfflineAPT.MaterialPath)), "/")
-	}
-	if b.OfflineAPT.Enabled && len(b.OfflineAPT.Entries) == 0 && strings.TrimSpace(b.OfflineAPT.MaterialPath) != "" {
-		b.OfflineAPT.Entries = defaultOfflineRepoEntries("apt")
-	}
 	if b.OfflineRepo.TargetFile == "" && (b.OfflineRepo.Enabled || strings.TrimSpace(b.OfflineRepo.MaterialPath) != "" || len(b.OfflineRepo.Entries) > 0) {
 		switch b.Platform.PackageManager {
 		case "yum":
@@ -485,14 +664,19 @@ func (b *Bundle) ApplyDefaults() {
 	if b.OfflineRepo.Enabled && len(b.OfflineRepo.Entries) == 0 && strings.TrimSpace(b.OfflineRepo.MaterialPath) != "" {
 		b.OfflineRepo.Entries = defaultOfflineRepoEntries(b.Platform.PackageManager)
 	}
+	if legacyOffline {
+		// Directly constructed legacy bundles retain their in-memory alias;
+		// JSON decoding and serialization use only OfflineRepo.
+		b.OfflineAPT = b.OfflineRepo
+	}
 	if b.Artifacts.WorkDir == "" {
 		b.Artifacts.WorkDir = "/opt/kunlun"
 	}
 	if b.Check.Bandwidth.Duration == 0 {
 		b.Check.Bandwidth.Duration = 1
 	}
-	if b.Check.Bandwidth.GIDIndex == 0 {
-		b.Check.Bandwidth.GIDIndex = 3
+	if b.Check.Bandwidth.GIDIndex == 0 && !b.Check.Bandwidth.GIDIndexSet {
+		b.Check.Bandwidth.GIDIndexAuto = true
 	}
 	if b.Check.Bandwidth.Iterations == 0 {
 		b.Check.Bandwidth.Iterations = 100
@@ -507,7 +691,7 @@ func (b *Bundle) ApplyDefaults() {
 	if b.Check.RDMAPing.Count == 0 {
 		b.Check.RDMAPing.Count = 3
 	}
-	if b.Check.RDMAPing.PayloadSize == 0 {
+	if b.Check.RDMAPing.PayloadSize == 0 && !b.Check.RDMAPing.PayloadAuto {
 		b.Check.RDMAPing.PayloadSize = 8972
 	}
 	if b.Check.RDMAPing.Timeout == 0 {
@@ -576,6 +760,16 @@ func (b *Bundle) ApplyDefaults() {
 }
 
 func (b Bundle) Validate() error {
+	p := b.Defaults.RDMAGatewayProbe.Effective()
+	if p.Attempts < 1 || p.Attempts > 10 || p.TimeoutSeconds < 1 || p.TimeoutSeconds > 30 || p.LinkWaitSeconds < 1 || p.LinkWaitSeconds > 60 {
+		return fmt.Errorf("invalid defaults.rdma_gateway_probe limits: attempts 1..10, timeout_seconds 1..30, link_wait_seconds 1..60")
+	}
+	if err := b.ApplyTimeouts.validate(); err != nil {
+		return err
+	}
+	if err := b.Check.SSH.validate(); err != nil {
+		return err
+	}
 	if err := b.Platform.Validate(); err != nil {
 		return err
 	}
@@ -589,11 +783,27 @@ func (b Bundle) Validate() error {
 			"/etc/sysconfig/network-scripts",
 			"/etc/apt/sources.list.d",
 			"/etc/yum.repos.d",
+			"/etc/systemd/system",
+			"/etc/udev/rules.d",
+			"/etc/modprobe.d",
+			"/etc/sysctl.d",
+			"/etc/networkd-dispatcher",
+			"/etc/NetworkManager/dispatcher.d",
+			"/usr/local/sbin",
 		} {
-			rel, err := filepath.Rel(activeConfigDir, backupRoot)
-			if err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))) {
-				return fmt.Errorf("defaults.backup_root %q must not be inside active configuration directory %s", b.Defaults.BackupRoot, activeConfigDir)
+			if pathsOverlap(backupRoot, activeConfigDir) {
+				return fmt.Errorf("defaults.backup_root %q must not overlap active configuration directory %s", b.Defaults.BackupRoot, activeConfigDir)
 			}
+		}
+	}
+	allowedChecks := map[string]bool{"ofed": true, "xre": true, "xdr": true, "firmware": true}
+	for key, command := range b.StageChecks {
+		normalized := strings.TrimSpace(strings.ToLower(key))
+		if !allowedChecks[normalized] || normalized != key {
+			return fmt.Errorf("stage_checks key %q is unsupported; use ofed, xre, xdr, or firmware", key)
+		}
+		if strings.TrimSpace(command) == "" {
+			return fmt.Errorf("stage_checks.%s must not be empty", key)
 		}
 	}
 	switch normalizeRDMAMode(b.Defaults.RDMAMode) {
@@ -602,6 +812,14 @@ func (b Bundle) Validate() error {
 	default:
 		return fmt.Errorf("defaults.rdma_mode %q is not supported; use full, names_only, or off", b.Defaults.RDMAMode)
 	}
+}
+
+func pathsOverlap(left, right string) bool {
+	contains := func(parent, child string) bool {
+		rel, err := filepath.Rel(filepath.Clean(parent), filepath.Clean(child))
+		return err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))))
+	}
+	return contains(left, right) || contains(right, left)
 }
 
 func (p *PlatformConfig) ApplyDefaults() {
@@ -651,7 +869,7 @@ func defaultOfflineRepoEntries(packageManager string) []string {
 		}
 	default:
 		return []string{
-			"deb [trusted=yes] file:{{offline_apt_target}} ./",
+			"deb [trusted=yes] file:{{offline_apt_target}} jammy main",
 		}
 	}
 }
@@ -777,9 +995,60 @@ func firstConfiguredBool(defaultValue bool, values ...*bool) bool {
 }
 
 func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]string) (MachineConfig, error) {
+	legacyRecord := record.LegacySchema || (!record.FromInventory && strings.TrimSpace(record.HostID) != "")
+	if strings.TrimSpace(record.Hostname) == "" && strings.TrimSpace(record.HostID) != "" {
+		record.Hostname = strings.TrimSpace(record.HostID)
+	}
+	if strings.TrimSpace(record.Hostname) == "" {
+		return MachineConfig{}, errors.New("hostname is required; fill hostname in inventory")
+	}
+	if record.MgmtBondName != "" {
+		if record.MgmtTargetName != "" && record.MgmtTargetName != record.MgmtBondName {
+			return MachineConfig{}, errors.New("conflicting mgmt_target_name and deprecated mgmt_bond_name")
+		}
+		record.MgmtTargetName = record.MgmtBondName
+	}
+	mgmtMode := strings.ToLower(strings.TrimSpace(record.MgmtMode))
+	switch mgmtMode {
+	case "":
+		mgmtMode = MgmtModeAuto
+	case MgmtModeSingle, MgmtModeBond, MgmtModeAuto:
+	default:
+		return MachineConfig{}, fmt.Errorf("invalid mgmt_mode %q: use single, bond, or auto", record.MgmtMode)
+	}
+	if mgmtMode == MgmtModeAuto {
+		slots := 0
+		if hasExplicitMgmtSlot(record, 1) {
+			slots++
+		}
+		if hasExplicitMgmtSlot(record, 2) {
+			slots++
+		}
+		switch slots {
+		case 1:
+			mgmtMode = MgmtModeSingle
+		case 2:
+			mgmtMode = MgmtModeBond
+		}
+	}
+	if mgmtMode == MgmtModeSingle {
+		if hasExplicitMgmtSlot(record, 1) && hasExplicitMgmtSlot(record, 2) {
+			return MachineConfig{}, errors.New("mgmt_mode single must specify only one management slot")
+		}
+		if hasExplicitMgmtSlot(record, 2) {
+			record.MgmtIface1, record.MgmtMAC1 = record.MgmtIface2, record.MgmtMAC2
+			record.MgmtIface2, record.MgmtMAC2 = "", ""
+		}
+		if record.MgmtIface1 == "" && record.MgmtMAC1 != "" {
+			record.MgmtIface1 = record.MgmtTargetName
+		}
+	}
+	if !legacyRecord && bundle.ConfigureManagementNetwork() && strings.TrimSpace(record.MgmtIP) == "" {
+		return MachineConfig{}, errors.New("mgmt_ip is required when mgmt_mode is specified and management configuration is enabled")
+	}
 	configureMgmt := bundle.ConfigureManagementNetwork() && strings.TrimSpace(record.MgmtIP) != ""
 
-	mgmtPrefix := bundle.Defaults.MgmtPrefix
+	mgmtPrefix := 0
 	if configureMgmt && record.MgmtPrefix != "" {
 		p, err := strconv.Atoi(strings.TrimSpace(record.MgmtPrefix))
 		if err != nil {
@@ -787,11 +1056,18 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 		}
 		mgmtPrefix = p
 	}
+	if configureMgmt && (mgmtPrefix < 1 || mgmtPrefix > 32) {
+		if legacyRecord {
+			mgmtPrefix = firstNonZero(bundle.Defaults.MgmtPrefix, 26)
+		} else {
+			return MachineConfig{}, errors.New("mgmt_prefix (1..32) is required in inventory when management network configuration is enabled")
+		}
+	}
 
 	mgmtIfaces := make([]string, 0, 2)
 	mgmtMACs := make([]string, 0, 2)
 	if configureMgmt {
-		resolveMgmtCount := len(bundle.Defaults.MgmtInterfaces)
+		resolveMgmtCount := 0
 		explicitMgmt1 := hasExplicitMgmtSlot(record, 1)
 		explicitMgmt2 := hasExplicitMgmtSlot(record, 2)
 		if explicitMgmt2 && resolveMgmtCount < 2 {
@@ -799,6 +1075,15 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 		}
 		if explicitMgmt1 && !explicitMgmt2 {
 			resolveMgmtCount = 1
+		}
+		switch mgmtMode {
+		case MgmtModeSingle:
+			resolveMgmtCount = 1
+		case MgmtModeBond:
+			resolveMgmtCount = 2
+		}
+		if legacyRecord && resolveMgmtCount == 0 {
+			resolveMgmtCount = len(bundle.Defaults.MgmtInterfaces)
 		}
 		for idx := range resolveMgmtCount {
 			var configuredName, configuredMAC, defaultName string
@@ -810,8 +1095,20 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 				configuredName = record.MgmtIface2
 				configuredMAC = record.MgmtMAC2
 			}
-			if idx < len(bundle.Defaults.MgmtInterfaces) {
+			if legacyRecord && idx < len(bundle.Defaults.MgmtInterfaces) {
 				defaultName = bundle.Defaults.MgmtInterfaces[idx]
+			}
+			// An explicit mode defines the slot count even before the target
+			// hardware is available. Empty slots are resolved by the runner;
+			// they are not invented interface names or one-member bonds.
+			if mgmtMode != "" && (ifaceByMAC == nil || (strings.TrimSpace(configuredName) == "" && strings.TrimSpace(configuredMAC) == "" && strings.TrimSpace(defaultName) == "")) {
+				mac, err := NormalizeMAC(configuredMAC)
+				if err != nil {
+					return MachineConfig{}, fmt.Errorf("invalid mgmt%d mac %q: %w", idx+1, configuredMAC, err)
+				}
+				mgmtIfaces = append(mgmtIfaces, firstNonEmpty(configuredName, defaultName))
+				mgmtMACs = append(mgmtMACs, mac)
+				continue
 			}
 			name, mac, err := resolveInterfaceName(configuredName, configuredMAC, defaultName, ifaceByMAC, fmt.Sprintf("mgmt%d", idx+1))
 			if err != nil {
@@ -820,7 +1117,7 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 			mgmtIfaces = append(mgmtIfaces, name)
 			mgmtMACs = append(mgmtMACs, mac)
 		}
-		if len(mgmtIfaces) == 0 && (explicitMgmt1 || explicitMgmt2 || len(bundle.Defaults.MgmtInterfaces) > 0) {
+		if len(mgmtIfaces) == 0 && (explicitMgmt1 || explicitMgmt2) {
 			return MachineConfig{}, errors.New("need at least 1 management interface")
 		}
 	}
@@ -829,10 +1126,13 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 	if configureMgmt {
 		mgmtGW = strings.TrimSpace(record.MgmtGateway)
 		if mgmtGW == "" {
-			mgmtGW = strings.TrimSpace(bundle.Defaults.MgmtGateway)
-		}
-		if mgmtGW == "" {
-			mgmtGW = deriveGateway(record.MgmtIP)
+			if legacyRecord && bundle.Defaults.MgmtGateway != "" {
+				mgmtGW = strings.TrimSpace(bundle.Defaults.MgmtGateway)
+			} else if legacyRecord {
+				mgmtGW = deriveGateway(record.MgmtIP)
+			} else {
+				return MachineConfig{}, errors.New("mgmt_gateway is required in inventory when management network configuration is enabled")
+			}
 		}
 	}
 
@@ -845,34 +1145,35 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 	}
 
 	rdmaCount := len(record.RDMA)
-	if rdmaCount == 0 {
+	if legacyRecord && rdmaCount == 0 {
 		rdmaCount = len(bundle.Defaults.RDMAInterfaces)
 	}
 	rdma := make([]RDMAConfig, 0, rdmaCount)
 	if bundle.RDMAExists() {
 		for idx := 0; idx < rdmaCount; idx++ {
-			def := RDMAInterfaceDefault{
-				Table: 101 + idx,
+			item := RDMAConfig{}
+			// Full route configuration always needs a stable per-slot table. For
+			// names-only inventories, apply the same derived table when the slot
+			// is explicitly present in inventory; bundle-only legacy interface
+			// defaults remain table-less because no route will be configured.
+			if bundle.RDMAConfigureIPRoute() || idx < len(record.RDMA) {
+				item.Table = 101 + idx
 			}
-			if idx < len(bundle.Defaults.RDMAInterfaces) {
-				def = bundle.Defaults.RDMAInterfaces[idx]
-			}
-			item := RDMAConfig{
-				Name:      def.Name,
-				Prefix:    bundle.Defaults.RDMAPrefix,
-				Gateway:   strings.TrimSpace(def.Gateway),
-				Table:     def.Table,
-				RouteCIDR: strings.TrimSpace(bundle.Defaults.RDMARouteCIDR),
+			if legacyRecord && idx < len(bundle.Defaults.RDMAInterfaces) && bundle.Defaults.RDMAInterfaces[idx].Table > 0 {
+				item.Table = bundle.Defaults.RDMAInterfaces[idx].Table
 			}
 			if idx < len(record.RDMA) {
 				row := record.RDMA[idx]
 				item.MAC = strings.TrimSpace(row.MAC)
-				if strings.TrimSpace(row.Name) != "" || strings.TrimSpace(row.MAC) != "" || strings.TrimSpace(item.Name) != "" {
-					name, mac, err := resolveInterfaceName(row.Name, row.MAC, item.Name, ifaceByMAC, fmt.Sprintf("rdma%d", idx+1))
+				if strings.TrimSpace(row.Name) != "" || strings.TrimSpace(row.MAC) != "" {
+					resolvedName, mac, err := resolveInterfaceName(firstNonEmpty(row.Name, fmt.Sprintf("xgbe%d", idx)), row.MAC, "", ifaceByMAC, fmt.Sprintf("rdma%d", idx+1))
 					if err != nil {
 						return MachineConfig{}, err
 					}
-					item.Name = firstNonEmpty(row.Name, item.Name, name)
+					item.Name = strings.TrimSpace(row.Name)
+					if item.Name == "" && legacyRecord {
+						item.Name = resolvedName
+					}
 					item.MAC = mac
 				}
 				item.IP = strings.TrimSpace(row.IP)
@@ -898,47 +1199,87 @@ func ResolveMachine(bundle Bundle, record MachineRecord, ifaceByMAC map[string]s
 				}
 			}
 			if item.Name == "" {
-				item.Name = fmt.Sprintf("rdma%d", idx+1)
+				if legacyRecord {
+					item.Name = fmt.Sprintf("rdma%d", idx+1)
+				} else {
+					item.Name = fmt.Sprintf("xgbe%d", idx)
+				}
 			}
 			if bundle.RDMAConfigureIPRoute() && item.IP == "" {
 				return MachineConfig{}, fmt.Errorf("inventory row missing rdma%d_ip", idx+1)
 			}
-			if item.Gateway == "" && item.IP != "" {
-				item.Gateway = deriveGateway(item.IP)
+			if bundle.RDMAConfigureIPRoute() && (item.Prefix <= 0 || item.Gateway == "") {
+				if legacyRecord {
+					if item.Prefix == 0 {
+						item.Prefix = firstNonZero(bundle.Defaults.RDMAPrefix, 24)
+					}
+					if item.Gateway == "" && item.IP != "" {
+						item.Gateway = deriveGateway(item.IP)
+					}
+				} else {
+					return MachineConfig{}, fmt.Errorf("inventory row missing rdma%d_prefix or rdma%d_gateway; fill inventory", idx+1, idx+1)
+				}
+			}
+			if item.Prefix < 0 || item.Prefix > 32 {
+				return MachineConfig{}, fmt.Errorf("invalid rdma%d_prefix: use 1..32", idx+1)
+			}
+			if item.RouteCIDR == "" && item.IP != "" && item.Prefix > 0 {
+				if _, network, err := net.ParseCIDR(fmt.Sprintf("%s/%d", item.IP, item.Prefix)); err == nil {
+					item.RouteCIDR = network.String()
+				}
 			}
 			rdma = append(rdma, item)
 		}
 	}
 
-	bondName := strings.TrimSpace(record.MgmtBondName)
-	if bondName == "" {
-		bondName = bundle.Defaults.MgmtBondName
+	targetName := strings.TrimSpace(record.MgmtTargetName)
+	bondName := ""
+	if mgmtMode == MgmtModeBond {
+		bondName = targetName
+		if bondName == "" {
+			bondName = "bond0"
+		}
 	}
 	bondPrimary := strings.TrimSpace(bundle.Defaults.BondPrimary)
-	if strings.EqualFold(bundle.Defaults.BondMode, "active-backup") && bondPrimary != "" && len(mgmtIfaces) > 0 && !stringInSlice(bondPrimary, mgmtIfaces) {
+	if mgmtMode == MgmtModeSingle {
+		bondPrimary = ""
+	}
+	if strings.EqualFold(bundle.Defaults.BondMode, "active-backup") && bondPrimary != "" && len(mgmtIfaces) > 0 && !stringInSlice("", mgmtIfaces) && !stringInSlice(bondPrimary, mgmtIfaces) {
 		return MachineConfig{}, fmt.Errorf("bond_primary %q is not one of management interfaces: %s", bondPrimary, strings.Join(mgmtIfaces, ","))
+	}
+	if mgmtMode == MgmtModeBond && bondName != "" && stringInSlice(bondName, mgmtIfaces) {
+		return MachineConfig{}, fmt.Errorf("mgmt_target_name %q must differ from its member interface names", bondName)
+	}
+	if mgmtMode == MgmtModeSingle && targetName != "" && len(mgmtIfaces) == 1 && targetName != mgmtIfaces[0] {
+		return MachineConfig{}, fmt.Errorf("mgmt_target_name %q must equal selected management interface %q in single mode", targetName, mgmtIfaces[0])
+	}
+	if mgmtMode == MgmtModeBond {
+		targetName = bondName
+	} else if mgmtMode == MgmtModeSingle && targetName == "" && len(mgmtIfaces) == 1 {
+		targetName = mgmtIfaces[0]
 	}
 
 	cfg := MachineConfig{
-		HostID:        firstNonEmpty(record.HostID, record.Hostname, record.MgmtIP),
-		Hostname:      firstNonEmpty(record.Hostname, record.HostID),
-		MgmtBondName:  bondName,
-		MgmtIP:        strings.TrimSpace(record.MgmtIP),
-		MgmtPrefix:    mgmtPrefix,
-		MgmtGateway:   mgmtGW,
-		MgmtIfaces:    mgmtIfaces,
-		MgmtMACs:      mgmtMACs,
-		MgmtDNS:       dns,
-		MgmtMTU:       bundle.Defaults.MgmtMTU,
-		BondMode:      bundle.Defaults.BondMode,
-		BondLACPRate:  bundle.Defaults.BondLACPRate,
-		BondXmitHash:  bundle.Defaults.BondTransmitHashPolicy,
-		BondMII:       bundle.Defaults.BondMIIMonitorInterval,
-		BondPrimary:   bondPrimary,
-		RDMAMTU:       bundle.Defaults.RDMAMTU,
-		RouteCIDR:     bundle.Defaults.RDMARouteCIDR,
-		RoutePriority: bundle.Defaults.RoutePriority,
-		RDMA:          rdma,
+		HostID:         strings.TrimSpace(record.Hostname),
+		Hostname:       strings.TrimSpace(record.Hostname),
+		MgmtMode:       mgmtMode,
+		MgmtTargetName: targetName,
+		MgmtBondName:   bondName,
+		MgmtIP:         strings.TrimSpace(record.MgmtIP),
+		MgmtPrefix:     mgmtPrefix,
+		MgmtGateway:    mgmtGW,
+		MgmtIfaces:     mgmtIfaces,
+		MgmtMACs:       mgmtMACs,
+		MgmtDNS:        dns,
+		MgmtMTU:        bundle.Defaults.MgmtMTU,
+		BondMode:       bundle.Defaults.BondMode,
+		BondLACPRate:   bundle.Defaults.BondLACPRate,
+		BondXmitHash:   bundle.Defaults.BondTransmitHashPolicy,
+		BondMII:        bundle.Defaults.BondMIIMonitorInterval,
+		BondPrimary:    bondPrimary,
+		RDMAMTU:        bundle.Defaults.RDMAMTU,
+		RoutePriority:  bundle.Defaults.RoutePriority,
+		RDMA:           rdma,
 	}
 
 	if configureMgmt {
@@ -1111,6 +1452,15 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func firstNonZero(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func maxInt(left int, right int) int {

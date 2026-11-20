@@ -260,11 +260,7 @@ rdmaN_prefix
 
 两者归一化后相同，因此被认为属于同一 rail。
 
-prefix 的获取顺序为：
-
-1. inventory 中的 `rdmaN_prefix`。
-2. bundle 中的默认 `rdma_prefix`。
-3. IPv4 最后默认使用 `/24`。
+规范配置中 prefix 来自 inventory 的 `rdmaN_prefix`。旧 bundle/inventory 通过兼容入口读取时，才保留 bundle 默认值或历史 `/24` 回退；规范 `rdma_mode=full` 项目缺少 prefix 会在离线校验阶段失败。
 
 这里进行的是身份推导，不是网络连通性探测。程序不会通过 ping、LLDP、交换机信息或路由表证明两个接口物理上属于同一条 rail。
 
@@ -445,9 +441,9 @@ node-a eth1 必须对应 node-b eth3
 如果相同网段下实际存在彼此隔离的物理 rail，则必须人工提供对应关系，例如：
 
 ```csv
-host_id,rdma1_name,rdma1_ip,rdma1_prefix,rdma1_rail_id,rdma2_name,rdma2_ip,rdma2_prefix,rdma2_rail_id
-node-a,ens11np0,10.61.10.11,24,fabric-a,ens13np0,10.61.10.12,24,fabric-b
-node-b,ens7f0np0,10.61.10.21,24,fabric-b,ens3f0np0,10.61.10.22,24,fabric-a
+hostname,mgmt_mode,mgmt_target_name,mgmt_ip,mgmt_prefix,mgmt_gateway,rdma1_name,rdma1_ip,rdma1_prefix,rdma1_gateway,rdma1_rail_id,rdma2_name,rdma2_ip,rdma2_prefix,rdma2_gateway,rdma2_rail_id
+node-a,bond,bond0,192.168.1.11,24,192.168.1.1,ens11np0,10.61.10.11,24,10.61.10.1,fabric-a,ens13np0,10.61.10.12,24,10.61.10.1,fabric-b
+node-b,bond,bond0,192.168.1.12,24,192.168.1.1,ens7f0np0,10.61.10.21,24,10.61.10.1,fabric-b,ens3f0np0,10.61.10.22,24,10.61.10.1,fabric-a
 ```
 
 相同的 `fabric-a` 表示跨主机对应的同一条物理 rail，与本地 `rdmaN` 序号或接口名无关。

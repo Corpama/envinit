@@ -175,6 +175,7 @@ func TestXCCLRankScriptExportsRuntimeAndTopologyEnvironment(t *testing.T) {
 		RDMANICs:        []string{"ens11np0", "ens13np0"},
 		RDMANICOrder:    []string{"ens11np0", "ens11np0", "ens13np0", "ens13np0"},
 		SocketInterface: "bond0",
+		MPIInterfaceIP:  "172.18.49.201",
 	}
 	script := xcclRankScript(cfg, plan, "/tmp/envinit-xccl-check/run", true)
 	for _, want := range []string{
@@ -186,6 +187,8 @@ func TestXCCLRankScriptExportsRuntimeAndTopologyEnvironment(t *testing.T) {
 		"BKCL_FORCE_RDMA_NICS_ORDER='ens11np0,ens11np0,ens13np0,ens13np0'",
 		"BKCL_RDMA_NICS='ens11np0,ens11np0,ens13np0,ens13np0'",
 		"BKCL_SOCKET_IFNAME='bond0'",
+		"MPIR_CVAR_CH3_INTERFACE_HOSTNAME='172.18.49.201'",
+		"MPICH_INTERFACE_HOSTNAME='172.18.49.201'",
 		"BKCL_SWITCH_TOPO='1'",
 		"BKCL_RDMA_VERBS='1'",
 		"BKCL_TREE_THRESHOLD='1'",
@@ -196,10 +199,78 @@ func TestXCCLRankScriptExportsRuntimeAndTopologyEnvironment(t *testing.T) {
 		"CUDA_VISIBLE_DEVICES='0,1,2,3'",
 		"XPU_VISIBLE_DEVICES='0,1,2,3'",
 		"BKCL_DEBUG='1'",
+		"INFO xccl rank start host=",
 		"exec '/tmp/envinit-xccl-check/run/runtime/xccl_Linux_x86_64/systest/xccl_perf' \"$@\"",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("expected %q in rank script:\n%s", want, script)
+		}
+	}
+}
+
+func TestResolveXCCLControlInterfacesUsesManagementIPAndExplicitOverrides(t *testing.T) {
+	target := Target{Name: "node2", Address: "172.18.49.201"}
+	opts := Options{
+		Bundle: spec.Bundle{Check: spec.CheckConfig{XCCL: spec.CheckXCCLConfig{}}},
+		CommandRunner: func(_ spec.CheckConfig, _ Target, command string) (string, error) {
+			if command != "ip -o -4 addr show scope global" {
+				t.Fatalf("unexpected command: %s", command)
+			}
+			return "2: xgbe0 inet 10.247.1.12/24 scope global xgbe0\n3: bond0 inet 172.18.49.201/24 scope global bond0\n", nil
+		},
+	}
+	socket, mpiIP, err := resolveXCCLControlInterfaces(opts, target)
+	if err != nil || socket != "bond0" || mpiIP != "172.18.49.201" {
+		t.Fatalf("default socket=%q mpi_ip=%q err=%v", socket, mpiIP, err)
+	}
+	opts.Bundle.Check.XCCL.SocketInterface = "xgbe0"
+	socket, mpiIP, err = resolveXCCLControlInterfaces(opts, target)
+	if err != nil || socket != "xgbe0" || mpiIP != "172.18.49.201" {
+		t.Fatalf("BKCL-only override socket=%q mpi_ip=%q err=%v", socket, mpiIP, err)
+	}
+	opts.Bundle.Check.XCCL.MPIInterface = "xgbe0"
+	socket, mpiIP, err = resolveXCCLControlInterfaces(opts, target)
+	if err != nil || socket != "xgbe0" || mpiIP != "10.247.1.12" {
+		t.Fatalf("override socket=%q mpi_ip=%q err=%v", socket, mpiIP, err)
+	}
+	opts.Bundle.Check.XCCL.SocketInterface = ""
+	socket, mpiIP, err = resolveXCCLControlInterfaces(opts, target)
+	if err != nil || socket != "bond0" || mpiIP != "10.247.1.12" {
+		t.Fatalf("MPI-only override socket=%q mpi_ip=%q err=%v", socket, mpiIP, err)
+	}
+	opts.Bundle.Check.XCCL.MPIInterface = "missing"
+	if _, _, err := resolveXCCLControlInterfaces(opts, target); err == nil {
+		t.Fatal("missing MPI interface should fail")
+	}
+}
+
+func TestResolveXCCLControlInterfacesRejectsUnassignedManagementIP(t *testing.T) {
+	opts := Options{CommandRunner: func(_ spec.CheckConfig, _ Target, _ string) (string, error) {
+		return "2: xgbe0 inet 10.247.1.12/24 scope global xgbe0\n", nil
+	}}
+	if _, _, err := resolveXCCLControlInterfaces(opts, Target{Name: "node2", Address: "172.18.49.201"}); err == nil {
+		t.Fatal("unassigned management IP should fail")
+	}
+}
+
+func TestResolveXCCLControlInterfacesSupportsDifferentManagementInterfaceNames(t *testing.T) {
+	outputs := map[string]string{
+		"bonded": "2: bond0 inet 172.18.49.200/24 scope global bond0\n3: xgbe0 inet 10.247.1.11/24 scope global xgbe0\n",
+		"single": "2: eno1 inet 172.18.49.201/24 scope global eno1\n3: xgbe0 inet 10.247.1.12/24 scope global xgbe0\n",
+	}
+	opts := Options{CommandRunner: func(_ spec.CheckConfig, target Target, _ string) (string, error) {
+		return outputs[target.Name], nil
+	}}
+	for _, tc := range []struct {
+		target Target
+		iface  string
+	}{
+		{Target{Name: "bonded", Address: "172.18.49.200"}, "bond0"},
+		{Target{Name: "single", Address: "172.18.49.201"}, "eno1"},
+	} {
+		socket, mpiIP, err := resolveXCCLControlInterfaces(opts, tc.target)
+		if err != nil || socket != tc.iface || mpiIP != tc.target.Address {
+			t.Fatalf("%s: socket=%q mpi_ip=%q err=%v", tc.target.Name, socket, mpiIP, err)
 		}
 	}
 }
@@ -283,13 +354,17 @@ func TestXCCLMPIRunArgsUseSysTestInterface(t *testing.T) {
 	}
 	got := strings.Join(xcclMPIRunArgs(cfg, "/tmp/envinit-xccl-check/run", 8, false), " ")
 	for _, want := range []string{
-		"mpiexec.hydra -launcher fork -np 8",
+		"mpiexec.hydra -launcher fork",
+		"-np 8",
 		"-wdir /tmp/envinit-xccl-check/run",
 		"run-rank.sh -O allReduce -x 1 -b 1024 -e 256m -f 2 -w 5 -n 20 -c 0 -d float",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expected %q in systest command:\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "-verbose") {
+		t.Fatalf("Hydra verbose logs would mix with the bandwidth table: %s", got)
 	}
 }
 
@@ -300,12 +375,16 @@ func TestXCCLMPIRunArgsAddSameIndexSplitMode(t *testing.T) {
 	}
 	got := strings.Join(xcclMPIRunArgs(cfg, "/tmp/envinit-xccl-check/run", 24, true), " ")
 	for _, want := range []string{
-		"-f /tmp/envinit-xccl-check/run/hosts -np 24",
+		"-f /tmp/envinit-xccl-check/run/hosts",
+		"-np 24",
 		"-d fp16 --split_mode --split_step 8 --split_op 0",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expected %q in same-index command:\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "-verbose") {
+		t.Fatalf("Hydra verbose logs would mix with the bandwidth table: %s", got)
 	}
 }
 
@@ -566,7 +645,10 @@ func TestRunXCCLDryRunDiscoversTopologyAndPrintsEnvironment(t *testing.T) {
 					}
 				}
 			case strings.Contains(command, "ip -o -4 addr show"):
-				return "bond0\n", nil
+				if target.Name == "node-a" {
+					return "2: bond0 inet 10.0.0.1/24 scope global bond0\n3: ens11np0 inet 10.1.0.1/24 scope global ens11np0\n", nil
+				}
+				return "2: bond0 inet 10.0.0.2/24 scope global bond0\n3: ens11np0 inet 10.1.0.2/24 scope global ens11np0\n", nil
 			}
 			return "", fmt.Errorf("unexpected command for %s: %s", target.Name, command)
 		},
@@ -576,13 +658,17 @@ func TestRunXCCLDryRunDiscoversTopologyAndPrintsEnvironment(t *testing.T) {
 	}
 	got := output.String()
 	for _, want := range []string{
-		"INFO xccl topology: node-a xpus=8 xpu_order=0,1,2,3,4,5,6,7 socket_iface=ens11np0",
+		"INFO xccl topology: node-a xpus=8 xpu_order=0,1,2,3,4,5,6,7 socket_iface=bond0 mpi_ip=10.0.0.1",
 		"unique_rdma_nics(4)=ens11np0,ens13np0,ens15np0,ens17np0",
 		"rdma_nics(8)=ens11np0,ens11np0,ens13np0,ens13np0,ens15np0,ens15np0,ens17np0,ens17np0",
 		"force_order(8)=ens11np0,ens11np0,ens13np0,ens13np0,ens15np0,ens15np0,ens17np0,ens17np0",
 		"dry-run xccl copy node-a:",
 		"BKCL_ENABLE_XDR='1'",
-		"BKCL_SOCKET_IFNAME='ens11np0'",
+		"BKCL_SOCKET_IFNAME='bond0'",
+		"MPIR_CVAR_CH3_INTERFACE_HOSTNAME='10.0.0.1'",
+		"MPICH_INTERFACE_HOSTNAME='10.0.0.1'",
+		"ENV xccl node-b MPIR_CVAR_CH3_INTERFACE_HOSTNAME=10.0.0.2",
+		"ENV xccl node-b MPICH_INTERFACE_HOSTNAME=10.0.0.2",
 		"CUDA_VISIBLE_DEVICES='0,1,2,3,4,5,6,7'",
 		"XPU_VISIBLE_DEVICES='0,1,2,3,4,5,6,7'",
 		"INFO xccl ranks: np=16 source=auto discovered_xpus=16",
@@ -634,7 +720,7 @@ func TestRunSingleHostXCCLDryRunUsesLocalLauncherWithoutSSHAuthorization(t *test
 					}
 				}
 			case strings.Contains(command, "ip -o -4 addr show"):
-				return "bond0\n", nil
+				return "2: bond0 inet 10.0.0.1/24 scope global bond0\n", nil
 			}
 			return "", fmt.Errorf("unexpected command: %s", command)
 		},
@@ -644,7 +730,7 @@ func TestRunSingleHostXCCLDryRunUsesLocalLauncherWithoutSSHAuthorization(t *test
 	}
 	got := output.String()
 	for _, want := range []string{
-		"INFO xccl topology: node-a xpus=8 xpu_order=0,1,2,3,4,5,6,7 socket_iface=ens11np0",
+		"INFO xccl topology: node-a xpus=8 xpu_order=0,1,2,3,4,5,6,7 socket_iface=bond0 mpi_ip=10.0.0.1",
 		"local Hydra processes on node-a",
 		"authorized_keys will not be modified",
 		"'-launcher' 'fork'",
@@ -783,9 +869,15 @@ func TestValidateXCCLConfigAllowsTunableBKCLOverrides(t *testing.T) {
 		t.Fatalf("tunable BKCL environment override should validate: %v", err)
 	}
 	plan := xcclTargetPlan{RDMANICOrder: []string{"eth1"}}
-	env := xcclManagedRankEnvironment(cfg, plan, true)
-	if env["BKCL_DEBUG"] != "1" || env["BKCL_FLAT_RING"] != "0" || env["BCCL_ERROR_FILE"] != "/tmp/bccl.%h.%p.log" {
+	env := xcclManagedRankEnvironment(cfg, plan, "/tmp/envinit-xccl-check/run", true)
+	if env["BKCL_DEBUG"] != "1" || env["BKCL_FLAT_RING"] != "0" {
 		t.Fatalf("environment overrides were not applied last: %#v", env)
+	}
+	if env["BCCL_ERROR_FILE"] != "/tmp/envinit-xccl-check/run/logs/bccl-err.%h.%p.log" {
+		t.Fatalf("BCCL_ERROR_FILE should stay inside the run directory: %#v", env)
+	}
+	if env["BCCL_UNIX_SOCKET_PATH"] != "/tmp/envinit-xccl-check/run/bccl-sockets" {
+		t.Fatalf("BCCL_UNIX_SOCKET_PATH should stay inside the run directory: %#v", env)
 	}
 }
 
@@ -798,7 +890,7 @@ func TestSingleHostEnvironmentDoesNotInheritMultiHostScriptVariables(t *testing.
 			"CUSTOM_FLAG":    "single-ok",
 		},
 	}
-	env := xcclManagedRankEnvironment(cfg, xcclTargetPlan{RDMANICOrder: []string{"eth1"}}, false)
+	env := xcclManagedRankEnvironment(cfg, xcclTargetPlan{RDMANICOrder: []string{"eth1"}}, "/tmp/envinit-xccl-check/run", false)
 	for _, key := range []string{"BKCL_FLAT_RING", "BKCL_DEBUG"} {
 		if _, ok := env[key]; ok {
 			t.Fatalf("single-host environment unexpectedly contains multi-host variable %s: %#v", key, env)
@@ -848,6 +940,29 @@ func TestGeneratedXCCLShellIsPortableSyntax(t *testing.T) {
 				t.Fatalf("generated %s shell syntax is invalid: %v\n%s\n%s", name, err, output, script)
 			}
 		})
+	}
+}
+
+func TestCollectXCCLRuntimeLogsReadsPerHostLogDir(t *testing.T) {
+	var hosts []string
+	var commands []string
+	opts := Options{
+		Bundle: spec.Bundle{Check: spec.CheckConfig{}},
+		CommandRunner: func(_ spec.CheckConfig, target Target, command string) (string, error) {
+			hosts = append(hosts, target.Name)
+			commands = append(commands, command)
+			return "----- /tmp/envinit-xccl-check/run/logs/rank-0.err -----\nHydra error\n", nil
+		},
+	}
+	got := collectXCCLRuntimeLogs(opts, []xcclTargetPlan{
+		{Target: Target{Name: "node-a"}},
+		{Target: Target{Name: "node-b"}},
+	}, "/tmp/envinit-xccl-check/run")
+	if !strings.Contains(got, "host=node-a") || !strings.Contains(got, "host=node-b") || !strings.Contains(got, "Hydra error") {
+		t.Fatalf("unexpected collected logs:\n%s", got)
+	}
+	if len(hosts) != 2 || !strings.Contains(commands[0], "/tmp/envinit-xccl-check/run/logs") {
+		t.Fatalf("expected per-host log collection, hosts=%v command=%s", hosts, strings.Join(commands, "\n"))
 	}
 }
 

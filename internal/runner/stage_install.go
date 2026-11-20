@@ -19,12 +19,10 @@ func (a *App) runAPTStage() error {
 	if a.usesYum() {
 		return a.runYumStage()
 	}
-	packages, err := a.requiredPackages()
-	if err != nil {
-		return err
-	}
-	if offlineRepoEnabled(a.Bundle.OfflineAPT) {
-		if err := a.prepareOfflineAPTMaterials(); err != nil {
+	before := a.managedFileRevision
+	repo := a.offlineRepoConfig()
+	if offlineRepoEnabled(repo) {
+		if err := a.prepareOfflineRepoMaterials(repo); err != nil {
 			return err
 		}
 		if a.Bundle.DisableExistingAptSources() {
@@ -32,37 +30,36 @@ func (a *App) runAPTStage() error {
 				return err
 			}
 		}
-		content := strings.Join(a.renderOfflineAPTEntries(), "\n") + "\n"
-		if err := a.writeManagedFile(a.Bundle.OfflineAPT.TargetFile, content, 0o644); err != nil {
+		content := strings.Join(a.renderOfflineRepoEntries(repo), "\n") + "\n"
+		if err := a.writeManagedFile(repo.TargetFile, content, 0o644); err != nil {
 			return err
 		}
 	}
+	packages, err := a.requiredPackages()
+	if err != nil {
+		return err
+	}
+	packages, err = a.missingRequestedPackages(packages)
+	if err != nil {
+		return err
+	}
 
-	if len(packages) == 0 && !offlineRepoEnabled(a.Bundle.OfflineAPT) {
+	if len(packages) == 0 && !offlineRepoEnabled(repo) {
 		a.logf("skip software: no offline apt entries and no packages configured")
 		return nil
 	}
-	if err := a.runCmd("", nil, "apt-get", "update"); err != nil {
+	if len(packages) == 0 && a.managedFileRevision == before {
+		a.logf("software packages and apt source already satisfied; skip apt-get update")
+		return nil
+	}
+	if err := a.runCmd("", aptNonInteractiveEnv(nil), "apt-get", "update"); err != nil {
 		return err
 	}
 	if len(packages) == 0 {
 		return nil
 	}
 	args := append([]string{"install", "-y"}, packages...)
-	return a.runCmd("", nil, "apt-get", args...)
-}
-
-func (a *App) prepareOfflineAPTMaterials() error {
-	source := strings.TrimSpace(a.Bundle.OfflineAPT.MaterialPath)
-	target := strings.TrimSpace(a.Bundle.OfflineAPT.CopyTo)
-	if source == "" || target == "" {
-		return nil
-	}
-	return a.copyMaterial(source, target)
-}
-
-func (a *App) renderOfflineAPTEntries() []string {
-	return a.renderOfflineRepoEntries(a.Bundle.OfflineAPT)
+	return a.runCmd("", aptNonInteractiveEnv(nil), "apt-get", args...)
 }
 
 func (a *App) renderOfflineRepoEntries(repo spec.OfflineAPTConfig) []string {
@@ -89,10 +86,7 @@ func (a *App) renderOfflineRepoEntries(repo spec.OfflineAPTConfig) []string {
 }
 
 func (a *App) runYumStage() error {
-	packages, err := a.requiredPackages()
-	if err != nil {
-		return err
-	}
+	before := a.managedFileRevision
 	repo := a.offlineRepoConfig()
 	if offlineRepoEnabled(repo) {
 		if err := a.prepareOfflineRepoMaterials(repo); err != nil {
@@ -108,8 +102,20 @@ func (a *App) runYumStage() error {
 			return err
 		}
 	}
+	packages, err := a.requiredPackages()
+	if err != nil {
+		return err
+	}
+	packages, err = a.missingRequestedPackages(packages)
+	if err != nil {
+		return err
+	}
 	if len(packages) == 0 && !offlineRepoEnabled(repo) {
 		a.logf("skip software: no offline yum repo entries and no packages configured")
+		return nil
+	}
+	if len(packages) == 0 && a.managedFileRevision == before {
+		a.logf("software packages and yum repo already satisfied; skip yum makecache")
 		return nil
 	}
 	if err := a.runCmd("", nil, "yum", "makecache"); err != nil {
@@ -202,11 +208,11 @@ func (a *App) ensureOFEDPrerequisites() error {
 		args := append([]string{"install", "-y"}, missing...)
 		return a.runCmd("", nil, "yum", args...)
 	}
-	if err := a.runCmd("", nil, "apt-get", "update"); err != nil {
+	if err := a.runCmd("", aptNonInteractiveEnv(nil), "apt-get", "update"); err != nil {
 		return err
 	}
 	args := append([]string{"install", "-y"}, missing...)
-	return a.runCmd("", nil, "apt-get", args...)
+	return a.runCmd("", aptNonInteractiveEnv(nil), "apt-get", args...)
 }
 
 func (a *App) ofedPrerequisitePackages() ([]string, error) {
@@ -435,12 +441,27 @@ func (a *App) localPackageInstallDescription(packages []string) string {
 }
 
 func (a *App) installLocalPackages(packages []string) error {
+	pending, err := a.missingLocalPackages(packages)
+	if err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		a.logf("local packages already satisfied")
+		return nil
+	}
+	packages = pending
 	if a.usesYum() {
 		args := append([]string{"localinstall", "-y"}, packages...)
 		return a.runCmd("", nil, "yum", args...)
 	}
-	args := append([]string{"-i"}, packages...)
-	return a.runCmd("", nil, "dpkg", args...)
+	args := append([]string{
+		"--force-confdef",
+		"--force-confold",
+		"-i",
+	}, packages...)
+	return a.runCmd("", aptNonInteractiveEnv(map[string]string{
+		"DPKG_FRONTEND": "noninteractive",
+	}), "dpkg", args...)
 }
 
 func (a *App) runMlxConfigStage() error {
@@ -478,9 +499,13 @@ func (a *App) runMlxConfigStage() error {
 		}
 		for _, key := range keys {
 			target := a.Bundle.MlxConfig.Settings[key]
-			current := parseMlxConfigValue(queryOut, key)
-			if current == target {
+			current, next := parseMlxConfigValues(queryOut, key)
+			if current == target && next == target {
 				a.logf("mlxconfig %s %s already %s", device, key, target)
+				continue
+			}
+			if next == target {
+				a.logf("mlxconfig %s %s is %s now and %s on next boot; pending reboot", device, key, current, target)
 				continue
 			}
 			if err := a.runCmd("", nil, "mlxconfig", "-y", "-d", device, "set", fmt.Sprintf("%s=%s", key, target)); err != nil {
@@ -500,5 +525,5 @@ func (a *App) runSysctlStage() error {
 	if err := a.ensureSysctlSettings(); err != nil {
 		return err
 	}
-	return a.runCmd("", nil, "sysctl", "-p")
+	return a.applyOwnedSysctl()
 }

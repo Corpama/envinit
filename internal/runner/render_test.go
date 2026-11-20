@@ -36,16 +36,27 @@ func TestRenderRouteScript(t *testing.T) {
 	if strings.Contains(content, `ip route replace "$ROUTE_CIDR" via "$GW"`) {
 		t.Fatalf("did not expect RDMA CIDR route to go via gateway, got:\n%s", content)
 	}
-	if !strings.Contains(content, `done < <(ip rule show | grep "$DEV" || true)`) {
-		t.Fatalf("expected tolerant device-based cleanup in route script, got:\n%s", content)
+	if strings.Contains(content, `ip rule show | grep "$DEV"`) {
+		t.Fatalf("must not delete unrelated rules by interface substring:\n%s", content)
 	}
 	for _, want := range []string{
-		`ip rule del from all oif "$DEV" table "$TABLE" priority "$PRIORITY" 2>/dev/null || true`,
-		`ip rule del from "$IP" table "$TABLE" priority "$PRIORITY" 2>/dev/null || true`,
+		`while ip rule del from all oif "$DEV" table "$TABLE" priority "$PRIORITY" 2>/dev/null; do :; done`,
+		`while ip rule del from "$IP" table "$TABLE" priority "$PRIORITY" 2>/dev/null; do :; done`,
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("expected exact cleanup rule %q in route script, got:\n%s", want, content)
 		}
+	}
+}
+
+func TestParseMlxConfigCurrentAndNextBoot(t *testing.T) {
+	current, next := parseMlxConfigValues("LINK_TYPE_P1 ETH(2) IB(1)\n", "LINK_TYPE_P1")
+	if current != "2" || next != "1" {
+		t.Fatalf("got current=%q next=%q", current, next)
+	}
+	current, next = parseMlxConfigValues("ROCE_CC_PRIO_MASK_P1 255\n", "ROCE_CC_PRIO_MASK_P1")
+	if current != "255" || next != "255" {
+		t.Fatalf("got current=%q next=%q", current, next)
 	}
 }
 
@@ -290,7 +301,7 @@ func TestRenderOfflineAPTEntriesUseCopiedTarget(t *testing.T) {
 			},
 		},
 	}
-	got := app.renderOfflineAPTEntries()
+	got := app.renderOfflineRepoEntries(app.offlineRepoConfig())
 	want := []string{
 		"deb [trusted=yes] file:/opt/repo jammy main",
 		"deb [trusted=yes] file:/opt/repo jammy extra",
@@ -493,7 +504,7 @@ func TestEnsureNetplanRouteDispatcherInstallsMissingPackage(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(binDir, "apt-get"), []byte(aptScript), 0o755); err != nil {
 		t.Fatalf("write apt-get stub: %v", err)
 	}
-	systemctlScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + systemctlMarker + "\n"
+	systemctlScript := "#!/bin/sh\ncase \"$1\" in is-enabled|is-active) exit 1;; esac\nprintf '%s\\n' \"$*\" > " + systemctlMarker + "\n"
 	if err := os.WriteFile(filepath.Join(binDir, "systemctl"), []byte(systemctlScript), 0o755); err != nil {
 		t.Fatalf("write systemctl stub: %v", err)
 	}
@@ -1048,6 +1059,33 @@ func TestNICBindingReviewShowsPlannedIPAndSpaceBinding(t *testing.T) {
 	assertRenderedLinesFit(t, got, 100)
 }
 
+func TestNICBindingReviewShowsGatewayProbeFallbackWarning(t *testing.T) {
+	review := newNICBindingReview([]interfaceBinding{
+		{
+			Kind:         "rdma",
+			Name:         "rdma1",
+			CurrentName:  "ens1np0",
+			MAC:          "aa:bb:cc:dd:ee:01",
+			Address:      "33.3.133.151/25",
+			NeedsReview:  true,
+			Confidence:   "ambiguous",
+			ProbeWarning: "RDMA gateway probe did not produce a unique NIC mapping; fell back to PCI/hardware order",
+		},
+	}, nil)
+	var output strings.Builder
+	renderNICBindingReview(&output, review)
+	got := output.String()
+	for _, want := range []string{
+		"WARNING:",
+		"gateway probe did not produce a unique NIC mapping",
+		"PCI/hardware order",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in warning output:\n%s", want, got)
+		}
+	}
+}
+
 func TestNICBindingReviewSpaceOpensNICOptions(t *testing.T) {
 	review := newNICBindingReview([]interfaceBinding{
 		{
@@ -1164,6 +1202,91 @@ func TestNICBindingReviewNICDropdownSwapsPhysicalNICs(t *testing.T) {
 	}
 	if err := validateReviewBindings(review.Bindings); err != nil {
 		t.Fatalf("expected bindings to remain valid: %v", err)
+	}
+}
+
+func TestNICBindingReviewDisplaysManagementBondAsSharedIPMembers(t *testing.T) {
+	review := newNICBindingReview([]interfaceBinding{
+		{Kind: "mgmt", GroupName: "bond0", Name: "ens10f0np0", CurrentName: "eno1", MAC: "aa:bb:cc:dd:ee:01", Address: "10.101.9.11/26"},
+		{Kind: "mgmt", GroupName: "bond0", Name: "ens10f1np1", CurrentName: "eno2", MAC: "aa:bb:cc:dd:ee:02", Address: "10.101.9.11/26"},
+	}, nil)
+	var out strings.Builder
+	renderNICBindingReviewCompact(&out, review, 100, 0)
+	got := out.String()
+	for _, want := range []string{
+		"Management bond: bond0",
+		"2 physical members",
+		"one shared management IP: 10.101.9.11/26",
+		"bond0/m1",
+		"bond0/m2",
+		"do not treat them as separate management IPs",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in bond review:\n%s", want, got)
+		}
+	}
+	if err := validateReviewBindings(review.Bindings); err != nil {
+		t.Fatalf("distinct bond members should validate: %v", err)
+	}
+	if got := afterApplyLabel(review.Bindings[0]); got != "bond0 (shared IP) 10.101.9.11/26" {
+		t.Fatalf("unexpected bond apply summary: %q", got)
+	}
+}
+
+func TestNICBindingReviewRejectsDuplicatePhysicalNICInManagementBond(t *testing.T) {
+	err := validateReviewBindings([]interfaceBinding{
+		{Kind: "mgmt", GroupName: "bond0", Name: "ens10f0np0", MAC: "aa:bb:cc:dd:ee:01"},
+		{Kind: "mgmt", GroupName: "bond0", Name: "ens10f1np1", MAC: "aa:bb:cc:dd:ee:01"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "same physical NIC") {
+		t.Fatalf("expected duplicate physical NIC error, got %v", err)
+	}
+}
+
+func TestManagementBondMembersUsePermanentMACWhenRuntimeMACIsShared(t *testing.T) {
+	root := t.TempDir()
+	mustWriteNetDevice(t, root, "eno1", "02:00:00:00:00:aa", "0000:10:00.0", "ixgbe", 0, "p0")
+	mustWriteNetDevice(t, root, "eno2", "02:00:00:00:00:aa", "0000:10:00.1", "ixgbe", 1, "p1")
+	bondDir := filepath.Join(root, "sys/class/net", "bond0")
+	if err := os.MkdirAll(filepath.Join(bondDir, "bonding"), 0o755); err != nil {
+		t.Fatalf("mkdir bond sysfs: %v", err)
+	}
+	for iface, mac := range map[string]string{
+		"eno1": "02:00:00:00:00:01",
+		"eno2": "02:00:00:00:00:02",
+	} {
+		slaveDir := filepath.Join(root, "sys/class/net", iface, "bonding_slave")
+		if err := os.MkdirAll(slaveDir, 0o755); err != nil {
+			t.Fatalf("mkdir bond slave sysfs: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(slaveDir, "perm_hwaddr"), []byte(mac+"\n"), 0o644); err != nil {
+			t.Fatalf("write permanent MAC: %v", err)
+		}
+	}
+
+	app := &App{
+		Root: root,
+		Machine: spec.MachineConfig{
+			MgmtMode:     spec.MgmtModeBond,
+			MgmtBondName: "bond0",
+			MgmtIfaces:   []string{"ens10f0np0", "ens10f1np1"},
+			MgmtMACs:     []string{"02:00:00:00:00:01", "02:00:00:00:00:02"},
+			MgmtIP:       "10.101.9.11",
+			MgmtPrefix:   26,
+		},
+	}
+	bindings, err := app.interfaceBindings()
+	if err != nil {
+		t.Fatalf("interface bindings: %v", err)
+	}
+	if len(bindings) != 2 {
+		t.Fatalf("expected two management members, got %#v", bindings)
+	}
+	if bindings[0].CurrentName != "eno1" || bindings[0].MAC != "02:00:00:00:00:01" || bindings[1].CurrentName != "eno2" || bindings[1].MAC != "02:00:00:00:00:02" {
+		t.Fatalf("bond members were not resolved by permanent MAC: %#v", bindings)
+	}
+	if bindings[0].GroupName != "bond0" || bindings[1].GroupName != "bond0" {
+		t.Fatalf("bond group missing from bindings: %#v", bindings)
 	}
 }
 
@@ -1285,7 +1408,7 @@ func TestNewHonorsExplicitSecondManagementInterfaceWhenBundleDefaultsToSingle(t 
 	}
 }
 
-func TestPrepareOfflineAPTMaterialsCopiesDirectory(t *testing.T) {
+func TestPrepareOfflineRepoMaterialsCopiesDirectory(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(t.TempDir(), "repo")
 	if err := os.MkdirAll(filepath.Join(source, "dists"), 0o755); err != nil {
@@ -1297,14 +1420,14 @@ func TestPrepareOfflineAPTMaterialsCopiesDirectory(t *testing.T) {
 	app := &App{
 		Root: root,
 		Bundle: spec.Bundle{
-			OfflineAPT: spec.OfflineAPTConfig{
+			OfflineRepo: spec.OfflineAPTConfig{
 				MaterialPath: source,
 				CopyTo:       "/opt/repo",
 			},
 		},
 		Output: ioDiscard{},
 	}
-	if err := app.prepareOfflineAPTMaterials(); err != nil {
+	if err := app.prepareOfflineRepoMaterials(app.offlineRepoConfig()); err != nil {
 		t.Fatalf("prepare offline apt materials: %v", err)
 	}
 	target := filepath.Join(root, "opt", "repo", "dists", "Release")
@@ -1317,7 +1440,7 @@ func TestPrepareOfflineAPTMaterialsCopiesDirectory(t *testing.T) {
 	}
 }
 
-func TestPrepareOfflineAPTMaterialsSkipsUnchangedDirectory(t *testing.T) {
+func TestPrepareOfflineRepoMaterialsSkipsUnchangedDirectory(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(t.TempDir(), "repo")
 	if err := os.MkdirAll(filepath.Join(source, "dists"), 0o755); err != nil {
@@ -1329,17 +1452,17 @@ func TestPrepareOfflineAPTMaterialsSkipsUnchangedDirectory(t *testing.T) {
 	app := &App{
 		Root: root,
 		Bundle: spec.Bundle{
-			OfflineAPT: spec.OfflineAPTConfig{
+			OfflineRepo: spec.OfflineAPTConfig{
 				MaterialPath: source,
 				CopyTo:       "/opt/repo",
 			},
 		},
 		Output: ioDiscard{},
 	}
-	if err := app.prepareOfflineAPTMaterials(); err != nil {
+	if err := app.prepareOfflineRepoMaterials(app.offlineRepoConfig()); err != nil {
 		t.Fatalf("first prepare offline apt materials: %v", err)
 	}
-	if err := app.prepareOfflineAPTMaterials(); err != nil {
+	if err := app.prepareOfflineRepoMaterials(app.offlineRepoConfig()); err != nil {
 		t.Fatalf("second prepare offline apt materials: %v", err)
 	}
 	backups, err := filepath.Glob(filepath.Join(root, "opt", "repo.bak.*"))
@@ -1348,6 +1471,52 @@ func TestPrepareOfflineAPTMaterialsSkipsUnchangedDirectory(t *testing.T) {
 	}
 	if len(backups) != 0 {
 		t.Fatalf("expected no repo backups for unchanged material, got %v", backups)
+	}
+}
+
+func TestAPTStagePreparesOfflineRepoBeforePackageCheckAndInstall(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatalf("mkdir source repo: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "Packages"), []byte("repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo: %v", err)
+	}
+	marker := filepath.Join(t.TempDir(), "order.log")
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "dpkg-query"), []byte("#!/bin/sh\nif [ ! -f "+root+"/opt/repo/Packages ]; then exit 91; fi\nprintf 'dpkg-query\\n' >> "+marker+"\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write dpkg-query stub: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "apt-get"), []byte("#!/bin/sh\nif [ ! -f "+root+"/opt/repo/Packages ]; then exit 92; fi\nprintf '%s\\n' \"$*\" >> "+marker+"\n"), 0o755); err != nil {
+		t.Fatalf("write apt-get stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	app := &App{
+		Root: root,
+		Bundle: spec.Bundle{
+			Platform: spec.PlatformConfig{PackageManager: "apt", KernelHeadersPackage: "none"},
+			OfflineRepo: spec.OfflineAPTConfig{
+				Enabled:      true,
+				MaterialPath: source,
+				CopyTo:       "/opt/repo",
+				TargetFile:   "/etc/apt/sources.list.d/kunlun-offline.list",
+				Entries:      []string{"deb [trusted=yes] file:/opt/repo stable main"},
+			},
+			Packages: []string{"example-package"},
+		},
+		Output: ioDiscard{},
+	}
+	if err := app.runAPTStage(); err != nil {
+		t.Fatalf("run apt stage: %v", err)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read operation order: %v", err)
+	}
+	if got, want := string(data), "dpkg-query\nupdate\ninstall -y example-package\n"; got != want {
+		t.Fatalf("unexpected software operation order: got %q want %q", got, want)
 	}
 }
 
@@ -1936,7 +2105,7 @@ func TestNetworkStagePersistsUdevWhenPlannedInterfacesAreMissing(t *testing.T) {
 	}
 }
 
-func TestPrepareNetworkApplyDefersManagementRenameWhenImmediateApplyDisabled(t *testing.T) {
+func TestPrepareNetworkApplyDefersAllRenamesWhenImmediateApplyDisabled(t *testing.T) {
 	disabled := false
 	var output strings.Builder
 	app := &App{
@@ -1961,14 +2130,14 @@ func TestPrepareNetworkApplyDefersManagementRenameWhenImmediateApplyDisabled(t *
 		t.Fatalf("prepare network apply: %v", err)
 	}
 	got := output.String()
-	if !strings.Contains(got, "defer management interface rename mgmt-current -> mgmt-target until reboot") {
+	if !strings.Contains(got, "defer all live interface changes") {
 		t.Fatalf("expected management rename deferral, got:\n%s", got)
 	}
 	if strings.Contains(got, "ip link set dev mgmt-current") {
 		t.Fatalf("did not expect live management interface rename, got:\n%s", got)
 	}
-	if !strings.Contains(got, "ip link set dev rdma-current") {
-		t.Fatalf("expected RDMA interface to be renamed for later stages, got:\n%s", got)
+	if strings.Contains(got, "ip link set dev rdma-current") {
+		t.Fatalf("did not expect live RDMA interface rename, got:\n%s", got)
 	}
 }
 
@@ -2077,6 +2246,13 @@ func TestInstallPostPackagesPreservesBundleOrder(t *testing.T) {
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write dpkg stub: %v", err)
 	}
+	dpkgDeb := "#!/bin/sh\ncase \"$2\" in *pkg-a.deb) printf 'Package: pkg-a\\nVersion: 1\\nArchitecture: amd64\\n';; *) printf 'Package: pkg-b\\nVersion: 1\\nArchitecture: amd64\\n';; esac\n"
+	if err := os.WriteFile(filepath.Join(binDir, "dpkg-deb"), []byte(dpkgDeb), 0o755); err != nil {
+		t.Fatalf("write dpkg-deb stub: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "dpkg-query"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write dpkg-query stub: %v", err)
+	}
 	t.Setenv("PATH", binDir)
 
 	app := &App{
@@ -2095,7 +2271,7 @@ func TestInstallPostPackagesPreservesBundleOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read dpkg log: %v", err)
 	}
-	want := "-i /mnt/usb/pkg-a.deb\n-i /mnt/usb/pkg-b.deb\n"
+	want := "--force-confdef --force-confold -i /mnt/usb/pkg-a.deb\n--force-confdef --force-confold -i /mnt/usb/pkg-b.deb\n"
 	if string(data) != want {
 		t.Fatalf("unexpected install order: got %q want %q", string(data), want)
 	}
@@ -2284,10 +2460,13 @@ func TestDisableExistingNetworkFilesBacksUpOnlyEnabledNetworkTargets(t *testing.
 		}
 	}
 	for _, path := range []string{rdmaIfcfg, rdmaRoute, rdmaRule, rdmaNetplan} {
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Fatalf("expected RDMA target config to be moved before rewrite at %s, stat err=%v", path, err)
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("live RDMA config must remain until replacement at %s: %v", path, err)
 		}
 		systemPath := "/" + strings.TrimPrefix(strings.TrimPrefix(path, root), "/")
+		if err := app.writeManagedFile(systemPath, "replacement\n", 0o600); err != nil {
+			t.Fatal(err)
+		}
 		backup := backupPathForTest(root, "20260903_161524", systemPath)
 		if _, err := os.Stat(backup); err != nil {
 			t.Fatalf("expected RDMA target backup for %s at %s: %v", path, backup, err)
@@ -2340,10 +2519,13 @@ func TestDisableExistingNetworkFilesBacksUpOnlyManagementTargetsWhenRDMAIPDisabl
 		t.Fatalf("disable netplan: %v", err)
 	}
 	for _, path := range []string{mgmtIfcfg, mgmtNetplan} {
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Fatalf("expected management target config to be moved before rewrite at %s, stat err=%v", path, err)
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("live management config must remain until replacement at %s: %v", path, err)
 		}
 		systemPath := "/" + strings.TrimPrefix(strings.TrimPrefix(path, root), "/")
+		if err := app.writeManagedFile(systemPath, "replacement\n", 0o600); err != nil {
+			t.Fatal(err)
+		}
 		backup := backupPathForTest(root, "20260903_161816", systemPath)
 		if _, err := os.Stat(backup); err != nil {
 			t.Fatalf("expected management target backup for %s at %s: %v", path, backup, err)

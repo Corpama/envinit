@@ -65,7 +65,7 @@ func matchMachine(records []spec.MachineRecord, host string, root string, localM
 		return macMatches[0], nil
 	}
 
-	return spec.MachineRecord{}, errors.New("failed to auto-match the current machine; specify --host with a host_id/hostname/mgmt_ip from the inventory, or add MAC addresses to the inventory")
+	return spec.MachineRecord{}, errors.New("failed to auto-match the current machine; specify --host with a hostname/mgmt_ip from the inventory, or add MAC addresses to the inventory")
 }
 
 func matchesRecord(record spec.MachineRecord, host string) bool {

@@ -1,7 +1,9 @@
 package runner
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -124,7 +126,7 @@ func (a *App) describeStage(stage string) ([]string, error) {
 				lines = append(lines, fmt.Sprintf("best-effort enable RoCE adaptive routing on %s using ethtool bus-info and mlxreg ROCE_ACCL adaptive_routing_forced_en=0x1", item.Name))
 			}
 		}
-		return a.appendNetworkUdevRuleActions(lines), nil
+		return a.appendNetworkEvolutionHints(a.appendNetworkUdevRuleActions(lines)), nil
 	case "udev":
 		lines := []string{
 			"reuse confirmed NIC bindings from the network stage, or review NIC bindings when udev is run standalone",
@@ -140,20 +142,20 @@ func (a *App) describeStage(stage string) ([]string, error) {
 			return a.describeYumStage()
 		}
 		lines := []string{}
-		if offlineRepoEnabled(a.Bundle.OfflineAPT) {
-			if strings.TrimSpace(a.Bundle.OfflineAPT.MaterialPath) != "" && strings.TrimSpace(a.Bundle.OfflineAPT.CopyTo) != "" {
-				lines = append(lines, fmt.Sprintf("copy offline apt materials from %s to %s", a.Bundle.OfflineAPT.MaterialPath, a.Bundle.OfflineAPT.CopyTo))
+		if offlineRepoEnabled(a.offlineRepoConfig()) {
+			if strings.TrimSpace(a.offlineRepoConfig().MaterialPath) != "" && strings.TrimSpace(a.offlineRepoConfig().CopyTo) != "" {
+				lines = append(lines, fmt.Sprintf("copy offline apt materials from %s to %s", a.offlineRepoConfig().MaterialPath, a.offlineRepoConfig().CopyTo))
 			}
 			if a.Bundle.DisableExistingAptSources() {
 				lines = append(lines, fmt.Sprintf("backup existing apt source files except the envinit-managed offline source file under %s", a.Bundle.Defaults.BackupRoot))
 			}
-			lines = append(lines, fmt.Sprintf("write %s with offline apt entries: %s", a.Bundle.OfflineAPT.TargetFile, strings.Join(a.renderOfflineAPTEntries(), " ; ")))
+			lines = append(lines, fmt.Sprintf("write %s with offline apt entries: %s", a.offlineRepoConfig().TargetFile, strings.Join(a.renderOfflineRepoEntries(a.offlineRepoConfig()), " ; ")))
 		}
 		packages, err := a.requiredPackages()
 		if err != nil {
 			return nil, err
 		}
-		if offlineRepoEnabled(a.Bundle.OfflineAPT) || len(packages) > 0 {
+		if offlineRepoEnabled(a.offlineRepoConfig()) || len(packages) > 0 {
 			lines = append(lines, "run apt-get update")
 		}
 		if len(packages) > 0 {
@@ -273,12 +275,16 @@ func (a *App) describeStage(stage string) ([]string, error) {
 		return lines, nil
 	case "sysctl":
 		lines := []string{
-			fmt.Sprintf("append missing kernel parameters into %s", sysctlFile),
+			fmt.Sprintf("reconcile owned kernel parameters in %s; preserve external keys and restore recorded originals on retirement", sysctlFile),
+		}
+		if _, err := os.Stat(a.targetPath(sysctlOwnershipFile)); os.IsNotExist(err) {
+			lines = append(lines, "NOTICE: historical sysctl ownership is unavailable; no existing key will be auto-adopted or removed")
+			lines = append(lines, "ACTION: review old sysctl entries manually; rerun sysctl after ownership evidence is established")
 		}
 		for _, line := range desiredSysctlLines(a.Machine) {
 			lines = append(lines, fmt.Sprintf("ensure %s", line))
 		}
-		lines = append(lines, "run sysctl -p")
+		lines = append(lines, "verify runtime values even when files are unchanged; apply only differing keys with sysctl -w")
 		return lines, nil
 	case "kernel":
 		return []string{
@@ -369,7 +375,102 @@ func (a *App) describeNetworkManagerStage() []string {
 			lines = append(lines, fmt.Sprintf("best-effort enable RoCE adaptive routing on %s using ethtool bus-info and mlxreg ROCE_ACCL adaptive_routing_forced_en=0x1", item.Name))
 		}
 	}
-	return a.appendNetworkUdevRuleActions(lines)
+	return a.appendNetworkEvolutionHints(a.appendNetworkUdevRuleActions(lines))
+}
+
+func (a *App) appendNetworkEvolutionHints(lines []string) []string {
+	old := networkManifest{}
+	data, err := os.ReadFile(a.targetPath(networkManifestFile))
+	if err != nil {
+		if !os.IsNotExist(err) {
+			lines = append(lines, "WARNING: cannot read previous network ownership; topology cleanup requires manual review")
+		}
+		return lines
+	}
+	if err := json.Unmarshal(data, &old); err != nil {
+		return append(lines, "WARNING: previous network ownership is unreadable; execution will stop before destructive cleanup")
+	}
+	if old.Version < 2 || len(old.Topology.Links) == 0 {
+		return append(lines, "NOTICE: previous network state lacks topology ownership; verify old interfaces, bond members and routes manually before a topology change")
+	}
+	var next networkTopology
+	var bindings []interfaceBinding
+	for i, name := range a.Machine.MgmtIfaces {
+		mac := ""
+		if i < len(a.Machine.MgmtMACs) {
+			mac = a.Machine.MgmtMACs[i]
+		}
+		bindings = append(bindings, interfaceBinding{Kind: "mgmt", Name: name, MAC: mac})
+	}
+	for _, item := range a.Machine.RDMA {
+		bindings = append(bindings, interfaceBinding{Kind: "rdma", Name: item.Name, MAC: item.MAC})
+	}
+	next = a.desiredNetworkTopology(bindings)
+	changedPhysical := false
+	changedBond := false
+	for _, want := range next.Links {
+		oldLink, ok := topologyLink(old.Topology, want.Name)
+		if !ok {
+			changedPhysical = true
+			continue
+		}
+		if oldLink.MAC != want.MAC {
+			changedPhysical = true
+		}
+		if oldLink.Bond != want.Bond || oldLink.Master != want.Master || oldLink.BondMode != want.BondMode {
+			changedBond = true
+		}
+	}
+	for _, previous := range old.Topology.Links {
+		if _, ok := topologyLink(next, previous.Name); !ok {
+			changedPhysical = true
+		}
+	}
+	if changedPhysical || changedBond {
+		lines = append(lines, "NOTICE: network topology/physical binding differs from the last successful state")
+		lines = append(lines, describeTopologyDiff(old.Topology, next)...)
+		lines = append(lines, "NOTICE: review the generated bond/member and MAC changes; topology changes do not automatically enable mlxconfig, sysctl, or post")
+		lines = append(lines, "ACTION: if hardware/RDMA binding changed, manually run --stages mlxconfig,sysctl,post after network validation")
+	}
+	if a.networkBackend() != old.Topology.Backend {
+		lines = append(lines, fmt.Sprintf("NOTICE: network backend changes %s -> %s; manually verify service ownership and old profiles", old.Topology.Backend, a.networkBackend()))
+	}
+	return lines
+}
+
+func describeTopologyDiff(old, next networkTopology) []string {
+	var lines []string
+	seen := map[string]bool{}
+	for _, want := range next.Links {
+		previous, ok := topologyLink(old, want.Name)
+		seen[want.Name] = true
+		if !ok {
+			lines = append(lines, fmt.Sprintf("DIFF: add %s role=%s mac=%s address=%s gateway=%s master=%s bond=%t members=%s", want.Name, want.Role, want.MAC, want.Address, want.Gateway, want.Master, want.Bond, topologyMembers(next, want.Name)))
+			continue
+		}
+		if previous == want {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("DIFF: change %s mac %s -> %s; address %s -> %s; gateway %s -> %s; master %s -> %s; bond %t -> %t; mode %s -> %s; members %s -> %s", want.Name, previous.MAC, want.MAC, previous.Address, want.Address, previous.Gateway, want.Gateway, previous.Master, want.Master, previous.Bond, want.Bond, previous.BondMode, want.BondMode, topologyMembers(old, want.Name), topologyMembers(next, want.Name)))
+	}
+	for _, previous := range old.Links {
+		if seen[previous.Name] {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("DIFF: retire %s role=%s mac=%s address=%s gateway=%s master=%s bond=%t members=%s", previous.Name, previous.Role, previous.MAC, previous.Address, previous.Gateway, previous.Master, previous.Bond, topologyMembers(old, previous.Name)))
+	}
+	return lines
+}
+
+func topologyMembers(topology networkTopology, master string) string {
+	var members []string
+	for _, link := range topology.Links {
+		if link.Master == master {
+			members = append(members, link.Name)
+		}
+	}
+	sort.Strings(members)
+	return strings.Join(members, ",")
 }
 
 func (a *App) describeLegacyNetworkStage() []string {
@@ -416,7 +517,7 @@ func (a *App) describeLegacyNetworkStage() []string {
 			lines = append(lines, fmt.Sprintf("best-effort enable RoCE adaptive routing on %s using ethtool bus-info and mlxreg ROCE_ACCL adaptive_routing_forced_en=0x1", item.Name))
 		}
 	}
-	return a.appendNetworkUdevRuleActions(lines)
+	return a.appendNetworkEvolutionHints(a.appendNetworkUdevRuleActions(lines))
 }
 
 func (a *App) appendNetworkUdevRuleActions(lines []string) []string {
@@ -526,8 +627,8 @@ func (a *App) plannedFiles() []string {
 	if a.Stages["all"] || a.Stages["sysctl"] {
 		files = append(files, sysctlFile)
 	}
-	if a.stageEnabled("software") && offlineRepoEnabled(a.Bundle.OfflineAPT) {
-		files = append(files, a.Bundle.OfflineAPT.TargetFile)
+	if a.stageEnabled("software") && offlineRepoEnabled(a.offlineRepoConfig()) {
+		files = append(files, a.offlineRepoConfig().TargetFile)
 	}
 	if a.stageEnabled("software") && a.usesYum() {
 		repo := a.offlineRepoConfig()

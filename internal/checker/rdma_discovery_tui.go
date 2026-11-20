@@ -28,6 +28,7 @@ type targetNetworkDiscovery struct {
 	RDMAManual         []bool
 	DefaultMgmtChoice  int
 	DefaultRDMAChoices []int
+	DeleteUnmatched    bool
 }
 
 func runNetworkDiscoveryReview(targets []Target, mgmt map[string][]discoveredIPv4Address, rdma map[string][]discoveredRDMAInterface) ([]Target, error) {
@@ -52,6 +53,10 @@ func newNetworkDiscoveryReview(targets []Target, mgmt map[string][]discoveredIPv
 		Targets: make([]targetNetworkDiscovery, 0, len(targets)),
 	}
 	for _, target := range targets {
+		planned := target.PlannedRDMA
+		if planned == nil {
+			planned = target.RDMA
+		}
 		item := targetNetworkDiscovery{
 			Original:   target,
 			Mgmt:       append([]discoveredIPv4Address(nil), mgmt[target.Name]...),
@@ -67,7 +72,7 @@ func newNetworkDiscoveryReview(targets []Target, mgmt map[string][]discoveredIPv
 		if item.MgmtChoice < 0 && len(item.Mgmt) > 0 && strongDiscoveryCandidate(item.Mgmt[0].Confidence) {
 			item.MgmtChoice = 0
 		}
-		slotCount := len(target.RDMA)
+		slotCount := len(planned)
 		if slotCount == 0 {
 			slotCount = len(item.RDMA)
 		}
@@ -76,7 +81,7 @@ func newNetworkDiscoveryReview(targets []Target, mgmt map[string][]discoveredIPv
 		for idx := range item.RDMAChoices {
 			item.RDMAChoices[idx] = -1
 		}
-		for slot, existing := range target.RDMA {
+		for slot, existing := range planned {
 			if slot >= len(item.RDMAChoices) {
 				break
 			}
@@ -104,19 +109,53 @@ func reviewTargets(review *networkDiscoveryReview) []Target {
 		target := item.Original
 		if item.MgmtChoice >= 0 && item.MgmtChoice < len(item.Mgmt) {
 			target.Address = item.Mgmt[item.MgmtChoice].IP
+			target.ManagementIface = item.Mgmt[item.MgmtChoice].Iface
+			target.ManagementMAC = item.Mgmt[item.MgmtChoice].MAC
+		}
+		if target.DiscoveredHostname != "" && !target.ExplicitIdentity {
+			target.Name = target.DiscoveredHostname
 		}
 		target.RDMA = nil
-		for _, choice := range item.RDMAChoices {
+		target.DeleteUnmatchedRDMA = item.DeleteUnmatched
+		target.PreserveUnmatchedRDMA = !item.DeleteUnmatched
+		lastSlot := len(item.RDMAChoices)
+		if item.DeleteUnmatched {
+			for lastSlot > 0 && item.RDMAChoices[lastSlot-1] < 0 {
+				lastSlot--
+			}
+		}
+		if item.hasRDMAShortage() && !item.DeleteUnmatched {
+			target.PreserveUnmatchedRDMA = true
+		}
+		planned := item.Original.PlannedRDMA
+		if planned == nil {
+			planned = item.Original.RDMA
+		}
+		for slot, choice := range item.RDMAChoices[:lastSlot] {
 			if choice < 0 || choice >= len(item.RDMA) {
+				if slot < len(planned) {
+					target.RDMA = append(target.RDMA, planned[slot])
+				}
 				continue
 			}
 			candidate := item.RDMA[choice]
-			target.RDMA = append(target.RDMA, spec.RDMARecord{
+			record := spec.RDMARecord{
 				Name:   candidate.Name,
 				MAC:    candidate.MAC,
 				IP:     candidate.IP,
 				Prefix: prefixString(candidate.Prefix),
-			})
+			}
+			if slot < len(planned) {
+				record.Name = firstNonEmpty(record.Name, planned[slot].Name)
+				record.IP = firstNonEmpty(record.IP, planned[slot].IP)
+				record.MAC = firstNonEmpty(record.MAC, planned[slot].MAC)
+				record.Prefix = firstNonEmpty(planned[slot].Prefix, record.Prefix)
+				record.Gateway = planned[slot].Gateway
+				record.Table = planned[slot].Table
+				record.RouteCIDR = planned[slot].RouteCIDR
+				record.RailID = planned[slot].RailID
+			}
+			target.RDMA = append(target.RDMA, record)
 		}
 		out = append(out, target)
 	}
@@ -166,6 +205,8 @@ func (m networkDiscoveryModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.review.clearSlot()
 		case "r":
 			m.review.resetTargetDefaults()
+		case "d", "D":
+			m.review.toggleDeleteUnmatched()
 		case "+", "=":
 			m.review.addRDMASlot()
 		case "-", "_":
@@ -187,6 +228,14 @@ func (m networkDiscoveryModel) View() string {
 	target := &m.review.Targets[m.review.Target]
 	fmt.Fprintf(&b, "Network Discovery Review  target %d/%d: %s\n\n", m.review.Target+1, len(m.review.Targets), target.Original.Name)
 	fmt.Fprintln(&b, "Bind inventory fields to discovered network candidates.")
+	fmt.Fprintln(&b, "Gateway is not discovered: verify each rdmaN_gateway for the selected interface/IP before apply.")
+	if target.hasRDMAShortage() {
+		if target.DeleteUnmatched {
+			fmt.Fprintln(&b, "WARNING: deletion confirmed; trailing unselected planned RDMA slots will be removed")
+		} else {
+			fmt.Fprintln(&b, "WARNING: fewer RDMA candidates were found; press D to confirm removal, or accept to preserve planning values")
+		}
+	}
 	fmt.Fprintln(&b)
 	renderDiscoverySlots(&b, target, m.review.Slot)
 	fmt.Fprintln(&b)
@@ -202,19 +251,23 @@ func (m networkDiscoveryModel) View() string {
 
 func renderDiscoverySlots(b *strings.Builder, target *targetNetworkDiscovery, selected int) {
 	fmt.Fprintln(b, "Planned inventory fields")
-	fmt.Fprintln(b, "  Slot    Value                                      Why")
-	fmt.Fprintln(b, "  ----    -----------------------------------------  ------------------------")
+	fmt.Fprintln(b, "  Slot    Value                                      Inventory gateway  Why")
+	fmt.Fprintln(b, "  ----    -----------------------------------------  -----------------  ------------------------")
 	marker := " "
 	if selected == 0 {
 		marker = ">"
 	}
-	fmt.Fprintf(b, "%s mgmt   %-41s  %s\n", marker, mgmtChoiceLabel(target), mgmtChoiceReason(target))
+	fmt.Fprintf(b, "%s mgmt   %-41s  %-17s  %s\n", marker, mgmtChoiceLabel(target), "-", mgmtChoiceReason(target))
 	for idx := range target.RDMAChoices {
 		marker = " "
 		if selected == idx+1 {
 			marker = ">"
 		}
-		fmt.Fprintf(b, "%s rdma%-2d %-41s  %s\n", marker, idx+1, rdmaChoiceLabel(target, idx), rdmaChoiceReason(target, idx))
+		gateway := "-"
+		if idx < len(target.Original.RDMA) && strings.TrimSpace(target.Original.RDMA[idx].Gateway) != "" {
+			gateway = strings.TrimSpace(target.Original.RDMA[idx].Gateway)
+		}
+		fmt.Fprintf(b, "%s rdma%-2d %-41s  %-17s  %s\n", marker, idx+1, rdmaChoiceLabel(target, idx), gateway, rdmaChoiceReason(target, idx))
 	}
 }
 
@@ -370,6 +423,10 @@ func (review *networkDiscoveryReview) addRDMASlot() {
 
 func (review *networkDiscoveryReview) removeRDMASlot() {
 	target := &review.Targets[review.Target]
+	if target.hasRDMAShortage() && !target.DeleteUnmatched {
+		review.Message = "press D to confirm deletion before removing a missing planned RDMA slot"
+		return
+	}
 	if len(target.RDMAChoices) == 0 {
 		review.Message = "no RDMA slot to remove"
 		return
@@ -380,6 +437,28 @@ func (review *networkDiscoveryReview) removeRDMASlot() {
 		review.Slot = len(target.RDMAChoices)
 	}
 	review.Message = "removed the last RDMA inventory slot"
+}
+
+func (target *targetNetworkDiscovery) hasRDMAShortage() bool {
+	planned := target.Original.PlannedRDMA
+	if planned == nil {
+		planned = target.Original.RDMA
+	}
+	return len(planned) > len(target.RDMA)
+}
+
+func (review *networkDiscoveryReview) toggleDeleteUnmatched() {
+	target := &review.Targets[review.Target]
+	if !target.hasRDMAShortage() {
+		review.Message = "no planned RDMA slots are missing from discovery"
+		return
+	}
+	target.DeleteUnmatched = !target.DeleteUnmatched
+	if target.DeleteUnmatched {
+		review.Message = "deletion confirmed for trailing unselected planned RDMA slots"
+	} else {
+		review.Message = "deletion rejected; planned RDMA slots will be preserved"
+	}
 }
 
 func validateNetworkDiscoveryReview(review *networkDiscoveryReview) error {
@@ -394,8 +473,21 @@ func validateNetworkDiscoveryReview(review *networkDiscoveryReview) error {
 			mgmtIface = target.Mgmt[target.MgmtChoice].Iface
 			mgmtIP = target.Mgmt[target.MgmtChoice].IP
 		}
-		for idx, choice := range target.RDMAChoices {
+		lastSlot := len(target.RDMAChoices)
+		if target.DeleteUnmatched {
+			for lastSlot > 0 && target.RDMAChoices[lastSlot-1] < 0 {
+				lastSlot--
+			}
+		}
+		for idx, choice := range target.RDMAChoices[:lastSlot] {
 			if choice < 0 {
+				planned := target.Original.PlannedRDMA
+				if planned == nil {
+					planned = target.Original.RDMA
+				}
+				if idx < len(planned) && !target.DeleteUnmatched {
+					continue
+				}
 				return fmt.Errorf("%s rdma%d is not selected", target.Original.Name, idx+1)
 			}
 			if choice >= len(target.RDMA) {

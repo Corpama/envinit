@@ -72,18 +72,43 @@ func (a *App) ensureExplicitNetworkBackendService() error {
 	}
 	switch backend {
 	case "networkmanager":
-		if err := a.runCmdAllowFailure("", nil, "systemctl", "disable", "--now", "network"); err != nil {
-			return err
-		}
-		return a.runCmd("", nil, "systemctl", "enable", "--now", "NetworkManager")
+		return a.convergeExclusiveNetworkService("NetworkManager", "network")
 	case "network":
-		if err := a.runCmdAllowFailure("", nil, "systemctl", "disable", "--now", "NetworkManager"); err != nil {
-			return err
-		}
-		return a.runCmd("", nil, "systemctl", "enable", "--now", "network")
+		return a.convergeExclusiveNetworkService("network", "NetworkManager")
 	default:
 		return nil
 	}
+}
+
+func (a *App) convergeExclusiveNetworkService(target, other string) error {
+	if a.DryRun {
+		if err := a.runCmdAllowFailure("", nil, "systemctl", "disable", "--now", other); err != nil {
+			return err
+		}
+		return a.runCmd("", nil, "systemctl", "enable", "--now", target)
+	}
+	if _, err := a.captureCmd("", nil, "systemctl", "is-active", "--quiet", other); err == nil {
+		if err := a.runCmdAllowFailure("", nil, "systemctl", "disable", "--now", other); err != nil {
+			return err
+		}
+	} else if _, err := a.captureCmd("", nil, "systemctl", "is-enabled", "--quiet", other); err == nil {
+		if err := a.runCmdAllowFailure("", nil, "systemctl", "disable", other); err != nil {
+			return err
+		}
+	}
+	enabledErr := error(nil)
+	if _, err := a.captureCmd("", nil, "systemctl", "is-enabled", "--quiet", target); err != nil {
+		enabledErr = err
+	}
+	activeErr := error(nil)
+	if _, err := a.captureCmd("", nil, "systemctl", "is-active", "--quiet", target); err != nil {
+		activeErr = err
+	}
+	if enabledErr == nil && activeErr == nil {
+		a.logf("network service %s already satisfied", target)
+		return nil
+	}
+	return a.runCmd("", nil, "systemctl", "enable", "--now", target)
 }
 
 func (a *App) describeExplicitNetworkBackendServiceSwitch() []string {
@@ -108,10 +133,7 @@ func (a *App) describeExplicitNetworkBackendServiceSwitch() []string {
 }
 
 func (a *App) offlineRepoConfig() spec.OfflineAPTConfig {
-	if a.Bundle.OfflineRepo.Enabled || strings.TrimSpace(a.Bundle.OfflineRepo.MaterialPath) != "" || strings.TrimSpace(a.Bundle.OfflineRepo.CopyTo) != "" || len(a.Bundle.OfflineRepo.Entries) > 0 {
-		return a.Bundle.OfflineRepo
-	}
-	return a.Bundle.OfflineAPT
+	return a.Bundle.EffectiveOfflineRepo()
 }
 
 func (a *App) routeScriptPath(iface string) string {

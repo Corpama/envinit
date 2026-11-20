@@ -178,7 +178,7 @@ func TestCheckWizardParameterPageScrollsToSelectedRow(t *testing.T) {
 	model.height = 18
 	model.cursor = len(model.parameterRows()) - 1
 	view := model.View()
-	if !strings.Contains(view, "XCCL / socket interface") || strings.Contains(view, "Ping / packet count") {
+	if !strings.Contains(view, "XCCL / MPI interface") || strings.Contains(view, "Ping / packet count") {
 		t.Fatalf("parameter viewport did not follow the selected row:\n%s", view)
 	}
 }

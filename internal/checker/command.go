@@ -9,7 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,6 +21,151 @@ import (
 
 func runCommand(cfg spec.CheckConfig, target Target, remoteCommand string) (string, error) {
 	return runCommandStreamingContext(context.Background(), cfg, target, remoteCommand, nil, nil)
+}
+
+const (
+	defaultSSHConnectTimeoutSeconds = 10
+	defaultSSHKeepaliveSeconds      = 15
+	defaultSSHKeepaliveCount        = 4
+	// probeTargetTimeout bounds each host's environment-probe phase. Targets are
+	// probed concurrently, so this is a per-target wall-clock ceiling, not a
+	// shared budget: one silent host fails after this deadline while the others
+	// finish independently. Fixed by design; not bundle-configurable.
+	probeTargetTimeout = 30 * time.Second
+)
+
+// sshControlOptions adds conservative defaults for unattended execution. Without
+// them an unreachable host uses the kernel TCP timeout and a host that asks for
+// a password waits on stdin, so the run stalls with no diagnostic output.
+// Explicit bundle options always win.
+func sshControlOptions(cfg spec.CheckConfig) []string {
+	options := append([]string{}, cfg.SSH.Options...)
+	// The configured port travels as -o Port= because these options are shared
+	// with scp, whose port flag is uppercase -P. Explicit options always win.
+	if cfg.SSH.Port > 0 && !sshOptionConfigured(options, "Port") {
+		options = append(options, "-o", "Port="+strconv.Itoa(cfg.SSH.Port))
+	}
+	for _, fallback := range [][2]string{
+		{"BatchMode", "yes"},
+		{"ConnectTimeout", strconv.Itoa(defaultSSHConnectTimeoutSeconds)},
+		{"ServerAliveInterval", strconv.Itoa(defaultSSHKeepaliveSeconds)},
+		{"ServerAliveCountMax", strconv.Itoa(defaultSSHKeepaliveCount)},
+	} {
+		if sshOptionConfigured(options, fallback[0]) {
+			continue
+		}
+		options = append(options, "-o", fallback[0]+"="+fallback[1])
+	}
+	return options
+}
+
+func sshOptionConfigured(options []string, key string) bool {
+	for _, option := range options {
+		candidate := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(option), "-o"))
+		name, _, found := strings.Cut(candidate, "=")
+		if !found {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(name), key) {
+			return true
+		}
+	}
+	return false
+}
+
+// preflightTargetConnectivity reports every unusable control connection before
+// any stage starts, instead of stalling inside the first remote command. Each
+// target gets its own fixed deadline and all targets are probed concurrently,
+// so one unreachable host cannot serialize the wait behind the others. The full
+// ssh stdout/stderr is echoed as raw log so unexpected conditions (host key
+// changes, MOTD banners, permission scripts, sshd errors) are visible instead
+// of being hidden behind a short error summary.
+func preflightTargetConnectivity(ctx context.Context, cfg spec.CheckConfig, targets []Target, out io.Writer) error {
+	type probeOutcome struct {
+		index   int
+		name    string
+		address string
+		ok      bool
+		reason  string
+	}
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		outcomes []probeOutcome
+	)
+	emit := func(format string, args ...any) {
+		mu.Lock()
+		fmt.Fprintf(out, format, args...)
+		mu.Unlock()
+	}
+	for index, target := range targets {
+		if target.Local {
+			continue
+		}
+		wg.Add(1)
+		go func(index int, target Target) {
+			defer wg.Done()
+			address := targetControlAddress(target)
+			probeCtx, cancel := context.WithTimeout(ctx, probeTargetTimeout)
+			defer cancel()
+			var raw bytes.Buffer
+			rawWriter := &lineCallbackWriter{callback: func(line string) {
+				if strings.TrimSpace(line) == "" {
+					return
+				}
+				emit("PREFLIGHT %s: %s\n", target.Name, line)
+			}}
+			combined := &syncWriter{w: io.MultiWriter(&raw, rawWriter)}
+			_, err := runCommandStreamingContext(probeCtx, cfg, target, "true", combined, combined)
+			rawWriter.Flush()
+			timedOut := errors.Is(probeCtx.Err(), context.DeadlineExceeded)
+			if err == nil {
+				emit("INFO ssh preflight: %s (%s) reachable\n", target.Name, address)
+				mu.Lock()
+				outcomes = append(outcomes, probeOutcome{index: index, name: target.Name, address: address, ok: true})
+				mu.Unlock()
+				return
+			}
+			reason := strings.TrimSpace(err.Error())
+			if timedOut {
+				reason = fmt.Sprintf("no response within %s: %s", probeTargetTimeout, reason)
+			} else if ctx.Err() != nil {
+				reason = fmt.Sprintf("canceled: %s", reason)
+			}
+			if rawText := strings.TrimSpace(raw.String()); rawText != "" {
+				reason = fmt.Sprintf("%s\n    raw: %s", reason, strings.ReplaceAll(rawText, "\n", "\n    raw: "))
+			}
+			mu.Lock()
+			outcomes = append(outcomes, probeOutcome{index: index, name: target.Name, address: address, reason: reason})
+			mu.Unlock()
+		}(index, target)
+	}
+	wg.Wait()
+	sort.Slice(outcomes, func(i, j int) bool { return outcomes[i].index < outcomes[j].index })
+	var failures []string
+	for _, outcome := range outcomes {
+		if outcome.ok {
+			continue
+		}
+		failures = append(failures, fmt.Sprintf("  %s (%s): %s", outcome.name, outcome.address, outcome.reason))
+	}
+	if len(failures) == 0 {
+		return nil
+	}
+	return fmt.Errorf("ssh preflight failed for %d target(s); fix the control connection, credentials, or check.ssh options before rerunning:\n%s", len(failures), strings.Join(failures, "\n"))
+}
+
+// syncWriter serializes concurrent writes to the shared output so streamed raw
+// log lines from different targets do not interleave mid-line.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }
 
 func runCommandStreaming(cfg spec.CheckConfig, target Target, remoteCommand string, liveStdout, liveStderr io.Writer) (string, error) {
@@ -147,7 +295,7 @@ func runSCPOnce(cfg spec.CheckConfig, target Target, localPath, remotePath strin
 }
 
 func runSCPOnceContext(ctx context.Context, cfg spec.CheckConfig, target Target, localPath, remotePath string) error {
-	args := append([]string{}, cfg.SSH.Options...)
+	args := sshControlOptions(cfg)
 	destination := targetControlAddress(target)
 	if strings.TrimSpace(cfg.SSH.User) != "" {
 		destination = cfg.SSH.User + "@" + destination
@@ -171,7 +319,7 @@ func runSSHCommandOnceStreaming(cfg spec.CheckConfig, target Target, remoteComma
 }
 
 func runSSHCommandOnceStreamingContext(ctx context.Context, cfg spec.CheckConfig, target Target, remoteCommand string, liveStdout, liveStderr io.Writer) (string, error) {
-	args := append([]string{}, cfg.SSH.Options...)
+	args := sshControlOptions(cfg)
 	destination := targetControlAddress(target)
 	if strings.TrimSpace(cfg.SSH.User) != "" {
 		destination = cfg.SSH.User + "@" + destination

@@ -1,15 +1,36 @@
 package runner
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"reflect"
 	"strings"
+	"syscall"
 
 	"path/filepath"
 )
 
 func (a *App) runNetworkStage() error {
+	if !a.DryRun && !a.networkWorker && (a.Root == "" || a.Root == "/") && os.Getenv("SSH_CONNECTION") != "" && a.Bundle.ApplyNetworkImmediately() {
+		return a.runDetachedNetworkStage()
+	}
+	if err := a.beginNetworkTransaction(); err != nil {
+		return err
+	}
+	if err := a.runNetworkBackendStage(); err != nil {
+		return err
+	}
+	if err := a.cleanupRetiredNetworkObjects(); err != nil {
+		return err
+	}
+	return a.finishNetworkTransaction()
+}
+
+func (a *App) runNetworkBackendStage() error {
+	before := a.managedFileRevision
 	switch a.networkBackend() {
 	case "networkmanager":
 		return a.runNetworkManagerStage()
@@ -53,8 +74,11 @@ func (a *App) runNetworkStage() error {
 		}
 	}
 
+	if err := a.reconcileNetworkFiles(); err != nil {
+		return err
+	}
 	if a.Bundle.ApplyNetworkImmediately() && !deferApply {
-		if err := a.applyNetworkSettings(); err != nil {
+		if err := a.applyNetworkSettingsIfChanged(a.managedFileRevision != before); err != nil {
 			return err
 		}
 	}
@@ -68,6 +92,7 @@ func (a *App) runNetworkStage() error {
 }
 
 func (a *App) runNetworkManagerStage() error {
+	before := a.managedFileRevision
 	deferApply, err := a.prepareNetworkApply()
 	if err != nil {
 		return err
@@ -100,8 +125,11 @@ func (a *App) runNetworkManagerStage() error {
 			return err
 		}
 	}
+	if err := a.reconcileNetworkFiles(); err != nil {
+		return err
+	}
 	if a.Bundle.ApplyNetworkImmediately() && !deferApply {
-		if err := a.applyNetworkSettings(); err != nil {
+		if err := a.applyNetworkSettingsIfChanged(a.managedFileRevision != before); err != nil {
 			return err
 		}
 	}
@@ -115,6 +143,7 @@ func (a *App) runNetworkManagerStage() error {
 }
 
 func (a *App) runLegacyNetworkStage() error {
+	before := a.managedFileRevision
 	deferApply, err := a.prepareNetworkApply()
 	if err != nil {
 		return err
@@ -141,8 +170,11 @@ func (a *App) runLegacyNetworkStage() error {
 			}
 		}
 	}
+	if err := a.reconcileNetworkFiles(); err != nil {
+		return err
+	}
 	if a.Bundle.ApplyNetworkImmediately() && !deferApply {
-		if err := a.applyNetworkSettings(); err != nil {
+		if err := a.applyNetworkSettingsIfChanged(a.managedFileRevision != before); err != nil {
 			return err
 		}
 	}
@@ -164,38 +196,106 @@ func (a *App) ensureNetplanRouteDispatcher() error {
 		return nil
 	}
 	if _, err := a.captureCmd("", nil, "dpkg", "-s", "networkd-dispatcher"); err != nil {
-		if err := a.runCmd("", nil, "apt-get", "update"); err != nil {
+		if err := a.runCmd("", aptNonInteractiveEnv(nil), "apt-get", "update"); err != nil {
 			return err
 		}
-		if err := a.runCmd("", nil, "apt-get", "install", "-y", "networkd-dispatcher"); err != nil {
+		if err := a.runCmd("", aptNonInteractiveEnv(nil), "apt-get", "install", "-y", "networkd-dispatcher"); err != nil {
 			return err
 		}
 	} else {
 		a.logf("networkd-dispatcher is already installed")
 	}
+	enabled := false
+	active := false
+	if _, err := a.captureCmd("", nil, "systemctl", "is-enabled", "--quiet", "networkd-dispatcher"); err == nil {
+		enabled = true
+	}
+	if _, err := a.captureCmd("", nil, "systemctl", "is-active", "--quiet", "networkd-dispatcher"); err == nil {
+		active = true
+	}
+	if enabled && active {
+		a.logf("networkd-dispatcher already enabled and active")
+		return nil
+	}
 	return a.runCmd("", nil, "systemctl", "enable", "--now", "networkd-dispatcher")
 }
 
 func (a *App) prepareNetworkApply() (bool, error) {
-	missing := a.missingPlannedInterfaces()
-	if len(missing) == 0 {
-		return false, nil
-	}
+	// Existing names do not prove the intended physical mapping. Review before
+	// writing network configuration, including when the user wants to swap NICs.
 	bindings, err := a.confirmedNICBindings()
 	if err != nil {
 		return false, err
 	}
+	if tx := a.networkTransaction; tx != nil {
+		next := a.desiredNetworkTopology(bindings)
+		for _, link := range append(append([]ownedNetworkLink(nil), tx.Old.Topology.Links...), next.Links...) {
+			if !validTopologyLink(link) {
+				return false, fmt.Errorf("invalid network topology link %+v", link)
+			}
+		}
+		if tx.Phase != "prepared" && !reflect.DeepEqual(tx.Topology, next) {
+			return false, fmt.Errorf("physical binding changed during unfinished network transaction; resume the recorded binding")
+		}
+		tx.Topology = next
+		for _, link := range next.Links {
+			old, exists := topologyLink(tx.Old.Topology, link.Name)
+			if !exists {
+				a.logf("network plan: add %s mac=%s address=%s master=%s bond=%t", link.Name, link.MAC, link.Address, link.Master, link.Bond)
+			} else if !reflect.DeepEqual(old, link) {
+				a.logf("network plan: change %s mac=%s->%s address=%s->%s gateway=%s->%s master=%s->%s", link.Name, old.MAC, link.MAC, old.Address, link.Address, old.Gateway, link.Gateway, old.Master, link.Master)
+			}
+		}
+		for _, link := range tx.Old.Topology.Links {
+			if _, exists := topologyLink(next, link.Name); !exists {
+				a.logf("network plan: retire %s mac=%s address=%s master=%s bond=%t", link.Name, link.MAC, link.Address, link.Master, link.Bond)
+			}
+		}
+		for _, link := range tx.Old.Topology.Links {
+			current, ok := topologyLink(next, link.Name)
+			if link.Role == "rdma" && (!ok || link.MAC != current.MAC) {
+				a.logf("RDMA physical topology changed: %s; include mlxconfig,sysctl,post for hardware tuning reconciliation", link.Name)
+			}
+		}
+		if err := a.preflightNetworkFiles(bindings); err != nil {
+			return false, err
+		}
+		a.logf("network reconciliation: backend=%s, previous links=%d, desired links=%d, phase=%s", next.Backend, len(tx.Old.Topology.Links), len(next.Links), tx.Phase)
+		if err := a.saveNetworkTransaction(); err != nil {
+			return false, err
+		}
+		if tx.Phase == "prepared" {
+			if err := a.preflightNetworkTopology(next); err != nil {
+				return false, err
+			}
+			if err := a.suspendOwnedRouteReplay(); err != nil {
+				return false, err
+			}
+			if err := a.retireNetworkTopology(next); err != nil {
+				return false, err
+			}
+			if a.Bundle.ApplyNetworkImmediately() {
+				tx.Phase = "retired"
+			}
+			if err := a.saveNetworkTransaction(); err != nil {
+				return false, err
+			}
+		}
+		if a.Bundle.ApplyNetworkImmediately() && !a.DryRun {
+			if err := atomicWriteFile(a.targetPath("/run/envinit-network-changing"), []byte("network apply\n"), 0o600); err != nil {
+				return false, err
+			}
+		}
+	}
 	temporaryBindings := bindings
 	if !a.Bundle.ApplyNetworkImmediately() {
-		temporaryBindings = make([]interfaceBinding, 0, len(bindings))
-		for _, binding := range bindings {
-			if binding.Kind == "mgmt" {
-				if strings.TrimSpace(binding.CurrentName) != "" && strings.TrimSpace(binding.CurrentName) != strings.TrimSpace(binding.Name) {
-					a.logf("defer management interface rename %s -> %s until reboot because apply_network_immediately=false", binding.CurrentName, binding.Name)
-				}
-				continue
-			}
-			temporaryBindings = append(temporaryBindings, binding)
+		a.logf("defer all live interface changes because apply_network_immediately=false")
+		temporaryBindings = nil
+	} else if a.networkTransaction != nil {
+		var err error
+		temporaryBindings, err = a.withRetiredInterfaceNames(bindings)
+		if err != nil {
+			return false, err
 		}
 	}
 	if err := a.renameInterfacesTemporarily(temporaryBindings); err != nil {
@@ -235,34 +335,69 @@ func (a *App) applyDeferredNetworkSettings() error {
 func (a *App) applyNetworkSettings() error {
 	switch a.networkBackend() {
 	case "networkmanager":
-		if err := a.runCmd("", nil, "nmcli", "connection", "reload"); err != nil {
+		if err := a.runNetworkActivation("backend-reload", "networkmanager", "nmcli", "connection", "reload"); err != nil {
 			return err
 		}
 		for _, iface := range a.networkManagerApplyInterfaces() {
-			if err := a.runCmdAllowFailure("", nil, "nmcli", "connection", "up", iface); err != nil {
+			if err := a.runNetworkActivation("backend-up", iface, "nmcli", "connection", "up", "uuid", networkProfileUUID(iface)); err != nil {
 				return err
+			}
+		}
+		if a.configureManagementNetwork() && len(a.Machine.MgmtIfaces) > 1 {
+			for _, iface := range a.Machine.MgmtIfaces {
+				if err := a.runNetworkActivation("backend-up", iface, "nmcli", "connection", "up", "uuid", networkProfileUUID(iface)); err != nil {
+					return err
+				}
 			}
 		}
 	case "network":
 		for _, iface := range a.legacyNetworkApplyInterfaces() {
-			if err := a.runCmdAllowFailure("", nil, "ifup", iface); err != nil {
+			if err := a.runNetworkActivation("ifup", iface, "ifup", iface); err != nil {
 				return err
 			}
 		}
 	default:
-		if err := a.runCmd("", nil, "netplan", "generate"); err != nil {
+		if err := a.runNetworkActivation("backend-generate", "netplan", "netplan", "generate"); err != nil {
 			return err
 		}
-		if err := a.runCmd("", nil, "netplan", "apply"); err != nil {
+		if err := a.runNetworkActivation("backend-apply", "netplan", "netplan", "apply"); err != nil {
 			return err
 		}
 	}
 	if a.Bundle.RDMAConfigureIPRoute() {
 		for _, item := range a.Machine.RDMA {
 			routePath := a.routeScriptPath(item.Name)
-			if err := a.runCmd("", nil, "bash", routePath); err != nil {
+			if err := a.runNetworkActivationEnv("route-replay", item.Name, map[string]string{"ENVINIT_NETWORK_REPLAY": "1"}, "bash", routePath); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func (a *App) applyNetworkSettingsIfChanged(changed bool) error {
+	if a.networkTransaction != nil && !a.DryRun {
+		if err := a.verifyNetworkTopology(a.networkTransaction.Topology); err != nil {
+			a.logf("network runtime requires reconciliation: %v", err)
+			changed = true
+		}
+		if !reflect.DeepEqual(a.networkTransaction.Old.Topology, a.networkTransaction.Topology) {
+			changed = true
+		}
+		if a.networkTransaction.Next != nil && !reflect.DeepEqual(a.networkTransaction.Old.Files, a.networkTransaction.Next.Files) {
+			changed = true
+		}
+	}
+	if changed {
+		return a.applyNetworkSettings()
+	}
+	a.logf("network files already satisfied; skip backend reload")
+	if !a.Bundle.RDMAConfigureIPRoute() {
+		return nil
+	}
+	for _, item := range a.Machine.RDMA {
+		if err := a.runNetworkActivationEnv("route-replay", item.Name, map[string]string{"ENVINIT_NETWORK_REPLAY": "1"}, "bash", a.routeScriptPath(item.Name)); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -280,8 +415,23 @@ func (a *App) enableRoCEAdaptiveRouting() {
 			a.logf("skip RoCE adaptive routing on %s: %v", item.Name, err)
 			continue
 		}
+		current, err := a.captureCmd("", nil, "mlxreg", "-d", busInfo, "--reg_name", "ROCE_ACCL", "--get")
+		if err == nil && mlxregFieldEquals(current, "adaptive_routing_forced_en", "0x1") {
+			a.logf("RoCE adaptive routing already satisfied on %s", item.Name)
+			continue
+		}
 		_ = a.runCmdAllowFailure("", nil, "mlxreg", "-d", busInfo, "--reg_name", "ROCE_ACCL", "--set", "adaptive_routing_forced_en=0x1", "--yes")
 	}
+}
+
+func mlxregFieldEquals(output, key, want string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && strings.TrimSuffix(fields[0], ":") == key && fields[len(fields)-1] == want {
+			return true
+		}
+	}
+	return false
 }
 
 func parseEthtoolBusInfo(output string) (string, error) {
@@ -308,6 +458,7 @@ func (a *App) runUdevStage() error {
 }
 
 func (a *App) persistUdevRules() error {
+	before := a.managedFileRevision
 	if !a.hasPersistentNICNamingTargets() && !a.interfaceBindingsConfirmed {
 		a.logf("skip udev persistent naming: no management or RDMA NIC targets are configured")
 		return nil
@@ -322,11 +473,16 @@ func (a *App) persistUdevRules() error {
 			return err
 		}
 	}
-	if a.Bundle.RDMAExists() {
+	if a.Bundle.RDMAExists() || (a.networkTransaction != nil && a.networkTransaction.Old.Files[rdmaUdevFile] != "") {
 		content := renderUdevRulesForKind(bindings, "rdma")
 		if err := a.writeManagedFile(rdmaUdevFile, content, 0o644); err != nil {
 			return err
 		}
+	}
+	if a.managedFileRevision == before {
+		a.logf("udev rules already satisfied; skip reload")
+		a.udevRulesPersisted = true
+		return nil
 	}
 	if err := a.runCmd("", nil, "udevadm", "control", "--reload-rules"); err != nil {
 		return err
@@ -344,16 +500,41 @@ func (a *App) confirmedNICBindings() ([]interfaceBinding, error) {
 		}
 		return bindings, nil
 	}
+	fingerprint, err := a.applyConfigurationFingerprint()
+	if err != nil {
+		return nil, err
+	}
+	if err := a.restoreBindingState(fingerprint); err != nil {
+		return nil, err
+	}
 	bindings, err := a.interfaceBindings()
 	if err != nil {
 		return nil, err
 	}
-	bindings, err = a.confirmInterfaceBindings(bindings)
-	if err != nil {
-		return nil, err
+	baseBindings := cloneInterfaceBindings(bindings)
+	for {
+		signalCtx, stopProbe := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		ctx, cancelTimeout := context.WithTimeout(signalCtx, probeCommandTimeout)
+		bindings, err = a.probeNICBindings(ctx, cloneInterfaceBindings(baseBindings))
+		cancelTimeout()
+		stopProbe()
+		if err != nil {
+			return nil, err
+		}
+		bindings, err = a.confirmInterfaceBindings(bindings)
+		if errors.Is(err, errRetryNICProbe) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		break
 	}
 	if err := validateReviewBindings(bindings); err != nil {
 		return nil, incompleteNICBindingError(err)
+	}
+	if err := a.saveBindingState(fingerprint, bindings); err != nil {
+		return nil, err
 	}
 	a.confirmedInterfaceBindings = cloneInterfaceBindings(bindings)
 	a.interfaceBindingsConfirmed = true
@@ -455,17 +636,14 @@ func (a *App) persistSelectedRDMAInterfaces(bindings []interfaceBinding) error {
 	if strings.TrimSpace(content) == "" {
 		return nil
 	}
-	if a.DryRun {
-		a.logf("dry-run: would write %s with confirmed RDMA interface bindings", rdmaSelectedFile)
-		return nil
-	}
+	before := a.managedFileRevision
 	if err := a.writeManagedFile(rdmaSelectedFile, content, 0o644); err != nil {
 		return err
 	}
 	if err := a.ensureLegacyRDMASelectedLink(); err != nil {
 		return err
 	}
-	if a.pathExists("/lib/systemd/system/rdma.service") || a.pathExists("/etc/systemd/system/rdma.service") || a.pathExists("/etc/init.d/rdma") {
+	if a.managedFileRevision != before && (a.pathExists("/lib/systemd/system/rdma.service") || a.pathExists("/etc/systemd/system/rdma.service") || a.pathExists("/etc/init.d/rdma")) {
 		_ = a.runCmdAllowFailure("", nil, "systemctl", "restart", "rdma.service")
 	}
 	return nil
@@ -485,6 +663,7 @@ func (a *App) ensureLegacyRDMASelectedLink() error {
 
 	a.logf("link %s -> %s for RDMA service compatibility", legacyRDMASelectedFile, rdmaSelectedFile)
 	if a.DryRun {
+		a.managedFileRevision++
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
@@ -500,6 +679,7 @@ func (a *App) ensureLegacyRDMASelectedLink() error {
 	if err := os.Symlink(relativeTarget, legacy); err != nil {
 		return fmt.Errorf("link %s to %s: %w", legacyRDMASelectedFile, rdmaSelectedFile, err)
 	}
+	a.managedFileRevision++
 	return nil
 }
 

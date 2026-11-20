@@ -425,8 +425,14 @@ func ibWriteBWArgsForMode(cfg spec.CheckBandwidthConfig, group spec.CheckRDMAGro
 	}
 	args = append(args, "-d", group.IBDevice)
 	if mode == BandwidthModeVerbs {
-		args = append(args, "-i", "1")
-		if cfg.GIDIndex >= 0 {
+		portNumber := group.IBPort
+		if portNumber == 0 {
+			portNumber = 1
+		}
+		args = append(args, "-i", strconv.Itoa(portNumber))
+		if cfg.GIDIndexAuto && group.GIDIndex != nil {
+			args = append(args, "-x", strconv.Itoa(*group.GIDIndex))
+		} else if cfg.GIDIndex >= 0 && !cfg.GIDIndexAuto {
 			args = append(args, "-x", strconv.Itoa(cfg.GIDIndex))
 		}
 	}
@@ -436,9 +442,7 @@ func ibWriteBWArgsForMode(cfg spec.CheckBandwidthConfig, group spec.CheckRDMAGro
 	if cfg.MessageSize > 0 {
 		args = append(args, "-s", strconv.Itoa(cfg.MessageSize))
 	}
-	if cfg.ReportGBits {
-		args = append(args, "--report_gbits")
-	}
+	args = append(args, "--report_gbits")
 	if strings.TrimSpace(cfg.MmapDevice) != "" {
 		args = append(args, "--mmap="+cfg.MmapDevice)
 	}

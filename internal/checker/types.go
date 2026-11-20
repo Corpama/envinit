@@ -109,17 +109,24 @@ type DiscoverOptions struct {
 }
 
 type Target struct {
-	Input              string
-	Name               string
-	ExpectedHostname   string
-	DiscoveredHostname string
-	InventoryIdentity  string
-	InventoryMatched   bool
-	ExplicitIdentity   bool
-	ControlAddress     string
-	Address            string
-	RDMA               []spec.RDMARecord
-	Local              bool
+	Input                 string
+	Name                  string
+	ExpectedHostname      string
+	DiscoveredHostname    string
+	InventoryIdentity     string
+	InventoryMatched      bool
+	LegacySchema          bool
+	ExplicitIdentity      bool
+	ControlAddress        string
+	Address               string
+	Management            []discoveredIPv4Address
+	ManagementMAC         string
+	ManagementIface       string
+	DeleteUnmatchedRDMA   bool
+	PreserveUnmatchedRDMA bool
+	PlannedRDMA           []spec.RDMARecord
+	RDMA                  []spec.RDMARecord
+	Local                 bool
 }
 
 type Result struct {
@@ -194,6 +201,7 @@ type rdmaPingItem struct {
 	SourceIP         string
 	DestinationName  string
 	DestinationIP    string
+	PayloadSize      int
 }
 
 type rdmaPingResultRow struct {
@@ -253,6 +261,7 @@ type xcclTargetPlan struct {
 	RDMARailOrder   []string
 	Mapping         []string
 	SocketInterface string
+	MPIInterfaceIP  string
 }
 
 type xcclPerformanceRow struct {

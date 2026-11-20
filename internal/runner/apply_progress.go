@@ -51,6 +51,18 @@ func (a *App) runStagesWithProgress() error {
 	}
 
 	for _, stage := range stageOrder {
+		if completed[stage] && (stage == "network" || stage == "sysctl" || stage == "mlxconfig" || stage == "kernel") && a.runStageOverride == nil {
+			// A checkpoint proves a previous execution, not current kernel state.
+			// Reconcile network on resume; later stages retain their own checks.
+			completed[stage] = false
+			a.logf("resume: revalidate %s runtime despite completed checkpoint", stage)
+		}
+		if completed[stage] && stage == "post" && a.runStageOverride == nil && a.Bundle.RDMAExists() {
+			// Recheck hardware tuning without replaying custom tasks or power actions.
+			if err := a.ensurePostBootService(); err != nil {
+				return fmt.Errorf("resume post-boot tuning verification: %w", err)
+			}
+		}
 		if completed[stage] {
 			a.logf("resume: skip completed stage %s", stage)
 			continue

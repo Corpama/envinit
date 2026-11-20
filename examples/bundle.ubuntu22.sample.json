@@ -1,12 +1,35 @@
 {
+  "apply_timeouts": {
+    "default_seconds": 360,
+    "stages": {
+      "software": 360,
+      "ofed": 0,
+      "network": 360,
+      "xre": 0,
+      "xdr": 0,
+      "firmware": 0,
+      "container": 360,
+      "mlxconfig": 360,
+      "sysctl": 360,
+      "kernel": 360,
+      "post": 0,
+      "udev": 360
+    }
+  },
   "defaults": {
+    "backup_existing_netplan": true,
+    "backup_existing_network": false,
+    "disable_existing_apt_sources": false,
+    "disable_existing_repos": false,
     "backup_root": "/var/lib/envinit/backups",
+    "rdma_gateway_probe": {
+      "enabled": true,
+      "attempts": 3,
+      "timeout_seconds": 3,
+      "link_wait_seconds": 5
+    },
     "configure_management_network": true,
     "apply_network_immediately": false,
-    "mgmt_bond_name": "bond0",
-    "mgmt_interfaces": [],
-    "mgmt_prefix": 26,
-    "mgmt_gateway": "10.101.9.1",
     "mgmt_nameservers": [],
     "mgmt_mtu": 1500,
     "bond_mode": "802.3ad",
@@ -14,27 +37,16 @@
     "bond_transmit_hash_policy": "layer3+4",
     "bond_mii_monitor_interval": 100,
     "bond_primary": "",
-    "rdma_prefix": 24,
     "rdma_mtu": 9000,
-    "rdma_route_cidr": "",
     "rdma_mode": "full",
-    "route_priority": 32761,
-    "rdma_interfaces": []
+    "route_priority": 32761
   },
   "platform": {
     "os_family": "ubuntu",
     "package_manager": "apt",
-    "network_backend": "netplan",
-    "kernel_headers_package": "",
-    "kernel_headers_dir": ""
+    "network_backend": "netplan"
   },
-  "platform_options": {
-    "ubuntu": {
-      "backup_existing_netplan": true,
-      "disable_existing_apt_sources": false
-    }
-  },
-  "offline_apt": {
+  "offline_repo": {
     "enabled": true,
     "material_path": "data/apt-repo",
     "copy_to": "/opt/kunlun-apt-repo",
@@ -42,7 +54,6 @@
     "entries": []
   },
   "packages": [
-    "linux-headers-{{uname_r}}",
     "gcc",
     "make",
     "bzip2",
@@ -74,7 +85,7 @@
   "check": {
     "bandwidth": {
       "duration": 0,
-      "gid_index": 0,
+      "gid_index": "auto",
       "iterations": 100,
       "bandwidth_qps": 0,
       "message_size": 0,
@@ -86,11 +97,12 @@
     },
     "rdma_ping": {
       "count": 3,
-      "payload_size": 8972,
+      "payload_size": "auto",
       "timeout": 2
     },
     "ssh": {
       "user": "root",
+      "port": 22,
       "options": []
     },
     "xccl": {
@@ -118,6 +130,7 @@
       "validate_topology": true,
       "supernode": false,
       "socket_interface": "",
+      "mpi_interface": "",
       "min_bus_bandwidth_gbs": 0,
       "environment": {
         "BKCL_USE_AR": "1",
@@ -136,13 +149,13 @@
         "BKCL_FLAT_RING": "1",
         "BKCL_USE_RDMA": "1",
         "BKCL_FORCE_L3_RDMA": "0",
-        "BCCL_TRACE_HANG_ENABLE": "1",
-        "BCCL_UNIX_SOCKET_PATH": "/var/bccl/sockets",
-        "BCCL_ERROR_FILE": "/var/bccl/logs/err.%h.%p.log"
+        "BCCL_TRACE_HANG_ENABLE": "1"
       }
     }
   },
-  "post_packages": [],
+  "post_packages": [
+    "data/single_deb/rdma-userspace-config-bbc_1.0.3.1_all.deb"
+  ],
   "post_tasks": [],
   "post_power_action": {
     "action": "soft",

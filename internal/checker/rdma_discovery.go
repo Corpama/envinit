@@ -2,8 +2,10 @@ package checker
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -43,6 +45,11 @@ func DiscoverNetwork(opts DiscoverOptions) error {
 		return fmt.Errorf("discover requires at least one host")
 	}
 	targets = markLocalTargets(targets)
+	if opts.CommandRunner == nil {
+		if err := preflightTargetConnectivity(context.Background(), opts.Bundle.Check, targets, opts.Output); err != nil {
+			return err
+		}
+	}
 	targets, err = bindDiscoveryTargetIdentities(opts, targets)
 	if err != nil {
 		return err
@@ -53,19 +60,38 @@ func DiscoverNetwork(opts DiscoverOptions) error {
 
 func bindDiscoveryTargetIdentities(opts DiscoverOptions, targets []Target) ([]Target, error) {
 	bound := append([]Target(nil), targets...)
-	for idx := range bound {
-		target := bound[idx]
-		if target.InventoryMatched && !target.ExplicitIdentity {
-			continue
+
+	// Probe every target's hostname concurrently with a per-target deadline so a
+	// single unresponsive host cannot serialize or stall identity binding. The
+	// binding decisions below stay sequential and ordered for deterministic
+	// inventory matching and log output.
+	targetNeedsHostname := func(t Target) bool {
+		return !(t.InventoryMatched && !t.ExplicitIdentity)
+	}
+	hostnames, probeErr := probeTargetsConcurrently(context.Background(), bound, func(ctx context.Context, target Target) (string, error) {
+		if !targetNeedsHostname(target) {
+			return "", nil
 		}
-		output, err := runNetworkDiscoveryCommand(opts, target, "hostnamectl --static 2>/dev/null || hostname")
+		output, err := runNetworkDiscoveryCommandContext(ctx, opts, target, "hostnamectl --static 2>/dev/null || hostname")
 		if err != nil {
-			return nil, fmt.Errorf("discover hostname through %s: %w", targetControlAddress(target), err)
+			return "", fmt.Errorf("discover hostname through %s: %w", targetControlAddress(target), err)
 		}
 		hostname := firstNonEmptyLine(output)
 		if hostname == "" {
-			return nil, fmt.Errorf("discover hostname through %s: remote command returned an empty hostname", targetControlAddress(target))
+			return "", fmt.Errorf("discover hostname through %s: remote command returned an empty hostname", targetControlAddress(target))
 		}
+		return hostname, nil
+	})
+	if probeErr != nil {
+		return nil, probeErr
+	}
+
+	for idx := range bound {
+		target := bound[idx]
+		if !targetNeedsHostname(target) {
+			continue
+		}
+		hostname := hostnames[idx]
 		target.DiscoveredHostname = hostname
 
 		if target.ExplicitIdentity {
@@ -170,32 +196,57 @@ func autoDiscoverNetworkTargets(opts DiscoverOptions, targets []Target) ([]Targe
 	copy(updated, targets)
 	mgmtDiscovered := map[string][]discoveredIPv4Address{}
 	discovered := map[string][]discoveredRDMAInterface{}
-	for idx := range updated {
-		mgmtItems, err := discoverTargetManagementInterfaces(opts, updated[idx])
+
+	type targetProbe struct {
+		mgmt     []discoveredIPv4Address
+		items    []discoveredRDMAInterface
+		decision nicdetect.Decision
+	}
+	probes, probeErr := probeTargetsConcurrently(context.Background(), updated, func(ctx context.Context, target Target) (targetProbe, error) {
+		mgmtItems, err := discoverTargetManagementInterfaces(ctx, opts, target)
 		if err != nil {
-			return nil, err
+			return targetProbe{}, err
 		}
-		items, err := discoverTargetRDMAInterfaces(opts, updated[idx])
+		items, err := discoverTargetRDMAInterfaces(ctx, opts, target)
 		if err != nil {
-			return nil, err
+			return targetProbe{}, err
 		}
 		if len(items) == 0 {
-			return nil, fmt.Errorf("discover found no IPv4 show_gids RDMA entries for %s", updated[idx].Name)
+			return targetProbe{}, fmt.Errorf("discover found no IPv4 show_gids RDMA entries for %s", target.Name)
 		}
-		facts, err := discoverTargetNICFacts(opts, updated[idx], mgmtItems, items)
+		facts, err := discoverTargetNICFacts(ctx, opts, target, mgmtItems, items)
 		if err != nil {
-			return nil, err
+			return targetProbe{}, err
 		}
-		decision := recommendDiscoveredNetwork(updated[idx], facts)
+		decision := recommendDiscoveredNetwork(target, facts)
 		mgmtItems, items = enrichDiscoveryCandidates(mgmtItems, items, facts, decision)
-		mgmtDiscovered[updated[idx].Name] = mgmtItems
-		discovered[updated[idx].Name] = items
-		applyDiscoveryDecision(&updated[idx], decision)
-		fmt.Fprintf(opts.Output, "INFO discover network %s: confidence=%s, %s\n", updated[idx].Name, decision.Confidence, strings.Join(decision.Reasons, "; "))
+		return targetProbe{mgmt: mgmtItems, items: items, decision: decision}, nil
+	})
+	if probeErr != nil {
+		return nil, probeErr
+	}
+
+	for idx := range updated {
+		probe := probes[idx]
+		updated[idx].PlannedRDMA = append([]spec.RDMARecord(nil), updated[idx].RDMA...)
+		mgmtDiscovered[updated[idx].Name] = probe.mgmt
+		discovered[updated[idx].Name] = probe.items
+		applyDiscoveryDecision(&updated[idx], probe.decision)
+		if len(probe.mgmt) > 0 && updated[idx].ManagementIface == "" {
+			for _, candidate := range probe.mgmt {
+				if candidate.IP == updated[idx].Address {
+					updated[idx].ManagementIface = candidate.Iface
+					updated[idx].ManagementMAC = candidate.MAC
+					break
+				}
+			}
+		}
+		updated[idx].Management = append([]discoveredIPv4Address(nil), probe.mgmt...)
+		fmt.Fprintf(opts.Output, "INFO discover network %s: confidence=%s, %s\n", updated[idx].Name, probe.decision.Confidence, strings.Join(probe.decision.Reasons, "; "))
 		fmt.Fprintf(opts.Output, "INFO discover management %s: mgmt_ip=%s\n", updated[idx].Name, updated[idx].Address)
-		fmt.Fprintf(opts.Output, "INFO discover RDMA %s: %s\n", updated[idx].Name, describeDiscoveredRDMARecords(updated[idx].RDMA, items))
-		if !opts.Confirm && !acceptableAutomaticDecision(decision) {
-			return nil, fmt.Errorf("discover network classification for %s is %s (%s); --yes cannot accept an uncertain mapping, rerun interactively and select the management/RDMA bindings", updated[idx].Name, decision.Confidence, strings.Join(decision.Reasons, "; "))
+		fmt.Fprintf(opts.Output, "INFO discover RDMA %s: %s\n", updated[idx].Name, describeDiscoveredRDMARecords(updated[idx].RDMA, probe.items))
+		if !opts.Confirm && !acceptableAutomaticDecision(probe.decision) {
+			return nil, fmt.Errorf("discover network classification for %s is %s (%s); --yes cannot accept an uncertain mapping, rerun interactively and select the management/RDMA bindings", updated[idx].Name, probe.decision.Confidence, strings.Join(probe.decision.Reasons, "; "))
 		}
 	}
 	if opts.Confirm {
@@ -205,6 +256,7 @@ func autoDiscoverNetworkTargets(opts DiscoverOptions, targets []Target) ([]Targe
 		}
 		updated = reviewed
 	}
+	printDiscoverGatewayReminders(opts.Output, updated)
 	if opts.DryRun {
 		if strings.TrimSpace(opts.InventoryPath) != "" {
 			before, after, err := plannedInventoryRDMASlotChange(opts.InventoryPath, updated)
@@ -251,13 +303,13 @@ func plannedInventoryRDMASlotChange(path string, targets []Target) (int, int, er
 	return before, after, nil
 }
 
-func discoverTargetManagementInterfaces(opts DiscoverOptions, target Target) ([]discoveredIPv4Address, error) {
+func discoverTargetManagementInterfaces(ctx context.Context, opts DiscoverOptions, target Target) ([]discoveredIPv4Address, error) {
 	command := strings.Join([]string{
 		"ip -o -4 route show default 2>/dev/null || true",
 		"printf '\\n--ADDR--\\n'",
 		"ip -o -4 addr show scope global 2>/dev/null || true",
 	}, "; ")
-	output, err := runNetworkDiscoveryCommand(opts, target, command)
+	output, err := runNetworkDiscoveryCommandContext(ctx, opts, target, command)
 	if err != nil {
 		return nil, fmt.Errorf("discover management IP for %s: %w", target.Name, err)
 	}
@@ -397,8 +449,8 @@ func usableDiscoveredIPv4(value string) bool {
 		!v4.Equal(net.IPv4bcast)
 }
 
-func discoverTargetRDMAInterfaces(opts DiscoverOptions, target Target) ([]discoveredRDMAInterface, error) {
-	output, err := runNetworkDiscoveryCommand(opts, target, "show_gids")
+func discoverTargetRDMAInterfaces(ctx context.Context, opts DiscoverOptions, target Target) ([]discoveredRDMAInterface, error) {
+	output, err := runNetworkDiscoveryCommandContext(ctx, opts, target, "show_gids")
 	if err != nil {
 		return nil, fmt.Errorf("run show_gids on %s: %w", target.Name, err)
 	}
@@ -406,14 +458,18 @@ func discoverTargetRDMAInterfaces(opts DiscoverOptions, target Target) ([]discov
 }
 
 func runNetworkDiscoveryCommand(opts DiscoverOptions, target Target, command string) (string, error) {
+	return runNetworkDiscoveryCommandContext(context.Background(), opts, target, command)
+}
+
+func runNetworkDiscoveryCommandContext(ctx context.Context, opts DiscoverOptions, target Target, command string) (string, error) {
 	if opts.CommandRunner != nil {
 		return opts.CommandRunner(opts.Bundle.Check, target, command)
 	}
-	return runCommand(opts.Bundle.Check, target, command)
+	return runCommandStreamingContext(ctx, opts.Bundle.Check, target, command, nil, nil)
 }
 
-func discoverTargetNICFacts(opts DiscoverOptions, target Target, mgmt []discoveredIPv4Address, rdma []discoveredRDMAInterface) ([]nicdetect.Facts, error) {
-	output, err := runNetworkDiscoveryCommand(opts, target, nicFactDiscoveryCommand())
+func discoverTargetNICFacts(ctx context.Context, opts DiscoverOptions, target Target, mgmt []discoveredIPv4Address, rdma []discoveredRDMAInterface) ([]nicdetect.Facts, error) {
+	output, err := runNetworkDiscoveryCommandContext(ctx, opts, target, nicFactDiscoveryCommand())
 	if err != nil {
 		return nil, fmt.Errorf("discover NIC hardware facts for %s: %w", target.Name, err)
 	}
@@ -567,6 +623,8 @@ func acceptableAutomaticDecision(decision nicdetect.Decision) bool {
 
 func applyDiscoveryDecision(target *Target, decision nicdetect.Decision) {
 	if len(decision.Management) == 1 {
+		target.ManagementIface = decision.Management[0].NIC.Name
+		target.ManagementMAC = decision.Management[0].NIC.MAC
 		if address, ok := preferredFactAddress(decision.Management[0].NIC); ok {
 			target.Address = address.IP
 		}
@@ -580,10 +638,34 @@ func applyDiscoveryDecision(target *Target, decision nicdetect.Decision) {
 		if !ok {
 			continue
 		}
-		records = append(records, spec.RDMARecord{Name: binding.NIC.Name, MAC: binding.NIC.MAC, IP: address.IP, Prefix: strconv.Itoa(address.Prefix)})
+		record := spec.RDMARecord{Name: binding.NIC.Name, MAC: binding.NIC.MAC, IP: address.IP, Prefix: strconv.Itoa(address.Prefix)}
+		if slot := binding.Slot; slot >= 0 && slot < len(target.RDMA) {
+			planned := target.RDMA[slot]
+			record.Prefix = firstNonEmpty(planned.Prefix, record.Prefix)
+			record.Gateway = planned.Gateway
+			record.Table = planned.Table
+			record.RouteCIDR = planned.RouteCIDR
+			record.RailID = planned.RailID
+			target.RDMA[slot] = record
+			continue
+		}
+		records = append(records, record)
 	}
-	if len(records) == len(decision.RDMA) {
-		target.RDMA = records
+	if len(records) > 0 {
+		target.RDMA = append(target.RDMA, records...)
+	}
+}
+
+func printDiscoverGatewayReminders(output io.Writer, targets []Target) {
+	fmt.Fprintln(output, "WARN discover does not verify per-interface gateways; check each rdmaN_gateway against the confirmed slot/IP before applying network configuration")
+	for _, target := range targets {
+		for idx, item := range target.RDMA {
+			gateway := strings.TrimSpace(item.Gateway)
+			if gateway == "" {
+				gateway = "(not set in inventory)"
+			}
+			fmt.Fprintf(output, "WARN discover gateway %s rdma%d iface=%s ip=%s inventory_gateway=%s\n", target.Name, idx+1, item.Name, item.IP, gateway)
+		}
 	}
 }
 
@@ -774,6 +856,9 @@ func confirmDiscoveredNetwork(opts DiscoverOptions, targets []Target, mgmt map[s
 }
 
 func updateDelimitedInventoryRDMA(path string, targets []Target) error {
+	for idx := range targets {
+		targets[idx].DeleteUnmatchedRDMA = true
+	}
 	_, _, err := updateDelimitedInventoryRDMAWithChange(path, targets)
 	return err
 }
@@ -1001,10 +1086,17 @@ func writeTargetInventoryFields(row []string, headerIndex map[string]int, target
 	if parsed := net.ParseIP(managementIP); parsed != nil && parsed.To4() != nil {
 		row[headerIndex["mgmt_ip"]] = managementIP
 	}
-	for key, column := range headerIndex {
-		slot, ok := inventoryRDMASlot(key)
-		if ok && slot > len(target.RDMA) && column < len(row) {
-			row[column] = ""
+	if !target.ExplicitIdentity {
+		setFirstExistingInventoryField(row, headerIndex, []string{"hostname", "node", "machine"}, firstNonEmpty(target.DiscoveredHostname, target.ExpectedHostname, target.Name))
+	}
+	setFirstExistingInventoryField(row, headerIndex, []string{"mgmt_iface1", "mgmt_port1"}, target.ManagementIface)
+	setFirstExistingInventoryField(row, headerIndex, []string{"mgmt_mac1", "mgmt_port1_mac"}, target.ManagementMAC)
+	if target.DeleteUnmatchedRDMA || !target.PreserveUnmatchedRDMA {
+		for key, column := range headerIndex {
+			slot, ok := inventoryRDMASlot(key)
+			if ok && slot > len(target.RDMA) && column < len(row) {
+				row[column] = ""
+			}
 		}
 	}
 	for idx, item := range target.RDMA {

@@ -1,6 +1,7 @@
 package checker
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sort"
@@ -41,13 +42,7 @@ func targetCounterInterfaces(bundle spec.Bundle, target Target) []string {
 	interfaces := make([]string, 0, maxItems)
 	seen := map[string]bool{}
 	for idx := 0; idx < maxItems; idx++ {
-		name := ""
-		if idx < len(target.RDMA) {
-			name = strings.TrimSpace(target.RDMA[idx].Name)
-		}
-		if name == "" && idx < len(bundle.Defaults.RDMAInterfaces) {
-			name = strings.TrimSpace(bundle.Defaults.RDMAInterfaces[idx].Name)
-		}
+		name := targetRDMAInterfaceName(bundle, target, idx)
 		if name == "" || seen[name] {
 			continue
 		}
@@ -61,6 +56,9 @@ func targetRDMAInterfaceCount(bundle spec.Bundle, target Target) int {
 	if len(target.RDMA) > 0 {
 		return len(target.RDMA)
 	}
+	if !target.LegacySchema {
+		return 0
+	}
 	return len(bundle.Defaults.RDMAInterfaces)
 }
 
@@ -70,7 +68,7 @@ func targetRDMAInterfaceName(bundle spec.Bundle, target Target, index int) strin
 			return name
 		}
 	}
-	if index >= 0 && index < len(bundle.Defaults.RDMAInterfaces) {
+	if target.LegacySchema && index >= 0 && index < len(bundle.Defaults.RDMAInterfaces) {
 		return strings.TrimSpace(bundle.Defaults.RDMAInterfaces[index].Name)
 	}
 	return ""
@@ -141,11 +139,21 @@ func resolveIBDeviceForInterface(opts Options, target Target, iface string) (str
 	return devices[0], nil
 }
 
+// runDiscoveryCommand runs a read-only environment-probe command bounded by
+// probeTargetPhaseTimeout so a hung xpu-smi/ethtool/sysfs read fails fast with
+// a clear timeout instead of stalling until the slower SSH keepalive fires.
 func runDiscoveryCommand(opts Options, target Target, command string) (string, error) {
 	if opts.CommandRunner != nil {
 		return opts.CommandRunner(opts.Bundle.Check, target, command)
 	}
-	return runCommand(opts.Bundle.Check, target, command)
+	baseCtx := checkContext(opts)
+	ctx, cancel := context.WithTimeout(baseCtx, probeTargetPhaseTimeout)
+	defer cancel()
+	output, err := runCommandStreamingContext(ctx, opts.Bundle.Check, target, command, nil, nil)
+	if err != nil && ctx.Err() == context.DeadlineExceeded && baseCtx.Err() == nil {
+		return output, fmt.Errorf("probe command on %s exceeded %s and was aborted: %s", target.Name, probeTargetPhaseTimeout, strings.TrimSpace(err.Error()))
+	}
+	return output, err
 }
 
 func resolveIBDeviceCommand(iface string) string {

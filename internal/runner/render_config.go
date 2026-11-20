@@ -177,6 +177,7 @@ func writeIfcfgCommon(b *strings.Builder, name string, deviceType string, mtu in
 	b.WriteString("ONBOOT=yes\n")
 	if nmControlled {
 		b.WriteString("NM_CONTROLLED=yes\n")
+		fmt.Fprintf(b, "UUID=%s\n", networkProfileUUID(name))
 	} else {
 		b.WriteString("NM_CONTROLLED=no\n")
 	}
@@ -301,16 +302,30 @@ func renderRouteScript(item spec.RDMAConfig, routeCIDR string, priority int) str
 	fmt.Fprintf(&b, "ROUTE_CIDR=%q\n", routeCIDR)
 	fmt.Fprintf(&b, "PRIORITY=%q\n", strconv.Itoa(priority))
 	fmt.Fprintf(&b, "BROADCAST=%q\n\n", ipv4Broadcast(item.IP, item.Prefix))
-	b.WriteString("if ! ip addr show \"$DEV\" | grep -q \"inet \"; then\n")
+	b.WriteString("mkdir -p /run/lock\nexec 9>/run/lock/envinit-routes.lock\nflock -x 9\n")
+	b.WriteString("if [ -f /run/envinit-network-changing ] && [ \"${ENVINIT_NETWORK_REPLAY:-0}\" != 1 ]; then exit 0; fi\n")
+	fmt.Fprintf(&b, "if ! ip -o -4 addr show dev \"$DEV\" | awk '{print $4}' | grep -Fxq \"${IP}/%d\"; then\n", item.Prefix)
 	b.WriteString("    echo \"device $DEV no ip address, so add ip address for it\"\n")
 	b.WriteString("    ip addr add \"${IP}/" + strconv.Itoa(item.Prefix) + "\" brd \"$BROADCAST\" dev \"$DEV\"\n")
 	b.WriteString("fi\n\n")
-	b.WriteString("while read -r line; do\n")
-	b.WriteString("    [ -n \"$line\" ] || continue\n")
-	b.WriteString("    ip rule del \"${line#*: }\" 2>/dev/null || true\n")
-	b.WriteString("done < <(ip rule show | grep \"$DEV\" || true)\n\n")
-	b.WriteString("ip rule del from all oif \"$DEV\" table \"$TABLE\" priority \"$PRIORITY\" 2>/dev/null || true\n")
-	b.WriteString("ip rule del from \"$IP\" table \"$TABLE\" priority \"$PRIORITY\" 2>/dev/null || true\n\n")
+	b.WriteString(`# Reject overlapping external selectors before any partial-selector deletion.
+ip rule show | awk -v priority="$PRIORITY:" -v table="$TABLE" -v dev="$DEV" -v ip="$IP" '
+$1 == priority {
+    from=""; oif=""; lookup=""; extra=0
+    for(i=2;i<=NF;i++) {
+        if($i=="from") { from=$(i+1); i++ }
+        else if($i=="oif") { oif=$(i+1); i++ }
+        else if($i=="lookup" || $i=="table") { lookup=$(i+1); i++ }
+        else if($i=="proto" || $i=="protocol") i++
+        else extra=1
+    }
+    sub(/\/32$/, "", from)
+    if(lookup==table && ((from==ip && (extra || oif!="")) || (from=="all" && oif==dev && extra))) exit 1
+}' || { echo "external policy rule overlaps envinit selectors" >&2; exit 1; }
+while ip rule del from all oif "$DEV" table "$TABLE" priority "$PRIORITY" 2>/dev/null; do :; done
+while ip rule del from "$IP" table "$TABLE" priority "$PRIORITY" 2>/dev/null; do :; done
+
+`)
 	b.WriteString("ip route replace default via \"$GW\" dev \"$DEV\" table \"$TABLE\"\n")
 	b.WriteString("ip route replace \"$ROUTE_CIDR\" dev \"$DEV\" scope link table \"$TABLE\" src \"$IP\" proto static\n")
 	b.WriteString("ip rule add from all oif \"$DEV\" table \"$TABLE\" priority \"$PRIORITY\"\n")
@@ -485,55 +500,7 @@ func desiredSysctlLines(machine spec.MachineConfig) []string {
 }
 
 func (a *App) ensureSysctlSettings() error {
-	target := a.targetPath(sysctlFile)
-	if !a.DryRun {
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return fmt.Errorf("mkdir %s: %w", filepath.Dir(target), err)
-		}
-	}
-	existing, err := os.ReadFile(target)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("read %s: %w", sysctlFile, err)
-	}
-
-	lines := strings.Split(strings.ReplaceAll(string(existing), "\r\n", "\n"), "\n")
-	lastValues := map[string]string{}
-	for _, line := range lines {
-		key, value, ok := parseSysctlLine(line)
-		if !ok {
-			continue
-		}
-		lastValues[key] = value
-	}
-
-	changed := false
-	for _, line := range desiredSysctlLines(a.Machine) {
-		key, value, ok := parseSysctlLine(line)
-		if !ok {
-			continue
-		}
-		if lastValues[key] == value {
-			continue
-		}
-		lines = append(lines, line)
-		lastValues[key] = value
-		changed = true
-	}
-
-	if !changed {
-		a.logf("unchanged %s", sysctlFile)
-		return nil
-	}
-
-	content := strings.Join(lines, "\n")
-	if !strings.HasSuffix(content, "\n") {
-		content += "\n"
-	}
-	a.logf("update %s", sysctlFile)
-	if a.DryRun {
-		return nil
-	}
-	return os.WriteFile(target, []byte(content), 0o644)
+	return a.prepareOwnedSysctl()
 }
 
 func parseSysctlLine(line string) (string, string, bool) {
@@ -553,15 +520,27 @@ func parseSysctlLine(line string) (string, string, bool) {
 	return key, value, true
 }
 
-func parseMlxConfigValue(output string, key string) string {
+func parseMlxConfigValues(output string, key string) (string, string) {
 	for _, line := range strings.Split(output, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 0 || fields[0] != key {
 			continue
 		}
-		return fields[len(fields)-1]
+		if len(fields) == 2 {
+			v := normalizeMlxConfigValue(fields[1])
+			return v, v
+		}
+		return normalizeMlxConfigValue(fields[len(fields)-2]), normalizeMlxConfigValue(fields[len(fields)-1])
 	}
-	return ""
+	return "", ""
+}
+
+func normalizeMlxConfigValue(value string) string {
+	value = strings.TrimSpace(value)
+	if start := strings.LastIndex(value, "("); start >= 0 && strings.HasSuffix(value, ")") {
+		return value[start+1 : len(value)-1]
+	}
+	return value
 }
 
 func findDirWithFiles(root string, files ...string) (string, error) {

@@ -502,6 +502,49 @@ func TestCheckTUISeparatesMainAndDetailPaging(t *testing.T) {
 	}
 }
 
+func TestCheckTUIRawLogsPageAndJumpKeysAcrossStages(t *testing.T) {
+	stages := []string{checkTUIStagePing, bandwidthStageForMode(BandwidthModeVerbs), bandwidthStageForMode(BandwidthModeRDMACM), checkTUIStageXCCL}
+	for _, stage := range stages {
+		t.Run(stage, func(t *testing.T) {
+			model := newCheckTUIModel()
+			model.width, model.height = 100, 18
+			model.setStages([]string{stage})
+			model.tab = checkTUITabLogs
+			for i := 0; i < 80; i++ {
+				model.logLines[stage] = append(model.logLines[stage], fmt.Sprintf("log line %d", i))
+			}
+			press := func(key tea.KeyMsg) {
+				updated, _ := model.Update(key)
+				model = updated.(checkTUIModel)
+			}
+			press(tea.KeyMsg{Type: tea.KeyPgDown})
+			if model.textOffset == 0 {
+				t.Fatal("PgDown did not page Raw Logs")
+			}
+			press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+			if model.textOffset != model.maxTextOffset() {
+				t.Fatalf("Shift+G offset = %d, want %d", model.textOffset, model.maxTextOffset())
+			}
+			press(tea.KeyMsg{Type: tea.KeyPgUp})
+			if model.textOffset >= model.maxTextOffset() {
+				t.Fatal("PgUp did not page backward")
+			}
+			before := model.textOffset
+			press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+			if model.textOffset != before {
+				t.Fatal("first g changed the viewport")
+			}
+			press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+			if model.textOffset != 0 {
+				t.Fatalf("gg offset = %d, want 0", model.textOffset)
+			}
+			if !strings.Contains(model.View(), "Shift+G: bottom") {
+				t.Fatal("Raw Logs footer omits jump keys")
+			}
+		})
+	}
+}
+
 func TestCheckTUIDetailPagingRequiresOpenDetails(t *testing.T) {
 	model := newCheckTUIModel()
 	model.setStages([]string{checkTUIStagePing})

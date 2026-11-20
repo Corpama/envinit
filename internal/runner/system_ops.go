@@ -1,18 +1,39 @@
 package runner
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"os/exec"
 	"path/filepath"
+
+	"golang.org/x/sys/unix"
 )
+
+// probeCommandTimeout bounds read-only probe/query commands (captureCmd and the
+// local network probes). These are expected to return within seconds, so a hung
+// device query fails fast with a clear error instead of stalling the run.
+const probeCommandTimeout = 30 * time.Second
 
 func (a *App) targetPath(systemPath string) string {
 	return resolveTargetPath(a.Root, systemPath)
+}
+
+// aptNonInteractiveEnv prevents apt/dpkg from opening interactive config
+// prompts that would block forever on stdin during unattended installs.
+func aptNonInteractiveEnv(extra map[string]string) map[string]string {
+	env := map[string]string{
+		"DEBIAN_FRONTEND": "noninteractive",
+	}
+	for key, value := range extra {
+		env[key] = value
+	}
+	return env
 }
 
 func (a *App) logf(format string, args ...any) {
@@ -22,7 +43,48 @@ func (a *App) logf(format string, args ...any) {
 	fmt.Fprintf(a.Output, format+"\n", args...)
 }
 
+// commandContext derives a context bounded by timeout. A zero timeout means no
+// deadline (used by long vendor stages and the post stage). The returned cancel
+// must always be called.
+func commandContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.WithCancel(context.Background())
+	}
+	return context.WithTimeout(context.Background(), timeout)
+}
+
+// startProcessGroup runs cmd in its own process group and wires cancellation to
+// SIGKILL the whole group, so a timeout also reaps any children the command
+// spawned (apt, installers, firmware scripts).
+func prepareProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &unix.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		if err := unix.Kill(-cmd.Process.Pid, unix.SIGKILL); err != nil {
+			if err == unix.ESRCH {
+				return os.ErrProcessDone
+			}
+			return err
+		}
+		return nil
+	}
+	cmd.WaitDelay = 2 * time.Second
+}
+
+func timeoutError(rendered string, timeout time.Duration, ctx context.Context, err error) error {
+	if timeout > 0 && ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("run %s exceeded %s and was terminated: %w", rendered, timeout, err)
+	}
+	return fmt.Errorf("run %s: %w", rendered, err)
+}
+
 func (a *App) runCmd(dir string, env map[string]string, name string, args ...string) error {
+	return a.runCmdTimeout(a.currentStageTimeout, dir, env, name, args...)
+}
+
+func (a *App) runCmdTimeout(timeout time.Duration, dir string, env map[string]string, name string, args ...string) error {
 	rendered := strings.TrimSpace(strings.Join(append([]string{name}, args...), " "))
 	if dir != "" {
 		a.logf("run (dir=%s): %s", dir, rendered)
@@ -32,7 +94,10 @@ func (a *App) runCmd(dir string, env map[string]string, name string, args ...str
 	if a.DryRun {
 		return nil
 	}
-	cmd := exec.Command(name, args...)
+	ctx, cancel := commandContext(timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	prepareProcessGroup(cmd)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -43,7 +108,7 @@ func (a *App) runCmd(dir string, env map[string]string, name string, args ...str
 		cmd.Env = append(cmd.Env, key+"="+value)
 	}
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("run %s: %w", rendered, err)
+		return timeoutError(rendered, timeout, ctx, err)
 	}
 	return nil
 }
@@ -58,7 +123,10 @@ func (a *App) runCmdAllowFailure(dir string, env map[string]string, name string,
 	if a.DryRun {
 		return nil
 	}
-	cmd := exec.Command(name, args...)
+	ctx, cancel := commandContext(a.currentStageTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	prepareProcessGroup(cmd)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -74,13 +142,19 @@ func (a *App) runCmdAllowFailure(dir string, env map[string]string, name string,
 	return nil
 }
 
+// captureCmd runs a read-only command and buffers its output. It always uses the
+// short probe timeout because these are queries (ethtool, mlxconfig query,
+// rpm -q, systemctl is-*), not long installers.
 func (a *App) captureCmd(dir string, env map[string]string, name string, args ...string) (string, error) {
 	rendered := strings.TrimSpace(strings.Join(append([]string{name}, args...), " "))
 	a.logf("capture: %s", rendered)
 	if a.DryRun {
 		return "", nil
 	}
-	cmd := exec.Command(name, args...)
+	ctx, cancel := commandContext(probeCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	prepareProcessGroup(cmd)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -90,6 +164,9 @@ func (a *App) captureCmd(dir string, env map[string]string, name string, args ..
 	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("probe command %s exceeded %s and was terminated: %w\n%s", rendered, probeCommandTimeout, err, string(output))
+		}
 		return "", fmt.Errorf("run %s: %w\n%s", rendered, err, string(output))
 	}
 	return string(output), nil

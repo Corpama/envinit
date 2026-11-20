@@ -106,8 +106,8 @@ func TestRelocateLegacyNetworkBackupsForUbuntuAndKylin(t *testing.T) {
 			return time.Date(2026, 9, 3, 17, 0, 0, 0, time.UTC)
 		},
 	}
-	if err := app.relocateLegacyNetworkBackups(); err != nil {
-		t.Fatalf("relocate legacy network backups: %v", err)
+	if err := app.relocateLegacyNetworkBackups(); err == nil || !strings.Contains(err.Error(), "needs attention") || !strings.Contains(err.Error(), keep) {
+		t.Fatalf("expected unknown backup review after relocating known files: %v", err)
 	}
 	for _, systemPath := range legacy {
 		original := filepath.Join(root, strings.TrimPrefix(systemPath, "/"))
@@ -120,6 +120,6 @@ func TestRelocateLegacyNetworkBackupsForUbuntuAndKylin(t *testing.T) {
 		}
 	}
 	if _, err := os.Stat(keep); err != nil {
-		t.Fatalf("manual non-envinit backup should remain: %v", err)
+		t.Fatalf("manual non-envinit backup should remain for review: %v", err)
 	}
 }

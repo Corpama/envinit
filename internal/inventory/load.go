@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -79,8 +80,22 @@ func parseRows(rows [][]string) ([]spec.MachineRecord, error) {
 	}
 
 	header := make(map[int]string)
+	legacySchema := false
+	seenHeaders := map[string]bool{}
 	for idx, value := range rows[0] {
 		header[idx] = canonicalHeader(value)
+		if header[idx] == "" || seenHeaders[header[idx]] {
+			return nil, fmt.Errorf("empty or duplicate inventory header %q", value)
+		}
+		seenHeaders[header[idx]] = true
+		canonical := PlanningColumnName(value)
+		if canonical == "host_id" {
+			legacySchema = true
+			canonical = "hostname"
+		}
+		if header[idx] != canonical {
+			fmt.Fprintf(os.Stderr, "WARN inventory column %s is deprecated; use %s\n", value, canonical)
+		}
 	}
 
 	out := make([]spec.MachineRecord, 0, len(rows)-1)
@@ -92,6 +107,8 @@ func parseRows(rows [][]string) ([]spec.MachineRecord, error) {
 		if err != nil {
 			return nil, fmt.Errorf("inventory row %d: %w", line+2, err)
 		}
+		record.LegacySchema = legacySchema
+		record.FromInventory = true
 		out = append(out, record)
 	}
 	if len(out) == 0 {
@@ -101,24 +118,82 @@ func parseRows(rows [][]string) ([]spec.MachineRecord, error) {
 }
 
 func rowToRecord(header map[int]string, row []string) (spec.MachineRecord, error) {
-	record := spec.MachineRecord{}
+	return rowToRecordMode(header, row, false)
+}
 
-	for idx, raw := range row {
+func rowToRecordMode(header map[int]string, row []string, template bool) (spec.MachineRecord, error) {
+	record := spec.MachineRecord{}
+	values := map[string]string{}
+	set := func(field, value string) error {
+		if value == "" {
+			return nil
+		}
+		if previous, ok := values[field]; ok && previous != value {
+			return fmt.Errorf("duplicate/conflicting values for %s: %q and %q", field, previous, value)
+		}
+		values[field] = value
+		return nil
+	}
+
+	for idx := 0; idx < len(header); idx++ {
+		raw := ""
+		if idx < len(row) {
+			raw = row[idx]
+		}
 		key := header[idx]
 		value := strings.TrimSpace(raw)
+		field := PlanningColumnName(key)
+		if field == "host_id" {
+			field = "hostname"
+		}
+		if value == "" {
+			continue
+		}
+		if err := set(field, value); err != nil {
+			return spec.MachineRecord{}, err
+		}
 		switch key {
 		case "host_id", "host", "node_id", "asset_tag":
+			if err := set("hostname", value); err != nil {
+				return spec.MachineRecord{}, err
+			}
 			record.HostID = value
 		case "hostname", "node", "machine":
+			if err := set("hostname", value); err != nil {
+				return spec.MachineRecord{}, err
+			}
 			record.Hostname = value
+		case "mgmt_mode", "management_mode":
+			if err := set("mgmt_mode", value); err != nil {
+				return spec.MachineRecord{}, err
+			}
+			record.MgmtMode = value
+		case "mgmt_target_name", "management_target_name":
+			if err := set("mgmt_target_name", value); err != nil {
+				return spec.MachineRecord{}, err
+			}
+			record.MgmtTargetName = value
 		case "mgmt_ip", "bond_ip", "management_ip":
+			if err := set("mgmt_ip", value); err != nil {
+				return spec.MachineRecord{}, err
+			}
 			record.MgmtIP = value
 		case "mgmt_prefix", "bond_prefix", "management_prefix":
+			if err := set("mgmt_prefix", value); err != nil {
+				return spec.MachineRecord{}, err
+			}
 			record.MgmtPrefix = value
 		case "mgmt_gateway", "bond_gateway", "management_gateway":
+			if err := set("mgmt_gateway", value); err != nil {
+				return spec.MachineRecord{}, err
+			}
 			record.MgmtGateway = value
 		case "mgmt_bond_name", "bond_name":
-			record.MgmtBondName = value
+			// Deprecated input aliases are normalized at the inventory boundary.
+			if err := set("mgmt_target_name", value); err != nil {
+				return spec.MachineRecord{}, err
+			}
+			record.MgmtTargetName = value
 		case "mgmt_iface1", "mgmt_port1", "bond_iface1", "bond_port1":
 			record.MgmtIface1 = value
 		case "mgmt_iface2", "mgmt_port2", "bond_iface2", "bond_port2":
@@ -133,6 +208,14 @@ func rowToRecord(header map[int]string, row []string) (spec.MachineRecord, error
 			if ok := assignRDMAField(&record, key, value); ok {
 				continue
 			}
+		}
+	}
+	if strings.TrimSpace(record.Hostname) == "" {
+		// host_id-only rows are accepted solely for legacy compatibility; the
+		// caller marks the record and emits the deprecated-header warning.
+		record.Hostname = strings.TrimSpace(record.HostID)
+		if record.Hostname == "" && !template {
+			return spec.MachineRecord{}, errors.New("hostname is required")
 		}
 	}
 	for len(record.RDMA) > 0 && emptyRDMARecord(record.RDMA[len(record.RDMA)-1]) {
@@ -172,7 +255,7 @@ func assignRDMAField(record *spec.MachineRecord, key string, value string) bool 
 	}
 
 	n, err := strconv.Atoi(rest[:idxEnd])
-	if err != nil || n < 1 {
+	if err != nil || n < 1 || n > 64 {
 		return false
 	}
 	for len(record.RDMA) < n {

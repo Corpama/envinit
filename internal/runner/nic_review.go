@@ -15,6 +15,7 @@ import (
 )
 
 type nicBindingReview struct {
+	RetryProbe    bool
 	Original      []interfaceBinding
 	Bindings      []interfaceBinding
 	Devices       []netDevice
@@ -23,17 +24,27 @@ type nicBindingReview struct {
 	DropdownMode  string
 	DropdownIndex int
 	Message       string
+	Warning       string
 
 	blinkCmd   *exec.Cmd
 	blinkIface string
 }
 
+var errRetryNICProbe = errors.New("retry NIC probe")
+
 func newNICBindingReview(bindings []interfaceBinding, devices []netDevice) *nicBindingReview {
-	return &nicBindingReview{
+	review := &nicBindingReview{
 		Original: cloneInterfaceBindings(bindings),
 		Bindings: cloneInterfaceBindings(bindings),
 		Devices:  append([]netDevice(nil), devices...),
 	}
+	for _, binding := range bindings {
+		if strings.TrimSpace(binding.ProbeWarning) != "" {
+			review.Warning = binding.ProbeWarning
+			break
+		}
+	}
+	return review
 }
 
 func cloneInterfaceBindings(bindings []interfaceBinding) []interfaceBinding {
@@ -63,6 +74,9 @@ func runNICBindingReview(tty *os.File, review *nicBindingReview) ([]interfaceBin
 	}
 	if model.aborted {
 		return nil, errors.New("NIC binding review aborted")
+	}
+	if review.RetryProbe {
+		return nil, errRetryNICProbe
 	}
 	return review.Bindings, nil
 }
@@ -126,6 +140,9 @@ func (model nicBindingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			model.review.DropdownOpen = false
 			model.review.DropdownMode = ""
 			model.review.Message = "restored automatic mapping"
+		case "R":
+			model.review.RetryProbe = true
+			return model, tea.Quit
 		case "p":
 			model.review.toggleBlink()
 		case "enter":
@@ -157,6 +174,10 @@ func (model nicBindingModel) View() string {
 	var b strings.Builder
 	title := lipgloss.NewStyle().Bold(true).Render("NIC Binding Review")
 	fmt.Fprintln(&b, fitText(title, width))
+	if model.review.Warning != "" {
+		warning := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9")).Render("WARNING: " + model.review.Warning)
+		fmt.Fprintln(&b, fitText(warning, width))
+	}
 	fmt.Fprintln(&b)
 	if width >= 120 {
 		renderNICBindingReviewWide(&b, model.review, width, model.deviceLimit())
@@ -165,6 +186,7 @@ func (model nicBindingModel) View() string {
 	}
 	renderReviewDetails(&b, model.review, width)
 	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, fitText("R: retry probe | Manual selections: connectivity unverified", width))
 	if model.review.DropdownOpen {
 		fmt.Fprintln(&b, fitText("Keys: Up/Down choose option | Space/Enter confirm | Esc cancel", width))
 	} else if width >= 100 {
@@ -195,16 +217,17 @@ func (model nicBindingModel) deviceLimit() int {
 
 func renderNICBindingReviewWide(tty io.Writer, review *nicBindingReview, width int, deviceLimit int) {
 	fmt.Fprintln(tty, sectionHeader("Planned Bindings", width))
-	fmt.Fprintln(tty, "    Slot    Target Name        Planned IP          Current NIC        MAC                Why")
-	fmt.Fprintln(tty, "    ------  -----------------  ------------------  -----------------  -----------------  ------------------")
+	renderManagementBondNotice(tty, review, width)
+	fmt.Fprintln(tty, "    Slot        Target Name        Planned IP          Current NIC        Physical MAC        Why")
+	fmt.Fprintln(tty, "    ----------  -----------------  ------------------  -----------------  -----------------  ------------------")
 	for idx, binding := range review.Bindings {
 		prefix := "  "
 		if idx == review.Selected {
 			prefix = "> "
 		}
-		fmt.Fprintf(tty, "%s  %-6s  %-17s  %-18s  %-17s  %-17s  %-18s\n",
+		fmt.Fprintf(tty, "%s  %-10s  %-17s  %-18s  %-17s  %-17s  %-18s\n",
 			prefix,
-			fitText(bindingSlotLabel(review.Bindings, idx), 6),
+			fitText(bindingSlotLabel(review.Bindings, idx), 10),
 			fitText(binding.Name, 17),
 			fitText(valueOrDash(binding.Address), 18),
 			fitText(valueOrDash(binding.CurrentName), 17),
@@ -248,16 +271,17 @@ func renderNICBindingReviewCompact(tty io.Writer, review *nicBindingReview, widt
 		nameWidth = 10
 	}
 	fmt.Fprintln(tty, sectionHeader("Planned Bindings", width))
-	fmt.Fprintf(tty, "    %-6s  %-*s  %-15s  %-*s  %-17s\n", "Slot", nameWidth, "Target", "IP", nameWidth, "NIC", "MAC")
-	fmt.Fprintf(tty, "    %-6s  %-*s  %-15s  %-*s  %-17s\n", "------", nameWidth, strings.Repeat("-", nameWidth), "---------------", nameWidth, strings.Repeat("-", nameWidth), "-----------------")
+	renderManagementBondNotice(tty, review, width)
+	fmt.Fprintf(tty, "    %-10s  %-*s  %-15s  %-*s  %-17s\n", "Slot", nameWidth, "Target", "IP", nameWidth, "NIC", "Phys MAC")
+	fmt.Fprintf(tty, "    %-10s  %-*s  %-15s  %-*s  %-17s\n", "----------", nameWidth, strings.Repeat("-", nameWidth), "---------------", nameWidth, strings.Repeat("-", nameWidth), "-----------------")
 	for idx, binding := range review.Bindings {
 		prefix := "  "
 		if idx == review.Selected {
 			prefix = "> "
 		}
-		fmt.Fprintf(tty, "%s  %-6s  %-*s  %-15s  %-*s  %-17s\n",
+		fmt.Fprintf(tty, "%s  %-10s  %-*s  %-15s  %-*s  %-17s\n",
 			prefix,
-			fitText(bindingSlotLabel(review.Bindings, idx), 6),
+			fitText(bindingSlotLabel(review.Bindings, idx), 10),
 			nameWidth,
 			fitText(binding.Name, nameWidth),
 			fitText(valueOrDash(binding.Address), 15),
@@ -300,18 +324,43 @@ func renderNICBindingReviewCompact(tty io.Writer, review *nicBindingReview, widt
 	renderMoreDevicesLine(tty, len(review.Devices), deviceLimit)
 }
 
+func renderManagementBondNotice(tty io.Writer, review *nicBindingReview, width int) {
+	var group string
+	memberCount := 0
+	var address string
+	for _, binding := range review.Bindings {
+		if binding.Kind != "mgmt" || strings.TrimSpace(binding.GroupName) == "" {
+			continue
+		}
+		group = binding.GroupName
+		memberCount++
+		if address == "" {
+			address = valueOrDash(binding.Address)
+		}
+	}
+	if group == "" {
+		return
+	}
+	message := fmt.Sprintf("Management bond: %s | %d physical members | one shared management IP: %s", group, memberCount, address)
+	fmt.Fprintln(tty, "    "+fitText(message, maxInt(10, width-4)))
+	fmt.Fprintln(tty, "    Each mgmt row below is a separate physical bond member; do not treat them as separate management IPs.")
+}
+
 func renderReviewDetails(tty io.Writer, review *nicBindingReview, width int) {
 	fmt.Fprintln(tty)
 	fmt.Fprintln(tty, sectionHeader("Details", width))
 	if review.Selected >= 0 && review.Selected < len(review.Bindings) {
 		binding := review.Bindings[review.Selected]
 		fmt.Fprintf(tty, "    Plan: %s  target=%s  ip=%s  after=%s\n",
-			fitText(bindingSlotLabel(review.Bindings, review.Selected), 6),
+			fitText(bindingSlotLabel(review.Bindings, review.Selected), 10),
 			fitText(binding.Name, 18),
 			fitText(valueOrDash(binding.Address), 18),
 			fitText(afterApplyLabel(binding), maxInt(12, width-62)),
 		)
 		fmt.Fprintf(tty, "    Why: %s\n", fitText(bindingReasonLabel(binding), maxInt(10, width-10)))
+		for _, detail := range binding.ProbeDetails {
+			fmt.Fprintf(tty, "    Probe: %s\n", fitText(detail, maxInt(10, width-12)))
+		}
 	}
 	device := activeReviewDevice(review)
 	if device == nil {
@@ -785,13 +834,14 @@ func applyPhysicalBindingFields(binding *interfaceBinding, fields physicalBindin
 }
 
 func markBindingUserSelected(binding *interfaceBinding) {
-	binding.Reason = "user selected"
+	binding.Reason = "user selected; connectivity unverified"
 	binding.Confidence = "manual"
 }
 
 func copyPlanFields(binding interfaceBinding, plan interfaceBinding) interfaceBinding {
 	binding.Kind = plan.Kind
 	binding.Name = plan.Name
+	binding.GroupName = plan.GroupName
 	binding.Address = plan.Address
 	binding.Gateway = plan.Gateway
 	binding.Table = plan.Table
@@ -849,7 +899,7 @@ func validateReviewBindings(bindings []interfaceBinding) error {
 		}
 		key := strings.ToLower(strings.TrimSpace(binding.MAC))
 		if other := seen[key]; other != "" {
-			return fmt.Errorf("%s %s uses the same NIC as %s", bindingSlotLabel(bindings, idx), binding.Name, other)
+			return fmt.Errorf("%s %s uses the same physical NIC as %s", bindingSlotLabel(bindings, idx), binding.Name, other)
 		}
 		seen[key] = bindingSlotLabel(bindings, idx) + " " + binding.Name
 	}
@@ -874,6 +924,9 @@ func bindingSlotLabel(bindings []interfaceBinding, target int) string {
 			count++
 		}
 	}
+	if bindings[target].Kind == "mgmt" && strings.TrimSpace(bindings[target].GroupName) != "" {
+		return fmt.Sprintf("%s/m%d", bindings[target].GroupName, count)
+	}
 	return fmt.Sprintf("%s%d", bindings[target].Kind, count)
 }
 
@@ -890,13 +943,20 @@ func afterApplyLabel(binding interfaceBinding) string {
 	if address == "-" {
 		return binding.Name
 	}
+	if strings.TrimSpace(binding.GroupName) != "" {
+		return binding.GroupName + " (shared IP) " + address
+	}
 	return binding.Name + " " + address
 }
 
 func plannedTargetDetail(binding interfaceBinding) string {
 	parts := []string{}
 	if strings.TrimSpace(binding.Gateway) != "" {
-		parts = append(parts, "via "+strings.TrimSpace(binding.Gateway))
+		gateway := "via " + strings.TrimSpace(binding.Gateway)
+		if strings.TrimSpace(binding.GatewaySource) != "" {
+			gateway += " (" + strings.TrimSpace(binding.GatewaySource) + ")"
+		}
+		parts = append(parts, gateway)
 	}
 	if binding.Table > 0 {
 		parts = append(parts, fmt.Sprintf("table %d", binding.Table))

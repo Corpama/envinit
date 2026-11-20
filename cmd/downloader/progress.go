@@ -61,6 +61,22 @@ func isInteractiveWriter(output io.Writer) bool {
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
+// stdinIsNonInteractiveFile reports whether stdin is a real OS file (e.g.
+// os.Stdin) that is not a terminal, such as a pipe or redirected file. In that
+// case the profile prompt would block forever on scanner.Scan with no feedback.
+// Non-*os.File readers (used in tests) are treated as answerable.
+func stdinIsNonInteractiveFile(stdin io.Reader) bool {
+	file, ok := stdin.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice == 0
+}
+
 func (p *materialProgress) addExisting(delta int64) {
 	if p == nil || delta == 0 {
 		return
