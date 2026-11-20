@@ -1,6 +1,6 @@
 # `env_init config` 配置初始化 Pipeline 方案与决策记录
 
-状态：用户已授权开始实施，源码已接入第一版 `env_init config`。使用和参数说明见 [config 模板准备](envinit-config.md)。各模块“本模块最终决定”保留设计选择；未勾选候选不作为实现要求。
+当前实现：下载电脑上的 `downloader config` 与目标机上的 `env_init config` 共用同一套离线配置流程；正常下载不会进入配置编辑器。使用和参数说明见 [config 模板准备](envinit-config.md)。下文保留最初的设计讨论。
 
 ## 1. 目标与边界
 

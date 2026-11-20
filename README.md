@@ -2,7 +2,7 @@
 
 开发交接与会话决策见 [分类索引](docs/session-summary.md)，其中区分当前源码、待实施建议和实机验收事项。
 
-downloader 只负责选择 profile、下载模板和离线材料、校验并组装交付目录。交付目录准备好后，通过 `env_init config` 初始化配置模板、编辑常用项目策略并导入规划表；使用说明见 [config 模板准备](docs/envinit-config.md)，设计决定见 [pipeline 方案](docs/envinit-configure-design.md)。
+在下载电脑上，用 `downloader config --project ./env_tool` 初始化或编辑规划文件；在目标 Linux 机器上，用 `env_init config` 打开同一个编辑器。两个入口都可离线使用。downloader 的普通下载命令仍负责选择 profile、下载校验材料和组装交付目录。命令示例见 [config 模板准备](docs/envinit-config.md)。
 
 ## 1. 用途
 
@@ -110,6 +110,8 @@ downloader 执行时才登录 AList，递归读取所选 profile 的物料目录
 
 ## 3. 下载器和 profile 选择
 
+`downloader` 和 `env_init` 在交互终端显示启动页。进度按当前命令已完成的准备步骤计算：例如 `plan` 加载 bundle 和机器规划表，downloader 读取并解析发布清单。准备完成后显示「启动就绪」；启动页至少展示约 2 秒，加载较慢时等到实际完成再进入命令。物料下载进度在下载阶段单独显示。帮助、列出 profile、纯文本模式和管道/重定向会跳过启动页。设置 `ENVINIT_NO_SPLASH=1` 可关闭启动页。
+
 发布包中的下载器会读取内置 manifest，让用户选择本次交付要拉取的系统 profile。交互式环境下直接运行下载器，会看到类似选择界面：
 
 ```text
@@ -142,7 +144,10 @@ chmod +x env_tool_downloader-linux-amd64
 也可以用命令行直接指定：
 
 ```bash
-./downloader --profile ubuntu22.04-x86_64 --output-dir /mnt/usb/env_tool
+# 默认在当前工作目录下创建 kunlun_env_init/ 并组装整套交付文件
+./downloader --profile ubuntu22.04-x86_64
+
+# 自定义路径即交付根目录，缺失的父目录也会自动创建
 ./downloader --profile kylin10sp3-x86_64 --output-dir /mnt/usb/env_tool
 
 # 网络或存储端承载较低时可降低并发数
@@ -155,7 +160,7 @@ chmod +x env_tool_downloader-linux-amd64
 | --- | --- |
 | `--list-profiles` | 只列出内置 manifest 中支持的 profile，不下载 |
 | `--profile <id>` | 指定 profile，适合非交互环境 |
-| `--output-dir <dir>` | 下载和解包输出目录，通常为 U 盘上的 `env_tool` |
+| `--output-dir <dir>` | 交付根目录，默认 `./kunlun_env_init`。使用自定义路径时直接组装到该目录，不额外嵌套一层。 |
 | `--jobs <n>` | profile 物料并发下载数，默认 6，最大 32 |
 | `--output <path>` | 仅兼容旧版“单归档 downloader”；当前内置 manifest/profile 的 release 不使用该参数，请使用 `--output-dir` |
 

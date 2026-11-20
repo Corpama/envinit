@@ -22,6 +22,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"envinit/internal/configcli"
+	"envinit/internal/startup"
 )
 
 var (
@@ -37,6 +40,8 @@ var (
 )
 
 const (
+	defaultOutputDir = "kunlun_env_init"
+
 	// httpDialTimeout / httpTLSTimeout / httpResponseHeaderTimeout bound the
 	// connection setup so an unreachable or silent endpoint fails fast instead
 	// of hanging forever.
@@ -100,12 +105,28 @@ type manifestAsset struct {
 }
 
 func main() {
+	name := filepath.Base(os.Args[0])
+	if len(os.Args) > 1 && os.Args[1] == "config" {
+		if err := configcli.Run(name, os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [download options]\n       %s config [--project DIR] [config options]\n\nDownload options:\n", name, name)
+		flag.PrintDefaults()
+	}
 	output := flag.String("output", "", "Output tar path, defaults to the release package name")
-	outputDir := flag.String("output-dir", ".", "Output directory for manifest/profile downloads")
+	outputDir := flag.String("output-dir", defaultOutputDir, "Delivery directory for all profile files (created if missing)")
 	profile := flag.String("profile", "", "Delivery profile ID to download, for example kylin10sp3-x86_64")
 	listProfiles := flag.Bool("list-profiles", false, "List delivery profiles in the embedded manifest")
 	jobs := flag.Int("jobs", 6, "Concurrent material file downloads")
 	flag.Parse()
+	if flag.NArg() != 0 {
+		flag.Usage()
+		os.Exit(2)
+	}
 
 	opts := runOptions{
 		Output:       *output,
@@ -133,12 +154,28 @@ type runOptions struct {
 }
 
 func run(opts runOptions) error {
-	rawManifest, err := embeddedManifest()
+	var rawManifest string
+	var manifest releaseManifest
+	var args []string
+	if opts.ListProfiles {
+		args = []string{"--list-profiles"}
+	}
+	err := startup.Run("downloader", args,
+		startup.Step{Label: "读取发布清单", Load: func() error { var e error; rawManifest, e = embeddedManifest(); return e }},
+		startup.Step{Label: "解析交付配置", Load: func() error {
+			if rawManifest == "" {
+				return validateLegacyMetadata()
+			}
+			var e error
+			manifest, e = parseManifest(rawManifest)
+			return e
+		}},
+	)
 	if err != nil {
 		return err
 	}
 	if rawManifest != "" {
-		return runManifestMode(opts, rawManifest)
+		return runManifestMode(opts, manifest)
 	}
 	return runLegacyMode(opts.Output)
 }
@@ -157,12 +194,16 @@ func embeddedManifest() (string, error) {
 	return string(raw), nil
 }
 
-func runLegacyMode(output string) error {
+func validateLegacyMetadata() error {
 	if strings.TrimSpace(alistBaseURL) == "" || strings.TrimSpace(alistFilePath) == "" ||
 		strings.TrimSpace(alistUserB64) == "" || strings.TrimSpace(alistPassB64) == "" ||
 		strings.TrimSpace(packageName) == "" || strings.TrimSpace(packageSHA256) == "" {
 		return errors.New("downloader build is missing release metadata")
 	}
+	return nil
+}
+
+func runLegacyMode(output string) error {
 	if output == "" {
 		output = packageName
 	}
@@ -262,11 +303,7 @@ func resolveDownloadURLForPathWithTokenAndRefresh(filePath, token string, refres
 	return fileResponse.Data.RawURL, nil
 }
 
-func runManifestMode(opts runOptions, rawManifest string) error {
-	manifest, err := parseManifest(rawManifest)
-	if err != nil {
-		return err
-	}
+func runManifestMode(opts runOptions, manifest releaseManifest) error {
 	if opts.Stdout == nil {
 		opts.Stdout = io.Discard
 	}
@@ -285,7 +322,7 @@ func runManifestMode(opts runOptions, rawManifest string) error {
 	}
 	outputDir := strings.TrimSpace(opts.OutputDir)
 	if outputDir == "" {
-		outputDir = "."
+		outputDir = defaultOutputDir
 	}
 	unlock, err := lockDeliveryProject(outputDir)
 	if err != nil {
@@ -337,6 +374,7 @@ func runManifestMode(opts runOptions, rawManifest string) error {
 		return err
 	}
 	fmt.Fprintf(opts.Stdout, "Profile %s is ready under %s\n", profile.ID, outputDir)
+	fmt.Fprintf(opts.Stdout, "Edit local planning: %s config --project %q\n", filepath.Base(os.Args[0]), outputDir)
 	return nil
 }
 

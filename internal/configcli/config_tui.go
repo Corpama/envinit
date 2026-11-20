@@ -1,4 +1,4 @@
-package main
+package configcli
 
 import (
 	"bufio"
@@ -82,7 +82,7 @@ func (m textPrompt) View() string {
 	if len(lines) > max(1, m.height-7) {
 		lines = lines[:max(1, m.height-7)]
 	}
-	return lipgloss.NewStyle().Bold(true).Render("env_init config") + "\n" +
+	return lipgloss.NewStyle().Bold(true).Render("config · 离线规划") + "\n" +
 		strings.Join(lines, "\n") + "\n\n" + m.title + "\n> " + string(m.value) +
 		"\nEnter 确认 · Esc 取消"
 }
@@ -379,7 +379,7 @@ func (m policyTableModel) View() string {
 	if m.height <= 0 {
 		m.height = 30
 	}
-	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("env_init config · 配置参数表")
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("config · 配置参数表")
 	subtitle := "Enter 编辑 · Ctrl+S 下一页 · ↑↓/jk 移动 · Space 折叠 · PgUp/PgDn 翻页 · gg/G 首末 · q 取消"
 	if m.input {
 		subtitle = "正在编辑 · Enter 应用  Esc 放弃  ←→移动  Home/End跳转"
@@ -1092,7 +1092,7 @@ func (m inventoryTableModel) View() string {
 		subtitle = "正在编辑 · Enter 应用 · Esc 放弃 · ←→移动 · Home/End跳转"
 	}
 	lines := []string{
-		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("env_init config · inventory 规划表"),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("config · inventory 规划表"),
 		lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(subtitle),
 	}
 	header := responsiveLine(compact, categoryWidth, nameWidth, descriptionWidth, currentWidth, inputWidth, "机器", "字段", "作用", "当前值", "修改为")

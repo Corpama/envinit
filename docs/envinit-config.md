@@ -1,10 +1,16 @@
 # config：装机前配置模板准备
 
-`env_init config` 在本地准备 `bundle.json` 和 `inventory.csv`，不需要目标服务器在线。输出是供用户继续编辑的模板：空 hostname、IP、prefix、gateway 等正常待填项会列出清单，格式错误和已填值的明确冲突阻止保存。
+下载电脑上的 `downloader config` 和目标机上的 `env_init config` 共用编辑器，在本地准备 `bundle.json` 和 `inventory.csv`，无需连接 AList 或目标服务器。输出是供用户继续编辑的模板：空 hostname、IP、prefix、gateway 等正常待填项会列出清单，格式错误和已填值的明确冲突阻止保存。
 
 ## 常用命令
 
 ```bash
+# 下载电脑：指向默认交付目录；若下载时指定了 --output-dir，此处使用同一路径
+./env_tool_downloader-darwin-arm64 config --project ./kunlun_env_init
+
+# 尚未下载材料，也可用本地 bundle 模板新建规划；inventory 可留空或用 --inventory-template 导入
+./env_tool_downloader-darwin-arm64 config --project ./new-project --bundle-template ./bundle.json
+
 # 当前目录的 planning/；交互终端默认 TUI
 env_init config
 env_init config --project ./env_tool

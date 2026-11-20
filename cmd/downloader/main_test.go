@@ -359,14 +359,17 @@ func TestRunManifestModeSupportsLegacyProfileArchives(t *testing.T) {
 	alistPassB64 = base64.StdEncoding.EncodeToString([]byte("secret"))
 	manifestJSON = string(rawManifest)
 
-	outputDir := t.TempDir()
+	t.Chdir(t.TempDir())
+	outputDir := "kunlun_env_init"
 	var output strings.Builder
 	if err := run(runOptions{
-		OutputDir: outputDir,
-		Profile:   "kylin10sp3-x86_64",
-		Stdout:    &output,
+		Profile: "kylin10sp3-x86_64",
+		Stdout:  &output,
 	}); err != nil {
 		t.Fatalf("run manifest mode: %v", err)
+	}
+	if entries, err := os.ReadDir("."); err != nil || len(entries) != 1 || entries[0].Name() != outputDir || !entries[0].IsDir() {
+		t.Fatalf("expected only the delivery directory, got %v, err=%v", entries, err)
 	}
 	assertFileContent(t, filepath.Join(outputDir, "env_init"), "base binary")
 	assertFileContent(t, filepath.Join(outputDir, "README.md"), "base readme")
@@ -502,7 +505,7 @@ func TestRunManifestModeDownloadsAndAssemblesMaterialDirectory(t *testing.T) {
 	alistPassB64 = base64.StdEncoding.EncodeToString([]byte("secret"))
 	manifestJSON = string(rawManifest)
 
-	outputDir := t.TempDir()
+	outputDir := filepath.Join(t.TempDir(), "new parent", "my delivery")
 	var output strings.Builder
 	opts := runOptions{OutputDir: outputDir, Profile: "kylin10sp3-x86_64", Jobs: 2, Stdout: &output}
 	if err := run(opts); err != nil {

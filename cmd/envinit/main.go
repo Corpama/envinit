@@ -13,20 +13,25 @@ import (
 
 	"envinit/internal/bundle"
 	"envinit/internal/checker"
+	"envinit/internal/configcli"
 	"envinit/internal/inventory"
 	"envinit/internal/runner"
 	"envinit/internal/spec"
+	"envinit/internal/startup"
 )
 
 func main() {
 	if len(os.Args) < 2 {
+		if err := startup.Run("env_init", nil); err != nil {
+			os.Exit(1)
+		}
 		usage()
 		os.Exit(2)
 	}
 
 	switch os.Args[1] {
 	case "config":
-		if err := runConfig(os.Args[2:]); err != nil {
+		if err := configcli.Run("env_init", os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
@@ -64,6 +69,14 @@ func main() {
 	}
 }
 
+func loadPlanning(args []string, bundlePath, inventoryPath, sheet string) (b spec.Bundle, records []spec.MachineRecord, err error) {
+	err = startup.Run("env_init", args,
+		startup.Step{Label: "读取配置包", Load: func() error { var e error; b, e = bundle.Load(bundlePath); return e }},
+		startup.Step{Label: "读取机器规划表", Load: func() error { var e error; records, e = inventory.Load(inventoryPath, sheet); return e }},
+	)
+	return
+}
+
 func runCheck(args []string) error {
 	fs := flag.NewFlagSet("envinit check", flag.ContinueOnError)
 	inventoryPath := fs.String("inventory", "", "Path to the inventory file (.csv/.tsv/.txt/.xlsx)")
@@ -98,7 +111,7 @@ func runCheck(args []string) error {
 	if err != nil {
 		return err
 	}
-	b, err := bundle.Load(*bundlePath)
+	b, records, err := loadPlanning(args, *bundlePath, *inventoryPath, *sheet)
 	if err != nil {
 		return err
 	}
@@ -114,10 +127,6 @@ func runCheck(args []string) error {
 	}
 	if runXCCL && !b.Check.XCCL.Enabled && !checkStageExplicitlyRequestsXCCL(rawCheckStage) {
 		runXCCL = false
-	}
-	records, err := inventory.Load(*inventoryPath, *sheet)
-	if err != nil {
-		return err
 	}
 	hosts := []string{*hostsRaw}
 	var bandwidthModes []string
@@ -174,11 +183,7 @@ func runDiscover(args []string) error {
 	if strings.TrimSpace(*hostsRaw) == "" {
 		return fmt.Errorf("--hosts is required")
 	}
-	b, err := bundle.Load(*bundlePath)
-	if err != nil {
-		return err
-	}
-	records, err := inventory.Load(*inventoryPath, *sheet)
+	b, records, err := loadPlanning(args, *bundlePath, *inventoryPath, *sheet)
 	if err != nil {
 		return err
 	}
@@ -313,11 +318,7 @@ func run(dryRun bool, args []string) error {
 		return fmt.Errorf("--bundle is required")
 	}
 
-	b, err := bundle.Load(*bundlePath)
-	if err != nil {
-		return err
-	}
-	records, err := inventory.Load(*inventoryPath, *sheet)
+	b, records, err := loadPlanning(args, *bundlePath, *inventoryPath, *sheet)
 	if err != nil {
 		return err
 	}

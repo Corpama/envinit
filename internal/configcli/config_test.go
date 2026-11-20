@@ -1,4 +1,4 @@
-package main
+package configcli
 
 import (
 	"bufio"
@@ -29,13 +29,13 @@ func TestConfigReadOnlyThenSaveAndSingleFile(t *testing.T) {
 	}
 	project := filepath.Join(root, "new-project")
 	args := []string{"--project", project, "--bundle-template", b, "--inventory-template", i}
-	if err := runConfig(append(args, "--check-only")); err != nil {
+	if err := Run("downloader", append(args, "--check-only")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(project); !os.IsNotExist(err) {
 		t.Fatal("check-only created project or lock")
 	}
-	if err := runConfig(append(args, "--yes")); err != nil {
+	if err := Run("downloader", append(args, "--yes")); err != nil {
 		t.Fatal(err)
 	}
 	p, err := configure.ResolvePaths(project, "", "")
@@ -49,7 +49,7 @@ func TestConfigReadOnlyThenSaveAndSingleFile(t *testing.T) {
 	if err := os.WriteFile(i, []byte("hostname\tmgmt_ip\tOwner\na\t10.0.0.2\tNew\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := runConfig(append(args, "--yes", "--replace", "--save", "inventory")); err != nil {
+	if err := Run("env_init", append(args, "--yes", "--replace", "--save", "inventory")); err != nil {
 		t.Fatal(err)
 	}
 	after, err := os.ReadFile(p.Bundle)
@@ -63,7 +63,7 @@ func TestConfigReadOnlyThenSaveAndSingleFile(t *testing.T) {
 	if err := os.WriteFile(i, []byte("hostname\tmgmt_ip\tOwner\na\tinvalid\tNew\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := runConfig(append(args, "--yes", "--replace")); err == nil {
+	if err := Run("env_init", append(args, "--yes", "--replace")); err == nil {
 		t.Fatal("--yes bypassed validation")
 	}
 	unchanged, err := os.ReadFile(p.Inventory)
@@ -98,7 +98,7 @@ func TestConfigBundleOnlyCannotDropLegacyPlanning(t *testing.T) {
 	if err := os.WriteFile(p.Inventory, []byte("host_id,mgmt_ip\na,10.0.0.2\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := runConfig([]string{"--project", root, "--yes", "--save", "bundle"}); err == nil || !strings.Contains(err.Error(), "--save both") {
+	if err := Run("env_init", []string{"--project", root, "--yes", "--save", "bundle"}); err == nil || !strings.Contains(err.Error(), "--save both") {
 		t.Fatalf("legacy migration must require both: %v", err)
 	}
 	after, err := os.ReadFile(p.Bundle)

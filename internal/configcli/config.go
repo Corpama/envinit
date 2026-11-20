@@ -1,4 +1,5 @@
-package main
+// Package configcli implements the offline planning editor shared by both CLIs.
+package configcli
 
 import (
 	"bufio"
@@ -11,10 +12,13 @@ import (
 
 	"envinit/internal/configure"
 	"envinit/internal/inventory"
+	"envinit/internal/startup"
+
+	"github.com/charmbracelet/x/term"
 )
 
-func runConfig(args []string) error {
-	fs := flag.NewFlagSet("env_init config", flag.ContinueOnError)
+func Run(command string, args []string) error {
+	fs := flag.NewFlagSet(command+" config", flag.ContinueOnError)
 	project := fs.String("project", "", "Project directory (defaults to current directory/planning)")
 	bundlePath := fs.String("bundle", "", "Bundle path in the planning directory")
 	invPath := fs.String("inventory", "", "Inventory path; XLSX/TSV/TXT is imported to inventory.csv in the same directory")
@@ -71,15 +75,19 @@ func runConfig(args []string) error {
 	if pending {
 		return fmt.Errorf("interrupted planning transaction; inspect backups and run config with the same paths and --recover")
 	}
-	snapshot, err := configure.Snapshot(p.Directory)
+	var snapshot, cachedBundle, cachedInventory, profile string
+	err = startup.Run(command, args,
+		startup.Step{Label: "读取规划快照", Load: func() error { var e error; snapshot, e = configure.Snapshot(p.Directory); return e }},
+		startup.Step{Label: "定位项目模板", Load: func() error {
+			var e error
+			cachedBundle, cachedInventory, profile, e = configure.CachedTemplates(p.Project)
+			return e
+		}},
+	)
 	if err != nil {
 		return err
 	}
-	cachedBundle, cachedInventory, profile, err := configure.CachedTemplates(p.Project)
-	if err != nil {
-		return err
-	}
-	ui := &configUI{plain: *plain || !stdinIsTerminal() || !stdoutIsTerminal(), input: bufio.NewReader(os.Stdin), output: os.Stdout}
+	ui := &configUI{plain: *plain || !term.IsTerminal(os.Stdin.Fd()) || !term.IsTerminal(os.Stdout.Fd()), input: bufio.NewReader(os.Stdin), output: os.Stdout}
 	interactive := !*yes && !*checkOnly
 	choose := func(target, explicit, cached, kind string) (string, error) {
 		_, err := os.Stat(target)

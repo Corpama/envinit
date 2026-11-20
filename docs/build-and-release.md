@@ -74,7 +74,7 @@ ARM64 二进制可构建不等于 ARM64 物料可用：当前正式 profile 只�
 
 ### 4.1 不注入元数据：构建检查
 
-在本机编译 downloader 做入口和构建检查。没有注入 release manifest、AList 地址和凭据时，downloader 不会执行 profile 下载；它也不负责配置问答。配置初始化由后续的 `env_init config` pipeline 处理：
+在本机编译 downloader 做入口和构建检查。不注入 release manifest、AList 地址和凭据也可使用离线 `config` 子命令；profile 下载才需要发布元数据：
 
 ```bash
 CGO_ENABLED=0 go build -trimpath -o dist/downloader-check ./cmd/downloader
@@ -88,7 +88,7 @@ go test ./cmd/downloader
   --output-dir ./dist/my-delivery
 ```
 
-下载完成后，可在交付目录中按 [`env_init config` pipeline 方案](envinit-configure-design.md)初始化或编辑规划；该命令当前仍是方案中的拟新增子命令。
+下载完成后，用 `./dist/downloader-release config --project ./dist/my-delivery` 在本机初始化或编辑规划，参数与目标机上的 `env_init config` 相同，见 [config 模板准备](envinit-config.md)。
 
 普通 `go build ./cmd/downloader` **不会自动带入下载地址、认证和 manifest**，不能当正式 downloader 直接下载。旧版 `packageName/packageSHA256/alistFilePath` 单归档参数属于兼容入口，新发行流程不要使用。
 
@@ -361,10 +361,10 @@ chmod +x "$VERIFY_DIR/env_tool_downloader-linux-amd64"
 
 每个目录应包含 `env_init`、`env_init_arch`、README、run 脚本、`planning/bundle.json`、`planning/inventory.csv`、对应 `data/` 及 `.envinit-downloads/` 元数据。检查 bundle 目标平台与材料路径，不能混入另一个系统的物料。规划模板不是现场最终规划。
 
-显式 `--profile` 只下载并组装交付目录。下载完成后，使用独立的 `env_init config` 初始化或编辑规划：
+显式 `--profile` 只下载并组装交付目录。下载完成后，在下载机上用相应平台的 downloader 初始化或编辑规划，例如：
 
 ```bash
-"$VERIFY_DIR/env_init-linux-amd64" config \
+"$VERIFY_DIR/env_tool_downloader-linux-amd64" config \
   --project "$VERIFY_DIR/ubuntu"
 ```
 
