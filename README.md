@@ -104,15 +104,15 @@ data/profiles/
     └── single_rpm/
 ```
 
-`data/profiles/` 是长期维护的物料区，不属于每个 GitHub release 的版本包。发版脚本不会读取、下载或重新打包这些大文件，只发布轻量的 base、各 profile 的 bundle、`inventory.csv`、manifest 和跨平台 downloader。manifest 为每个 profile 记录稳定物料目录，例如 `/data/profiles/ubuntu22.04-x86_64`。
+长期物料位于腾讯云 COS 的 `env_init/data/profiles/<profile>/`。发版时只列举对象元数据，为每个 profile 生成带 SHA256 摘要的 `materials.json` 索引，不下载或重新打包大文件。
 
-downloader 执行时才登录 AList，递归读取所选 profile 的物料目录，并把该目录下面的内容直接组装到输出目录的 `data/`。因此发布新版本不会为了几 GB 的离线源和驱动包触发一次完整物料读取，交付人员也不需要手工解包或搬运 profile 归档。
+新 downloader 通过腾讯云 COS Go SDK 匿名读取 base、规划模板、索引和物料，按索引将文件组装到 `data/`。现场只需能通过 HTTPS 访问 `wxq-1318169049.cos.ap-guangzhou.myqcloud.com`，无需桶的列举权限或 AList 账号。仅旧 manifest 继续使用 AList。
 
 ## 3. 下载器和 profile 选择
 
 `downloader` 和 `env_init` 在交互终端显示启动页。进度按当前命令已完成的准备步骤计算：例如 `plan` 加载 bundle 和机器规划表，downloader 读取并解析发布清单。准备完成后显示「启动就绪」；启动页至少展示约 2 秒，加载较慢时等到实际完成再进入命令。物料下载进度在下载阶段单独显示。帮助、列出 profile、纯文本模式和管道/重定向会跳过启动页。设置 `ENVINIT_NO_SPLASH=1` 可关闭启动页。
 
-发布包中的下载器会读取内置 manifest，让用户选择本次交付要拉取的系统 profile。交互式环境下直接运行下载器，会看到类似选择界面：
+发布包中的下载器会读取内置 manifest，让用户选择本次交付要拉取的系统 profile。交互式环境下直接运行下载器，会进入统一的 Bubble Tea TUI：可用方向键选择 profile，Enter 开始下载，界面会显示当前阶段、目录、总体进度、物料字节数和文件数。使用 `--profile`、管道或自动化环境时继续使用文本模式：
 
 ```text
 请选择本次交付系统 profile:
@@ -164,13 +164,13 @@ chmod +x env_tool_downloader-linux-amd64
 | `--jobs <n>` | profile 物料并发下载数，默认 6，最大 32 |
 | `--output <path>` | 仅兼容旧版“单归档 downloader”；当前内置 manifest/profile 的 release 不使用该参数，请使用 `--output-dir` |
 
-下载完成后只保留一个 `planning/` 目录，其中 `planning/bundle.json` 是 downloader 根据所选系统 profile 单独下载的模板，`planning/inventory.csv` 是一份可编辑的规划表。交付目录不再携带 `examples/`、`planning/templates/`、`inventory.sample.csv`，也不会同时放入两个系统的 bundle。`data/` 来自所选 profile 根目录，不会再携带另一个 profile 的目录。downloader 的筛选粒度到 profile 为止：除 `.DS_Store`、AppleDouble、`Thumbs.db` 外，它会递归拉取该根目录下的全部文件，不会再根据 bundle 路径自动过滤历史版本、源码展开目录或备用包。因此 AList 的 `/data/profiles/<profile>` 本身必须整理成可直接交付的最终物料集合。
+下载完成后只保留所选系统的 `planning/bundle.json` 和可编辑的 `planning/inventory.csv`。`data/` 只包含所选 profile 索引中的文件。发布时除 `.DS_Store`、AppleDouble 和 `Thumbs.db` 外，整个 profile 前缀下的文件都进入索引，不会按 bundle 自动过滤历史版本、源码或备用包；请先将 COS 前缀整理成可交付的物料集合。
 
 `--output-dir` 建议指向一个新的空目录，或者此前由同一 profile 组装的目录。同一 profile 重复运行是安全的，下载器会续传或跳过已完成文件；不要直接在 Ubuntu 已完成目录上改选 Kylin，下载器不会删除新 profile 中不存在的旧文件，否则两个系统的物料会混在一起。需要切换 profile 时请使用另一个输出目录，或先人工确认并清空旧交付目录。
 
 下载器会先校验并自动解包轻量 base，再把所选 profile 的 bundle 写为 `planning/bundle.json`、把统一规划表写为 `planning/inventory.csv`，最后递归组装 profile 物料。它不依赖目标电脑预装 `tar`；Linux、macOS 和 Windows 分别使用对应的权限或文件属性处理逻辑，脚本和 `.run` 文件会恢复为可执行文件。目录遍历会忽略 `.DS_Store`、AppleDouble 和 `Thumbs.db` 等系统杂项文件。
 
-base、bundle 和 inventory 使用 manifest 中的 SHA256 校验。bundle 本身是 JSON 文件，即使 COS 返回 `Content-Type: application/json` 也会作为正常资产下载；只有响应同时具有 AList 的 `code/message/data` 错误信封且 `code != 200` 时才按接口错误终止。profile 物料如果 AList 提供 SHA256，也逐文件校验；否则使用远端路径、大小和修改时间形成完成标记。记录保存在 `.envinit-downloads/`，中断下载会保留 `.part` 文件供续传，使用同一输出目录重复运行时会跳过未变化且已完成的文件。
+base、bundle、inventory 和物料索引使用内置 manifest 中的 SHA256 校验。物料按索引中的 ETag 和大小检查；若 COS 返回 SHA256 元数据或 CRC64，还会校验完整文件（包括续传前已有的部分）。完成标记保存在 `.envinit-downloads/`。中断后保留 `.part`，用同一输出目录重跑即可续传或跳过已完成文件。
 
 profile 物料开始组装后会显示聚合进度，而不是为 1000 多个文件分别刷屏：
 
@@ -178,11 +178,9 @@ profile 物料开始组装后会显示聚合进度，而不是为 1000 多个文
 Material [===========                   ]  37.42%  2.67 GiB/7.14 GiB  183.60 MiB/s  641/1529 files
 ```
 
-百分比和容量以 AList 列出的整个 profile 总字节数为分母；文件数表示已处理条目和总条目。速度只统计本轮实际从网络收到的字节，不把已校验文件或已有 `.part` 算入下载速度。交互终端中进度条会在同一行刷新；输出重定向到日志文件时只打印起始和最终状态，避免产生大量重复行。
+百分比按 profile 索引的总字节数计算，速度只统计本轮实际收到的字节，不把已完成文件或已有 `.part` 算入下载速度。
 
-如果 AList 目录缓存中残留一个“大小为 0、没有 SHA256、实际 COS 对象已经不存在”的悬空条目，downloader 会输出 `WARNING ... skipping stale entry` 并跳过；本地正式 profile 不应包含这类条目，仍建议从 COS/AList 清理。任何非零物料或带 SHA256 的物料返回 404 都会继续作为错误终止，避免静默生成缺包的交付目录。
-
-版本边界需要特别区分：base、bundle 和 inventory 固定属于 downloader 对应的 release；`material_root` 指向长期维护的 profile 目录，物料本身不随 GitHub release tag 再复制一份。因此以后再次运行旧 downloader 时，会读取该 profile 目录当时可见的物料。需要完整复现某次历史交付时，应保留当时已经组装好的 `env_tool` 目录，不能只保留 downloader。
+新清单固定发版时的物料列表，但不复制物料本身。后来新增的文件要到下次发版才会列入；索引内的对象若被删除或替换，下载会报错。需要复现某次交付时，请保留已组装的完整目录。
 
 ## 4. 推荐工作流
 
@@ -2039,9 +2037,7 @@ sudo ./env_init apply --inventory planning/inventory.csv --bundle planning/bundl
 
 ### 9.10 downloader 列出了物料但 COS 下载返回 404
 
-先看报错对象在 AList 目录列表中的大小。若它是零字节、无 SHA256，而且本地正式 profile 中不存在，通常是历史软链接、目录占位或已删除对象留下的 AList/COS 残留。新版 downloader 会打印 WARNING 并跳过这种不可下载的空条目；仍应在存储侧删除残留并刷新 AList 缓存。
-
-如果对象大小非零或带有 SHA256，downloader 会保持失败，因为这表示正式物料缺失，不能通过跳过来掩盖。此时应恢复 COS 对象或修正 AList profile 内容，再使用原输出目录重跑；已经校验成功的文件不会重复下载。
+对 COS manifest，核对索引的 `material_root`、相对路径和 ETag。恢复对应版本的对象后用原目录重跑；如果物料确实要替换，请重新发版生成索引。仅旧 AList 模式会警告并跳过无摘要、返回 404 的零字节缓存条目。
 
 ### 9.11 二次 Apply 改回网卡名时出现 `File exists`
 

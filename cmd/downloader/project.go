@@ -97,7 +97,7 @@ func rejectSymlinkParents(path string) error {
 	return nil
 }
 
-func downloadProjectTemplates(p projectPaths, profile manifestProfile, token string) error {
+func downloadProjectTemplates(p projectPaths, profile manifestProfile, store deliveryStore) error {
 	for _, item := range []struct {
 		asset manifestAsset
 		name  string
@@ -109,7 +109,7 @@ func downloadProjectTemplates(p projectPaths, profile manifestProfile, token str
 			return fmt.Errorf("profile %s has no %s template", profile.ID, item.name)
 		}
 		item.asset.Name = item.name
-		if err := downloadManifestAsset(filepath.Dir(p.BundleTemplate), item.asset, token); err != nil {
+		if err := downloadManifestAsset(filepath.Dir(p.BundleTemplate), item.asset, store); err != nil {
 			return err
 		}
 	}

@@ -109,7 +109,7 @@ func TestDownloadMaterialFileDoesNotSkipMissingNonEmptyFile(t *testing.T) {
 	oldBaseURL := alistBaseURL
 	t.Cleanup(func() { alistBaseURL = oldBaseURL })
 	alistBaseURL = server.URL
-	err := downloadMaterialFile(t.TempDir(), "test-profile", "token", materialFile{
+	err := downloadMaterialFile(t.TempDir(), "test-profile", deliveryStore{token: "token"}, materialFile{
 		RemotePath:   "/data/profiles/test/missing.rpm",
 		RelativePath: "missing.rpm",
 		Size:         1024,

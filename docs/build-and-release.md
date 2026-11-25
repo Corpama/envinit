@@ -7,8 +7,8 @@
 | 操作 | 产物和用途 | 是否访问或修改发布服务 |
 | --- | --- | --- |
 | 手动编译 env_init | 目标 Linux 服务器上的执行程序 | 不发布；缺少 Go 依赖缓存时会下载依赖 |
-| 手动编译 downloader | 无元数据版本用于构建/入口检查；嵌入元数据版本用于正式下载 | 编译本身不发布；正式下载运行时访问 AList/COS |
-| 完整发版 | base、规划模板、manifest、六个平台的 downloader、GitHub Release | 上传 COS、刷新 AList、发布 GitHub 资产；默认还会删除旧 COS 版本 |
+| 手动编译 downloader | 无元数据版本用于构建/入口检查；嵌入元数据版本用于正式下载 | 编译本身不发布；新 manifest 运行时匿名访问国内 COS |
+| 完整发版 | base、规划模板、物料索引、manifest、六个平台的 downloader、GitHub Release | 列举 COS 物料、上传轻量文件、发布 GitHub 资产；默认还会删除旧 COS 版本 |
 
 **只想更新一个测试二进制，执行第 3 或第 4 节即可，不要运行发布脚本。** 完整发版优先走第 6 节的 tag → Actions 流程；第 7 节是受控的人工替代流程，不能与 Actions 同时执行。
 
@@ -74,7 +74,7 @@ ARM64 二进制可构建不等于 ARM64 物料可用：当前正式 profile 只�
 
 ### 4.1 不注入元数据：构建检查
 
-在本机编译 downloader 做入口和构建检查。不注入 release manifest、AList 地址和凭据也可使用离线 `config` 子命令；profile 下载才需要发布元数据：
+在本机编译 downloader 做入口和构建检查。不注入 release manifest、AList 地址和凭据也可使用离线 `config` 子命令；profile 下载才需要发布元数据。交互终端运行 downloader 会进入 TUI，使用 `--profile`、管道或自动化调用时保留文本模式：
 
 ```bash
 CGO_ENABLED=0 go build -trimpath -o dist/downloader-check ./cmd/downloader
@@ -94,35 +94,28 @@ go test ./cmd/downloader
 
 ### 4.2 注入已有 release 元数据：构建可下载版本
 
-适用于补构建或内部验证。前提是已有经过确认的 `manifest.json`，其 base/bundle/inventory 已在 AList 发布并可下载；**仅构建 downloader 不会创建或上传这些文件**。新版本完整发行使用第 6/7 节，避免复制旧 manifest 后只改版本号。
+适用于补构建或内部验证。前提是已有经过确认的 `manifest.json`，其 base/bundle/inventory 和索引已在 COS 发布并可匿名下载；**仅构建 downloader 不会创建或上传这些文件**。
 
-manifest 含 `version`、`base` 和 `profiles`；每个 profile 包含 `material_root`、`bundle`、`inventory`、`assets`。文件资产包含 `name/path/sha256`。直接使用发布脚本生成的 manifest，不手写或省略摘要。
+manifest 含 `version`、`store`（provider、bucket、region、endpoint）、`base` 和 `profiles`。每个 profile 的 `material_root` 是无前导斜杠的 COS 前缀；`material_index` 指定该 tag 的索引对象键和 SHA256。所有资产的 `path` 均为完整对象键。缺少 `store` 的旧 manifest 仍使用原 AList 入口。
 
-下面在 Bash 中运行。先把 `MANIFEST_FILE`、`RELEASE_TAG`、`ALIST_BASE_URL` 改成已确认值；不要把实际账号密码写入脚本、仓库、终端录屏或命令历史：
+用新 manifest 补构建只需指定清单和版本：
 
 ```bash
 MANIFEST_FILE=/absolute/path/to/manifest.json
 RELEASE_TAG=vX.Y.Z
-ALIST_BASE_URL=https://your-alist.example.com
 
 test -f "$MANIFEST_FILE"
 jq -e --arg version "$RELEASE_TAG" \
-  '.version == $version and (.profiles | length > 0)' "$MANIFEST_FILE"
-
-read -r -p 'AList download username: ' ALIST_USERNAME
-read -r -s -p 'AList download password: ' ALIST_PASSWORD
-printf '\n'
+  '.version == $version and .store.provider == "cos" and (.profiles | length > 0)' "$MANIFEST_FILE"
 
 MANIFEST_JSON_B64="$(base64 < "$MANIFEST_FILE" | tr -d '\n')"
-ALIST_USERNAME_B64="$(printf '%s' "$ALIST_USERNAME" | base64 | tr -d '\n')"
-ALIST_PASSWORD_B64="$(printf '%s' "$ALIST_PASSWORD" | base64 | tr -d '\n')"
-DOWNLOADER_LDFLAGS="-s -w -X main.releaseVersion=${RELEASE_TAG} -X main.manifestJSONB64=${MANIFEST_JSON_B64} -X main.alistBaseURL=${ALIST_BASE_URL} -X main.alistUserB64=${ALIST_USERNAME_B64} -X main.alistPassB64=${ALIST_PASSWORD_B64}"
+DOWNLOADER_LDFLAGS="-s -w -X main.releaseVersion=${RELEASE_TAG} -X main.manifestJSONB64=${MANIFEST_JSON_B64}"
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   go build -trimpath -ldflags "$DOWNLOADER_LDFLAGS" \
   -o dist/env_tool_downloader-linux-amd64 ./cmd/downloader
 
-unset ALIST_USERNAME ALIST_PASSWORD ALIST_USERNAME_B64 ALIST_PASSWORD_B64 DOWNLOADER_LDFLAGS
+unset DOWNLOADER_LDFLAGS
 ```
 
 逐条确认 `test/jq` 成功再继续；若保存为构建脚本，在开头加 `set -euo pipefail`。其他平台在最后一条构建命令中替换 `GOOS/GOARCH` 和输出文件名；在 `unset` 前完成所有需要的构建：
@@ -136,7 +129,7 @@ unset ALIST_USERNAME ALIST_PASSWORD ALIST_USERNAME_B64 ALIST_PASSWORD_B64 DOWNLO
 | windows | amd64 | env_tool_downloader-windows-amd64.exe |
 | windows | arm64 | env_tool_downloader-windows-arm64.exe |
 
-**凭据边界：Base64 不是加密。** AList 账号密码会嵌入二进制，也可能出现在 Go 构建信息/进程参数中，拿到 downloader 的人应视为能拿到该账号。必须使用只读、最小目录权限的专用下载账号，禁止管理员账号；不要公开 `-ldflags`、`go version -m downloader` 或包含凭据的诊断输出。不要开启 `set -x`。COS Secret 只用于上传，不能注入 downloader。
+新 downloader 使用匿名 GetObject，不嵌入任何 COS 或 AList 凭据。发布凭据只由发布端读取。
 
 ## 5. 正式发布的前置条件与产物
 
@@ -146,9 +139,8 @@ unset ALIST_USERNAME ALIST_PASSWORD ALIST_USERNAME_B64 ALIST_PASSWORD_B64 DOWNLO
 
 | 名称 | 要求/用途 |
 | --- | --- |
-| `COS_SECRET_ID`、`COS_SECRET_KEY` | 必填，上传发布文件；默认清理流程还需列出、删除发布前缀内对象的权限 |
+| `COS_SECRET_ID`、`COS_SECRET_KEY` | 必填；需列举所选 profile 前缀（GetBucket）、上传发布文件；默认清理流程还需列出、删除发布前缀内对象的权限 |
 | `COS_SESSION_TOKEN` | 可选；使用 COS 临时凭据时，与对应 ID/Key 配套提供 |
-| `ALIST_USERNAME`、`ALIST_PASSWORD` | 必填，发布时验证路径，随后嵌入 downloader；应限制为下载/列目录所需权限 |
 | `GH_TOKEN` | Actions 发布步骤使用 `github.token` 自动提供；人工 `gh` 操作需自行认证，拥有该仓库发布权限 |
 
 发布脚本的当前默认值：
@@ -163,17 +155,15 @@ unset ALIST_USERNAME ALIST_PASSWORD ALIST_USERNAME_B64 ALIST_PASSWORD_B64 DOWNLO
 | `COS_RELEASE_UPLOAD_ENDPOINT` | `cos.accelerate.myqcloud.com`，上传和删除使用；桶需支持该访问方式 |
 | `COS_RELEASE_PREFIX` | `env_init/releases` |
 | `COS_RELEASE_KEEP` | `2`，按 `sort -V` 排序，只保留最新两个可识别版本目录，不按发布时间 |
-| `ALIST_BASE_URL` | `https://alt.corpa.me` |
-| `ALIST_RELEASE_PREFIX` | `/releases` |
-| `ALIST_PROFILE_PREFIX` | `/data/profiles` |
+| `COS_PROFILE_PREFIX` | `env_init/data/profiles` |
 | `RELEASE_PROFILES` | `ubuntu22.04-x86_64:kylin10sp3-x86_64`，冒号分隔；当前模板映射仅实现这两种 |
 | `RUNNER_TEMP` | 临时工作目录的父目录；未设置时使用仓库 `.release-work/` |
 
-只在 GitHub Settings 新建同名 Variables **不会自动覆盖**这些默认值；当前 workflow 仅显式传入五项 COS/AList secrets。要改变 CI 行为，需在 workflow 的组装步骤 `env` 中显式传值，并在打 tag 前提交。人工流程则 `export` 对应变量。
+只在 GitHub Settings 新建同名 Variables **不会自动覆盖**这些默认值；要改变 CI 行为，需在 workflow 的组装步骤 `env` 中显式传值。人工流程则 `export` 对应变量。
 
 **清理风险必须提前确认：** `COS_RELEASE_KEEP=2` 会真实删除旧版本对象，导致对应旧 downloader 无法再取得其 base/模板；不会同步删除 GitHub Release。当前脚本将 `COS_RELEASE_KEEP=0` 解释为跳过清理（会打印 warning），不是删除全部。若需验收前保留历史版本，在发布前将组装步骤的 `COS_RELEASE_KEEP` 明确设为 `'0'`。不应为补构建旧版本贸然执行默认清理。
 
-AList `/releases/<tag>/...` 必须映射到 COS `env_init/releases/<tag>/...`。两个 profile 的长期物料目录也必须已就绪，并与各自 bundle 中 `data/` 路径一致。脚本只校验轻量发布文件可解析到下载地址，**不会验证 profile 大材料是否完整，也不实际下载校验这些大文件**。
+两个 profile 的长期物料前缀必须非空，并与各自 bundle 中的路径一致。发布端按前缀分页列出对象、生成索引；脚本对上传的轻量文件做匿名 HEAD 检查，不下载所有大文件。下载电脑仅需通过 HTTPS 访问区域桶域名；桶无需允许匿名 List。
 
 ### 5.2 发布产物分布
 
@@ -183,7 +173,8 @@ AList `/releases/<tag>/...` 必须映射到 COS `env_init/releases/<tag>/...`。
 | COS `env_init/releases/<tag>/inventory.csv` | 来自 `examples/inventory.sample.csv` 的公共规划模板 |
 | COS `env_init/releases/<tag>/<profile>/bundle.json` | 来自 Ubuntu/Kylin 各自 sample JSON 的规划模板 |
 | 本地 `release/`，随后上传 GitHub Release | 六个平台的 downloader、`manifest.json`、`SHA256SUMS`，正常为 8 个资产 |
-| AList `/data/profiles/<profile>/` | 长期维护的大材料，发布脚本不下载、不重打包、不自动同步 |
+| COS `env_init/releases/<tag>/<profile>/materials.json` | 相对路径、大小、ETag 列表；摘要写入 manifest |
+| COS `env_init/data/profiles/<profile>/` | 长期维护的大材料，发布脚本不下载、不重打包、不自动同步 |
 
 base 包中的 `run1.sh/run2.sh` 是发布脚本生成的快捷脚本，规划路径硬编码为 `/mnt/usb/env_tool/planning/`，且用相对路径 `./env_init`。现场应在对应交付目录执行；换挂载路径或使用 ARM64 时必须调整调用。`run1.sh` 执行 software/ofed，`run2.sh` 执行 network/xre/xdr/firmware/container/mlxconfig/sysctl/kernel/post；它们是会修改目标机的 apply，不是下载验收命令。
 
@@ -300,7 +291,7 @@ test -f "release-notes/${RELEASE_TAG}.md"
 
 确认 `git describe` 输出就是预期版本。多个 tag 指向同一提交时，脚本不接受通过 `RELEASE_TAG` 环境变量指定版本，而是自行 `git describe`；选到其他 tag 时必须先解决版本选择问题。
 
-通过安全凭据管理工具给当前 shell 注入第 5 节的 COS/AList 环境变量，不在文档或仓库中保存凭据，然后执行：
+通过安全凭据管理工具给当前 shell 注入第 5 节的 COS 环境变量，然后执行：
 
 ```bash
 export COS_RELEASE_KEEP=0
@@ -309,7 +300,7 @@ ls -lh release/
 jq '.version, [.profiles[].id]' release/manifest.json
 ```
 
-这里显式跳过历史清理；如需清理，另行审核范围和保留版本，不在补发时顺手删除。**脚本没有 dry-run**，这条命令会真实上传、刷新并验证 AList，然后构建 downloader。它不会创建 GitHub Release。
+这里显式跳过历史清理。**脚本没有 dry-run**，这条命令会真实上传并验证 COS 对象，然后构建 downloader。它不会创建 GitHub Release。
 
 确认脚本成功且 tag/manifest 一致、远端 tag 正确、Release 尚不存在后，人工完成最后一步：
 
@@ -378,14 +369,14 @@ chmod +x "$VERIFY_DIR/env_tool_downloader-linux-amd64"
 
 ## 9. 故障、重试与回退
 
-发布过程不是跨 COS/AList/GitHub 的原子事务：可能已上传部分对象或已清理旧版本，但 GitHub Release 尚未创建。先定位失败步骤再处理。
+发布过程不是跨 COS/GitHub 的原子事务：可能已上传部分对象或已清理旧版本，但 GitHub Release 尚未创建。先定位失败步骤再处理。
 
 | 现象 | 检查和处理 |
 | --- | --- |
 | 本地 Go 构建/测试失败 | 核对 Go 版本、依赖缓存、实际错误和工作区；不要跳过测试包装成正式成功 |
 | COS 上传失败 | 检查凭据、会话 token、桶/前缀/endpoint 权限。已成功上传的部分不会自动回滚；修正后再决定重试 |
-| AList 文件未就绪 | 检查 `/releases` 映射、账号权限及缓存；脚本会刷新并轮询。COS 有文件不等于 AList 路径正确 |
-| 大材料缺失或下载 404 | 发布脚本未检查大材料。恢复正确 profile 对象并刷新 AList；不能靠重新打 tag 修复物料路径 |
+| 索引生成失败 | 检查发布凭据的 GetBucket 权限及 COS_PROFILE_PREFIX。匿名客户端不需要该权限 |
+| 大材料下载 404 或 ETag 不匹配 | 检查对象是否在发版后被删除或替换。恢复与索引匹配的对象；有意变更物料时发新版本 |
 | 缺 `release-notes/<tag>.md` | workflow 在组装和清理之后才检查说明，可能已有外部副作用。若仅缺说明，可核对后人工补发说明；若改源码/模板，使用新 commit/new tag，不移动已公开 tag |
 | 脚本成功、GitHub create 失败 | 先 `gh release view` 检查是否已创建。人工 `release/` 完整保留时可只重试发布；Actions 没有单独上传中间构建 artifact，runner 结束后不能假定目录仍可取回 |
 | GitHub Release 已存在 | 整体重跑仍会先上传 COS/清理历史，最后 create 才失败。不要用整个 workflow 当“更新说明”按钮；只改说明可审核后 `gh release edit` |
@@ -400,7 +391,7 @@ chmod +x "$VERIFY_DIR/env_tool_downloader-linux-amd64"
 - [ ] 已确认发布范围，工作区无未纳入的功能依赖，tag 精确指向审核后的提交。
 - [ ] 中文说明在 tag 内，描述与实际交付一致，未把待验收事项写成已通过。
 - [ ] 测试、静态检查、所需架构构建通过；profile 材料与模板匹配。
-- [ ] AList 专用账号权限可接受，COS 清理策略明确，历史回退材料已保留。
+- [ ] COS 发布权限和清理策略明确，历史回退材料已保留。
 - [ ] Actions 或人工发布完成，GitHub 8 项资产齐全、版本/manifest/摘要一致。
 - [ ] 从 GitHub 新下载的 downloader 完成两个 profile 组装与重跑保护检查。
 - [ ] 已记录实机验收结果及未覆盖项，并归档可复现的完整交付目录。

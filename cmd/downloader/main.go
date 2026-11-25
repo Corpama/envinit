@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"envinit/internal/configcli"
+	"envinit/internal/cosstore"
 	"envinit/internal/startup"
 )
 
@@ -83,19 +84,21 @@ func downloadHTTPClient() *http.Client {
 }
 
 type releaseManifest struct {
+	Store    *cosstore.Config  `json:"store,omitempty"`
 	Version  string            `json:"version"`
 	Base     manifestAsset     `json:"base"`
 	Profiles []manifestProfile `json:"profiles"`
 }
 
 type manifestProfile struct {
-	ID           string          `json:"id"`
-	Name         string          `json:"name"`
-	Description  string          `json:"description"`
-	MaterialRoot string          `json:"material_root"`
-	Assets       []manifestAsset `json:"assets"`
-	Bundle       manifestAsset   `json:"bundle"`
-	Inventory    manifestAsset   `json:"inventory"`
+	MaterialIndex manifestAsset   `json:"material_index,omitempty"`
+	ID            string          `json:"id"`
+	Name          string          `json:"name"`
+	Description   string          `json:"description"`
+	MaterialRoot  string          `json:"material_root"`
+	Assets        []manifestAsset `json:"assets"`
+	Bundle        manifestAsset   `json:"bundle"`
+	Inventory     manifestAsset   `json:"inventory"`
 }
 
 type manifestAsset struct {
@@ -175,6 +178,9 @@ func run(opts runOptions) error {
 		return err
 	}
 	if rawManifest != "" {
+		if isInteractiveDownloader() && opts.Profile == "" && !opts.ListProfiles {
+			return runManifestTUI(opts, manifest)
+		}
 		return runManifestMode(opts, manifest)
 	}
 	return runLegacyMode(opts.Output)
@@ -320,10 +326,11 @@ func runManifestMode(opts runOptions, manifest releaseManifest) error {
 	if err != nil {
 		return err
 	}
-	outputDir := strings.TrimSpace(opts.OutputDir)
-	if outputDir == "" {
-		outputDir = defaultOutputDir
-	}
+	return downloadSelectedProfile(opts, manifest, profile, nil)
+}
+
+func downloadSelectedProfile(opts runOptions, manifest releaseManifest, profile manifestProfile, reporter *tuiReporter) error {
+	outputDir := normalizedOutputDir(opts.OutputDir)
 	unlock, err := lockDeliveryProject(outputDir)
 	if err != nil {
 		return err
@@ -333,12 +340,22 @@ func runManifestMode(opts runOptions, manifest releaseManifest) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(opts.Stdout, "Downloading env_tool %s profile %s\n", valueOrDefault(manifest.Version, releaseVersion), profile.ID)
-	token, err := loginAList()
+	if reporter != nil {
+		quietDownloaderOutput = true
+		defer func() { quietDownloaderOutput = false }()
+		reporter.update("准备下载", "连接物料服务", 0.02, 0, 0, 0, 0)
+	}
+	if reporter == nil {
+		fmt.Fprintf(opts.Stdout, "Downloading env_tool %s profile %s\n", valueOrDefault(manifest.Version, releaseVersion), profile.ID)
+	}
+	store, err := openDeliveryStore(manifest.Store)
 	if err != nil {
 		return err
 	}
-	if err := downloadProjectTemplates(paths, profile, token); err != nil {
+	if reporter != nil {
+		reporter.update("下载规划模板", "bundle.json / inventory.csv", 0.08, 0, 0, 0, 0)
+	}
+	if err := downloadProjectTemplates(paths, profile, store); err != nil {
 		return err
 	}
 	if err := seedPlanningTemplates(paths); err != nil {
@@ -352,7 +369,7 @@ func runManifestMode(opts runOptions, manifest releaseManifest) error {
 	if strings.TrimSpace(manifest.Base.Path) != "" {
 		assets = append([]manifestAsset{manifest.Base}, assets...)
 	}
-	for _, asset := range assets {
+	for i, asset := range assets {
 		name := asset.Name
 		if name == "" {
 			name = filepath.Base(asset.Path)
@@ -360,12 +377,15 @@ func runManifestMode(opts runOptions, manifest releaseManifest) error {
 		if protectedProjectPath(filepath.ToSlash(filepath.Clean(name))) {
 			return fmt.Errorf("asset %q targets protected project configuration", name)
 		}
-		if err := downloadManifestAsset(outputDir, asset, token); err != nil {
+		if reporter != nil {
+			reporter.update("下载基础交付文件", name, 0.12+0.18*float64(i)/float64(max(1, len(assets))), 0, 0, 0, 0)
+		}
+		if err := downloadManifestAsset(outputDir, asset, store); err != nil {
 			return err
 		}
 	}
-	if strings.TrimSpace(profile.MaterialRoot) != "" {
-		if err := downloadProfileMaterials(outputDir, profile, token, opts.Jobs, opts.Stdout); err != nil {
+	if store.cos != nil || strings.TrimSpace(profile.MaterialRoot) != "" {
+		if err := downloadProfileMaterials(paths, profile, store, opts.Jobs, opts.Stdout, reporter); err != nil {
 			return err
 		}
 	}
@@ -373,8 +393,12 @@ func runManifestMode(opts runOptions, manifest releaseManifest) error {
 	if err := writeProjectState(paths, state); err != nil {
 		return err
 	}
-	fmt.Fprintf(opts.Stdout, "Profile %s is ready under %s\n", profile.ID, outputDir)
-	fmt.Fprintf(opts.Stdout, "Edit local planning: %s config --project %q\n", filepath.Base(os.Args[0]), outputDir)
+	if reporter != nil {
+		reporter.update("交付目录已就绪", outputDir, 1, 0, 0, 0, 0)
+	} else {
+		fmt.Fprintf(opts.Stdout, "Profile %s is ready under %s\n", profile.ID, outputDir)
+		fmt.Fprintf(opts.Stdout, "Edit local planning: %s config --project %q\n", filepath.Base(os.Args[0]), outputDir)
+	}
 	return nil
 }
 
@@ -483,6 +507,7 @@ type alistMaterialEntry struct {
 }
 
 type materialFile struct {
+	ETag         string
 	RemotePath   string
 	RelativePath string
 	Size         int64
@@ -505,12 +530,9 @@ func (e *downloadHTTPStatusError) Error() string {
 	return fmt.Sprintf("download package: HTTP %s", e.Status)
 }
 
-func downloadProfileMaterials(outputDir string, profile manifestProfile, token string, jobs int, stdout io.Writer) error {
-	root := path.Clean(strings.ReplaceAll(strings.TrimSpace(profile.MaterialRoot), "\\", "/"))
-	if !path.IsAbs(root) || root == "/" {
-		return fmt.Errorf("profile %s material_root must be an absolute AList directory below /, got %q", profile.ID, profile.MaterialRoot)
-	}
-	files, err := collectMaterialFiles(token, root)
+func downloadProfileMaterials(paths projectPaths, profile manifestProfile, store deliveryStore, jobs int, stdout io.Writer, reporter *tuiReporter) error {
+	outputDir, root := paths.OutputDir, profile.MaterialRoot
+	files, err := store.materialFiles(profile, filepath.Dir(paths.BundleTemplate))
 	if err != nil {
 		return fmt.Errorf("list material profile %s: %w", profile.ID, err)
 	}
@@ -529,8 +551,15 @@ func downloadProfileMaterials(outputDir string, profile manifestProfile, token s
 	if stdout == nil {
 		stdout = io.Discard
 	}
-	fmt.Fprintf(stdout, "Material profile %s: %d files from %s using %d workers\n", profile.ID, len(files), root, jobs)
-	progress := newMaterialProgress(stdout, files)
+	if reporter != nil {
+		// The Bubble Tea dashboard owns the terminal while a download is active.
+		// Keep the existing text progress implementation for non-interactive and
+		// explicit CLI mode, but never let it interleave with the TUI renderer.
+		stdout = io.Discard
+	} else {
+		fmt.Fprintf(stdout, "Material profile %s: %d files from %s using %d workers\n", profile.ID, len(files), root, jobs)
+	}
+	progress := newMaterialProgressWithReporter(stdout, files, reporter)
 	progress.start()
 
 	queue := make(chan materialFile, len(files))
@@ -555,7 +584,7 @@ func downloadProfileMaterials(outputDir string, profile manifestProfile, token s
 				if stopped {
 					continue
 				}
-				if err := downloadMaterialFile(outputDir, profile.ID, token, file, progress); err != nil {
+				if err := downloadMaterialFile(outputDir, profile.ID, store, file, progress); err != nil {
 					mu.Lock()
 					if errors.Is(err, errSkipStaleZeroSizeMaterial) {
 						skipped++
@@ -732,7 +761,7 @@ func hashInfoValue(raw json.RawMessage, algorithm string) string {
 	return ""
 }
 
-func downloadMaterialFile(outputDir, profileID, token string, file materialFile, progress *materialProgress) error {
+func downloadMaterialFile(outputDir, profileID string, store deliveryStore, file materialFile, progress *materialProgress) error {
 	dataRoot := filepath.Join(outputDir, "data")
 	output, err := assetOutputPath(dataRoot, filepath.FromSlash(file.RelativePath))
 	if err != nil {
@@ -747,16 +776,10 @@ func downloadMaterialFile(outputDir, profileID, token string, file materialFile,
 		progress.completeFile()
 		return nil
 	}
-	// Directory enumeration already refreshed the material tree. Avoid forcing
-	// another storage refresh for every file in a large offline repository.
-	downloadURL, err := resolveDownloadURLForPathWithTokenAndRefresh(file.RemotePath, token, false)
-	if err != nil {
-		return fmt.Errorf("resolve material %s: %w", file.RemotePath, err)
-	}
 	partialOutput := output + ".part"
-	if err := downloadFileWithProgress(partialOutput, downloadURL, false, progress.addExisting, progress.addDownloaded); err != nil {
+	if err := store.fetch(partialOutput, file.RemotePath, file.ETag, false, progress); err != nil {
 		var statusErr *downloadHTTPStatusError
-		if file.Size == 0 && file.SHA256 == "" && errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
+		if store.cos == nil && file.Size == 0 && file.SHA256 == "" && errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
 			_ = os.Remove(partialOutput)
 			return fmt.Errorf("%w: %s", errSkipStaleZeroSizeMaterial, file.RemotePath)
 		}
@@ -843,7 +866,11 @@ func materialMarkerPath(outputDir, remotePath string) string {
 }
 
 func materialFingerprint(profileID string, file materialFile) string {
-	return fmt.Sprintf("profile=%s\npath=%s\nsize=%d\nmodified=%s\nsha256=%s\n", profileID, file.RemotePath, file.Size, file.Modified, file.SHA256)
+	fp := fmt.Sprintf("profile=%s\npath=%s\nsize=%d\nmodified=%s\nsha256=%s\n", profileID, file.RemotePath, file.Size, file.Modified, file.SHA256)
+	if file.ETag != "" {
+		fp += "etag=" + file.ETag + "\n"
+	}
+	return fp
 }
 
 func writeMaterialMarker(outputDir, profileID string, file materialFile) error {
@@ -866,7 +893,7 @@ func materialFileMode(relativePath string) os.FileMode {
 	return 0o644
 }
 
-func downloadManifestAsset(outputDir string, asset manifestAsset, token string) error {
+func downloadManifestAsset(outputDir string, asset manifestAsset, store deliveryStore) error {
 	if strings.TrimSpace(asset.Path) == "" {
 		return errors.New("manifest asset path is required")
 	}
@@ -881,30 +908,27 @@ func downloadManifestAsset(outputDir string, asset manifestAsset, token string) 
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Asset: %s\n", name)
+	downloaderPrintf("Asset: %s\n", name)
 	if archiveKind(name) != "" {
 		assembled, err := manifestAssetAlreadyAssembled(outputDir, asset.SHA256)
 		if err != nil {
 			return err
 		}
 		if assembled {
-			fmt.Println("  archive already assembled")
+			downloaderPrintln("  archive already assembled")
 			return nil
 		}
 	}
 	if err := verifySHA256(output, asset.SHA256); err == nil {
-		fmt.Println("  existing file already matches SHA256")
+		downloaderPrintln("  existing file already matches SHA256")
 		return assembleManifestArchive(outputDir, output, asset.SHA256)
 	}
-	downloadURL, err := resolveDownloadURLForPathWithToken(asset.Path, token)
-	if err != nil {
-		return err
-	}
 	partialOutput := output + ".part"
-	if err := download(partialOutput, downloadURL); err != nil {
+	if err := store.fetch(partialOutput, asset.Path, "", true, nil); err != nil {
 		return err
 	}
 	if err := verifySHA256(partialOutput, asset.SHA256); err != nil {
+		_ = os.Remove(partialOutput)
 		return err
 	}
 	if err := os.Remove(output); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -916,7 +940,7 @@ func downloadManifestAsset(outputDir string, asset manifestAsset, token string) 
 	if err := os.Rename(partialOutput, output); err != nil {
 		return fmt.Errorf("replace output with verified asset: %w", err)
 	}
-	fmt.Printf("  verified SHA256: %s\n", asset.SHA256)
+	downloaderPrintf("  verified SHA256: %s\n", asset.SHA256)
 	return assembleManifestArchive(outputDir, output, asset.SHA256)
 }
 
@@ -946,7 +970,7 @@ func assembleManifestArchive(outputDir, archivePath, sha256 string) error {
 	if err := writeManifestAssemblyMarker(outputDir, sha256); err != nil {
 		return err
 	}
-	fmt.Printf("  assembled under %s\n", outputDir)
+	downloaderPrintf("  assembled under %s\n", outputDir)
 	return nil
 }
 
@@ -1172,6 +1196,19 @@ func downloadFile(output, url string, reportProgress bool) error {
 }
 
 func downloadFileWithProgress(output, url string, reportProgress bool, onExisting, onDownloaded func(int64)) error {
+	return downloadStream(output, reportProgress, true, onExisting, onDownloaded, func(byteRange string) (*http.Response, error) {
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		if byteRange != "" {
+			req.Header.Set("Range", byteRange)
+		}
+		return downloadHTTPClient().Do(req)
+	})
+}
+
+func downloadStream(output string, reportProgress, inspectAList bool, onExisting, onDownloaded func(int64), get func(string) (*http.Response, error)) error {
 	var offset int64
 	if info, err := os.Stat(output); err == nil {
 		offset = info.Size()
@@ -1179,22 +1216,18 @@ func downloadFileWithProgress(output, url string, reportProgress bool, onExistin
 		return fmt.Errorf("inspect existing output: %w", err)
 	}
 
-	client := downloadHTTPClient()
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return fmt.Errorf("create download request: %w", err)
-	}
+	var byteRange string
 	if offset > 0 {
 		if onExisting != nil {
 			onExisting(offset)
 		}
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		byteRange = fmt.Sprintf("bytes=%d-", offset)
 		if reportProgress {
-			fmt.Printf("Resuming at byte %d\n", offset)
+			downloaderPrintf("Resuming at byte %d\n", offset)
 		}
 	}
 
-	resp, err := client.Do(req)
+	resp, err := get(byteRange)
 	if err != nil {
 		return fmt.Errorf("download package: %w", err)
 	}
@@ -1208,14 +1241,22 @@ func downloadFileWithProgress(output, url string, reportProgress bool, onExistin
 		}
 		return &downloadHTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(message)}
 	}
-	downloadBody, err := inspectJSONDownloadResponse(resp.Header.Get("Content-Type"), body, onDownloaded)
-	if err != nil {
-		return err
+	var downloadBody io.Reader = body
+	if inspectAList {
+		downloadBody, err = inspectJSONDownloadResponse(resp.Header.Get("Content-Type"), body, onDownloaded)
+		if err != nil {
+			return err
+		}
+	} else if onDownloaded != nil {
+		downloadBody = io.TeeReader(body, byteProgressWriter{add: onDownloaded})
 	}
 
 	flags := os.O_CREATE | os.O_WRONLY
 	switch {
 	case offset > 0 && resp.StatusCode == http.StatusPartialContent:
+		if !strings.HasPrefix(resp.Header.Get("Content-Range"), fmt.Sprintf("bytes %d-", offset)) {
+			return fmt.Errorf("unexpected Content-Range %q at offset %d", resp.Header.Get("Content-Range"), offset)
+		}
 		flags |= os.O_APPEND
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		if offset > 0 && onExisting != nil {
@@ -1252,7 +1293,7 @@ func downloadFileWithProgress(output, url string, reportProgress bool, onExistin
 		return fmt.Errorf("close output: %w", err)
 	}
 	if reportProgress {
-		fmt.Printf("Downloaded %d bytes in %s\n", written, time.Since(start).Round(time.Second))
+		downloaderPrintf("Downloaded %d bytes in %s\n", written, time.Since(start).Round(time.Second))
 	}
 	return nil
 }

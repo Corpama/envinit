@@ -23,9 +23,14 @@ type materialProgress struct {
 	networkStarted time.Time
 	lastRender     time.Time
 	lastLineWidth  int
+	reporter       *tuiReporter
 }
 
 func newMaterialProgress(output io.Writer, files []materialFile) *materialProgress {
+	return newMaterialProgressWithReporter(output, files, nil)
+}
+
+func newMaterialProgressWithReporter(output io.Writer, files []materialFile, reporter *tuiReporter) *materialProgress {
 	if output == nil {
 		output = io.Discard
 	}
@@ -40,6 +45,7 @@ func newMaterialProgress(output io.Writer, files []materialFile) *materialProgre
 		dynamic:    isInteractiveWriter(output),
 		totalBytes: totalBytes,
 		totalFiles: len(files),
+		reporter:   reporter,
 	}
 }
 
@@ -173,6 +179,9 @@ func (p *materialProgress) renderLocked(force bool) {
 		p.completedFiles,
 		p.totalFiles,
 	)
+	if p.reporter != nil {
+		p.reporter.update("下载物料", line, percentage/100, p.completedBytes, p.totalBytes, p.completedFiles, p.totalFiles)
+	}
 	if p.dynamic {
 		padding := ""
 		if p.lastLineWidth > len(line) {
