@@ -23,6 +23,8 @@ jobs:
           COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
           COS_SECRET_KEY: ${{ secrets.COS_SECRET_KEY }}
           COS_SESSION_TOKEN: ${{ secrets.COS_SESSION_TOKEN }}
+          # Keep v0.4.1 available while replacing the withdrawn v0.4.2.
+          COS_RELEASE_KEEP: ${{ github.ref_name == 'v0.4.3' && '0' || '2' }}
         run: bash scripts/github-release.sh
 
       - name: Publish GitHub Release
@@ -36,4 +38,12 @@ jobs:
           fi
           gh release create "$GITHUB_REF_NAME" release/* \
             --title "$GITHUB_REF_NAME" \
-            --notes-file "$notes_file"
+             --notes-file "$notes_file"
+
+      - name: Withdraw v0.4.2 after verifying its replacement
+        if: github.ref_name == 'v0.4.3'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view v0.4.3 --json isDraft,assets | jq -e '.isDraft == false and (.assets | length == 8)'
+          gh release delete v0.4.2 --yes

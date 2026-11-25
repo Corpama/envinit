@@ -148,7 +148,9 @@ func (p *materialProgress) finish() {
 func (p *materialProgress) renderLocked(force bool) {
 	now := time.Now()
 	if !force {
-		if !p.dynamic || (!p.lastRender.IsZero() && now.Sub(p.lastRender) < 200*time.Millisecond) {
+		// The TUI owns the terminal; its text writer is io.Discard, but its
+		// reporter still needs intermediate progress messages.
+		if (!p.dynamic && p.reporter == nil) || (!p.lastRender.IsZero() && now.Sub(p.lastRender) < 200*time.Millisecond) {
 			return
 		}
 	}

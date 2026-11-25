@@ -55,7 +55,7 @@ func runManifestTUI(opts runOptions, manifest releaseManifest) error {
 	m.start = func(index int) tea.Cmd {
 		return func() tea.Msg {
 			profile := manifest.Profiles[index]
-			reporter := &tuiReporter{program: program}
+			reporter := &tuiReporter{send: program.Send}
 			err := downloadSelectedProfile(opts, manifest, profile, reporter)
 			if err != nil {
 				return downloadErrorMsg{err: err}
@@ -251,11 +251,11 @@ type downloadProgressMsg struct {
 type downloadDoneMsg struct{}
 type downloadErrorMsg struct{ err error }
 
-type tuiReporter struct{ program *tea.Program }
+type tuiReporter struct{ send func(tea.Msg) }
 
 func (r *tuiReporter) update(phase, detail string, progress float64, bytes, totalBytes int64, files, totalFiles int) {
-	if r != nil && r.program != nil {
-		r.program.Send(downloadProgressMsg{phase, detail, progress, bytes, totalBytes, files, totalFiles})
+	if r != nil && r.send != nil {
+		r.send(downloadProgressMsg{phase, detail, progress, bytes, totalBytes, files, totalFiles})
 	}
 }
 
