@@ -154,6 +154,8 @@ chmod +x env_tool_downloader-linux-amd64
 ./downloader --profile kylin10sp3-x86_64 --output-dir /mnt/usb/env_tool --jobs 3
 ```
 
+下载成功后，终端会给出可直接复制的配置命令，使用本次运行的下载器和实际交付目录。例如，使用默认目录的 Apple Silicon Mac 会看到 `./env_tool_downloader-darwin-arm64 config -project kunlun_env_init`。不带 `-project` 时，配置编辑器会在当前目录查找 `planning/bundle.json`。
+
 常用参数：
 
 | 参数 | 说明 |

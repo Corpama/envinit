@@ -24,6 +24,7 @@ type downloaderTUI struct {
 	files      int
 	totalFiles int
 	started    bool
+	completed  bool
 	cancelled  bool
 	err        error
 	width      int
@@ -71,6 +72,10 @@ func runManifestTUI(opts runOptions, manifest releaseManifest) error {
 	model := result.(downloaderTUI)
 	if model.cancelled {
 		return fmt.Errorf("download canceled")
+	}
+	if model.completed {
+		// Print after Bubble Tea restores the terminal so the command stays visible.
+		printConfigHint(opts)
 	}
 	return model.err
 }
@@ -123,6 +128,7 @@ func (m downloaderTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.progress, m.bytes, m.totalBytes = msg.progress, msg.bytes, msg.totalBytes
 		m.files, m.totalFiles = msg.files, msg.totalFiles
 	case downloadDoneMsg:
+		m.completed = true
 		m.phase, m.progress = "交付目录已就绪", 1
 		return m, tea.Quit
 	case downloadErrorMsg:

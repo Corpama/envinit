@@ -326,7 +326,11 @@ func runManifestMode(opts runOptions, manifest releaseManifest) error {
 	if err != nil {
 		return err
 	}
-	return downloadSelectedProfile(opts, manifest, profile, nil)
+	if err := downloadSelectedProfile(opts, manifest, profile, nil); err != nil {
+		return err
+	}
+	printConfigHint(opts)
+	return nil
 }
 
 func downloadSelectedProfile(opts runOptions, manifest releaseManifest, profile manifestProfile, reporter *tuiReporter) error {
@@ -397,7 +401,6 @@ func downloadSelectedProfile(opts runOptions, manifest releaseManifest, profile 
 		reporter.update("交付目录已就绪", outputDir, 1, 0, 0, 0, 0)
 	} else {
 		fmt.Fprintf(opts.Stdout, "Profile %s is ready under %s\n", profile.ID, outputDir)
-		fmt.Fprintf(opts.Stdout, "Edit local planning: %s config --project %q\n", filepath.Base(os.Args[0]), outputDir)
 	}
 	return nil
 }

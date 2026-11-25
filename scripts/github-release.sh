@@ -15,7 +15,6 @@ COS_RELEASE_PREFIX="${COS_RELEASE_PREFIX:-env_init/releases}"
 COS_RELEASE_KEEP="${COS_RELEASE_KEEP:-2}"
 RELEASE_PROFILES="${RELEASE_PROFILES:-ubuntu22.04-x86_64:kylin10sp3-x86_64}"
 COS_PROFILE_PREFIX="${COS_PROFILE_PREFIX:-env_init/data/profiles}"
-RELEASE_ROOT="${COS_RELEASE_PREFIX%/}"
 
 : "${COS_SECRET_ID:?Please configure COS_SECRET_ID in GitHub Actions repository secrets}"
 : "${COS_SECRET_KEY:?Please configure COS_SECRET_KEY in GitHub Actions repository secrets}"
@@ -28,6 +27,7 @@ if [[ "$RELEASE_TAG" != v* ]]; then
   echo "error: release assembly must run on a v* tag, got '${RELEASE_TAG:-<none>}'" >&2
   exit 1
 fi
+RELEASE_ROOT="${COS_RELEASE_PREFIX%/}"
 
 WORK_PARENT="${RUNNER_TEMP:-${REPO_ROOT}/.release-work}"
 mkdir -p "$WORK_PARENT"

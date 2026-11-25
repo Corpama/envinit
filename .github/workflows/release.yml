@@ -23,7 +23,7 @@ jobs:
           COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
           COS_SECRET_KEY: ${{ secrets.COS_SECRET_KEY }}
           COS_SESSION_TOKEN: ${{ secrets.COS_SESSION_TOKEN }}
-          # Keep v0.4.1 available while replacing the withdrawn v0.4.2.
+          # Keep existing COS releases while replacing the v0.4.3 GitHub Release.
           COS_RELEASE_KEEP: ${{ github.ref_name == 'v0.4.3' && '0' || '2' }}
         run: bash scripts/github-release.sh
 
@@ -36,14 +36,20 @@ jobs:
             echo "error: missing Chinese release notes: $notes_file" >&2
             exit 1
           fi
+          if [[ "$GITHUB_REF_NAME" == v0.4.3 ]]; then
+            # Replace only this tag's release; the source tag has already been moved.
+            old_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/v0.4.3" --jq '.id' 2>/dev/null || true)
+            if [[ -n "$old_id" ]]; then
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$old_id"
+            fi
+          fi
           gh release create "$GITHUB_REF_NAME" release/* \
+            --verify-tag \
             --title "$GITHUB_REF_NAME" \
-             --notes-file "$notes_file"
+            --notes-file "$notes_file"
 
-      - name: Withdraw v0.4.2 after verifying its replacement
-        if: github.ref_name == 'v0.4.3'
+      - name: Verify release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view v0.4.3 --json isDraft,assets | jq -e '.isDraft == false and (.assets | length == 8)'
-          gh release delete v0.4.2 --yes
+          gh release view "$GITHUB_REF_NAME" --json isDraft,assets | jq -e '.isDraft == false and (.assets | length == 8)'
